@@ -15,9 +15,9 @@ def calculate_num_patches(img_size, patch_size, num_frames, t_patch_size):
 def create_dummy_data(batch_size=3):
     """Create dummy data for testing the model."""
     # Create HSI data: [B, C, T, H, W]
-    hsi_data = torch.randn(batch_size, 1, 12, 128, 128)
+    hsi_data = torch.randn(batch_size, 1, 12, 224, 224)
 
-    # Create auxiliary data
+    # Create auxiliary data with different sizes
     aux_data = {
         'ir': torch.randn(batch_size, 3, 128, 128),
         'af': torch.randn(batch_size, 3, 128, 128),
@@ -34,32 +34,28 @@ def test_model():
     """Test the MultiModalSpectralGPT model with dummy data."""
 
     # Model parameters
-    img_size = 128
-    patch_size = 8
+    hsi_img_size = 224  # HSI image size
+    aux_img_size = 128  # Auxiliary image size
+    patch_size = 16
     num_frames = 12
     t_patch_size = 3
     embed_dim = 768
 
-    # Calculate the actual number of patches
-    num_patches = calculate_num_patches(img_size, patch_size, num_frames, t_patch_size)
+    # Calculate the actual number of patches for HSI
+    num_patches = calculate_num_patches(hsi_img_size, patch_size, num_frames, t_patch_size)
     print(f"Number of patches that will be generated: {num_patches}")
 
     # Create model with correct dimensions
     model = MultiModalSpectralGPT(
-        img_size=img_size,
+        hsi_img_size=hsi_img_size,     # Specify HSI image size
+        aux_img_size=aux_img_size,      # Specify auxiliary image size
         patch_size=patch_size,
-        in_chans=1,
-        aux_chans=3,
         embed_dim=embed_dim,
-        depth=12,
-        num_heads=12,
-        decoder_embed_dim=512,
-        decoder_depth=8,
-        decoder_num_heads=16,
         num_frames=num_frames,
         t_patch_size=t_patch_size,
-        aux_embed_dim=256,
-        mask_ratio=0.75
+        in_chans=1,                     # HSI channels
+        aux_chans=3,                    # Auxiliary channels
+        aux_encoder_type='vit'          # Choose auxiliary encoder type
     )
 
     # Verify positional embedding size

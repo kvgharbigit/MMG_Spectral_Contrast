@@ -1,6 +1,12 @@
 """
-Multi-Modal Guided SpectralGPT Architecture
-=========================================
+Multi-Modal Guided SpectralGPT Architecture (Updated)
+===================================================
+
+Key Updates:
+------------
+- Separate image sizes for HSI and auxiliary modalities
+- Flexible patch embedding
+- Configurable auxiliary encoder types (ViT or CNN)
 
 Input Processing:
 ---------------
@@ -10,8 +16,8 @@ HSI Input                 IR Input                  AF Input              Thickn
       v                         v                         v                    v
 +------------+          +--------------+          +--------------+    +--------------+
 |3D PatchEmbed|         |Aux Encoder   |          |Aux Encoder   |    |Aux Encoder   |
-|(img_size=128|         |(CNN or ViT)  |          |(CNN or ViT)  |    |(CNN or ViT)  |
-|patch_size=8)|         |              |          |              |    |              |
+|(hsi_img_size|         |(CNN or ViT)  |          |(CNN or ViT)  |    |(CNN or ViT)  |
+| patch_size) |         |              |          |              |    |              |
 +------------+          +--------------+          +--------------+    +--------------+
       |                         |                         |                    |
       v                         v                         v                    v
@@ -48,214 +54,197 @@ Random Masking                  |                         |                    |
 Decoder     Contrastive
 Path        Path
 
-Decoder Path:               Contrastive Path:
-------------               ---------------
-    |                          |
-    v                          v
-Decoder Embed           Mean Pooling
-[B,L*(1-mask_ratio),    [B,embed_dim]
- decoder_embed_dim]           |
-    |                         v
-    v                   Projection Head
-Append Mask Tokens      Linear->ReLU->Linear
-    |                         |
-    v                         v
-+Decoder Pos Embed      Contrastive Loss (against the other modalities in the contrastive space)
-    |                   (temp=0.07)
-    v
-Decoder Blocks
-(depth=8)
-    |
-    v
-Decoder Norm
-    |
-    v
-Decoder Prediction
-[B,num_patches,
- embed_dim]
+Configuration Parameters:
+----------------------
+- hsi_img_size: Spatial dimensions for HSI (e.g., 500x500)
+- aux_img_size: Spatial dimensions for auxiliary modalities (e.g., 128x128)
+- patch_size: Spatial patch size for tokenization
+- in_chans: Input channels for HSI (typically 1)
+- aux_chans: Channels for auxiliary modalities (e.g., 3 for RGB)
+- embed_dim: Main transformer embedding dimension (e.g., 768)
+- aux_embed_dim: Embedding dimension for auxiliary features (e.g., 256)
+- depth: Number of transformer layers
+- num_heads: Number of attention heads
+- aux_encoder_type: Type of auxiliary encoder ('cnn' or 'vit')
 
-Example with batch_size=32, img_size=128, num_frames=12:
-===============================================
+Detailed Forward Pass:
+--------------------
+1. Patch Embedding
+   - HSI: 3D patch embedding with spatial and temporal patches
+   - Auxiliary: 2D patch embedding (ViT or CNN)
 
-Input Processing:
----------------
+2. Positional Embedding
+   - Add learnable position embeddings to patch tokens
+
+3. Random Masking
+   - Randomly mask a proportion of tokens (default 75%)
+   - Maintain original token order for reconstruction
+
+4. Cross-Modal Conditioning
+   - Project auxiliary features to main embedding dimension
+   - Apply cross-attention to condition HSI features
+
+5. Transformer Processing
+   - Apply transformer blocks to process tokens
+   - Normalize features
+
+6. Decoding Path
+   - Project features to decoder dimension
+   - Append mask tokens
+   - Reconstruct original token embeddings
+
+7. Contrastive Learning
+   - Mean pool features
+   - Project to contrastive embedding space
+   - Compute similarity across modalities
+
+Training Objectives:
+-----------------
+1. Reconstruction Loss
+   - L2 loss on masked tokens
+   - Computed in embedding space
+   - Weighted by masking pattern
+
+2. Contrastive Loss
+   - Align representations across modalities
+   - Temperature-scaled similarity
+   - Cross-entropy loss with batch indices
+
+Example Configuration:
+--------------------
+model = MultiModalSpectralGPT(
+    hsi_img_size=500,
+    aux_img_size=128,
+    patch_size=16,
+    in_chans=1,
+    aux_chans=3,
+    embed_dim=768,
+    aux_embed_dim=256,
+    depth=12,
+    num_heads=12,
+    aux_encoder_type='vit',
+    mask_ratio=0.75
+)
+"""
+
+
+"""
+Multi-Modal Guided SpectralGPT Architecture (Concrete Implementation)
+===================================================================
+
+Concrete Model Configuration:
+----------------------------
+- hsi_img_size: 224 (default spatial dimensions for HSI)
+- aux_img_size: 128 (default auxiliary modalities dimensions)
+- patch_size: 16 (spatial patch size)
+- in_chans: 1 (HSI input channels)
+- aux_chans: 3 (Auxiliary modalities channels, e.g., RGB)
+- embed_dim: 768 (main transformer embedding dimension)
+- aux_embed_dim: 256 (auxiliary features embedding dimension)
+- depth: 16 (number of transformer layers)
+- num_heads: 12 (number of attention heads)
+- num_frames: 12 (spectral bands in HSI)
+- t_patch_size: 3 (temporal/spectral patch size)
+- aux_encoder_type: 'vit' (auxiliary encoder type)
+- mask_ratio: 0.75 (proportion of tokens masked)
+
+Input Processing Specifics:
+-------------------------
 HSI Input                 IR Input                  AF Input              Thickness Input
-[32,1,12,128,128]        [32,3,128,128]           [32,3,128,128]       [32,1,128,128]
+[B,1,12,224,224]         [B,3,128,128]             [B,3,128,128]        [B,1,128,128]
       |                         |                         |                    |
       v                         v                         v                    v
-Patch Embed             Aux Encoder              Aux Encoder            Aux Encoder
-[32,1024,768]           [32,256]                [32,256]               [32,256]
++------------+          +--------------+          +--------------+    +--------------+
+|3D PatchEmbed|         |ViT Encoder   |          |ViT Encoder   |    |ViT Encoder   |
+|(224x224,16)|          |(128x128,16)  |          |(128x128,16)  |    |(128x128,16)  |
++------------+          +--------------+          +--------------+    +--------------+
       |                         |                         |                    |
       v                         v                         v                    v
-+Position Embed        Auxiliary LayerNorm       Auxiliary LayerNorm  Auxiliary LayerNorm
-[32,1024,768]          [32,256]                 [32,256]              [32,256]
+[B,784,768]         [B,64,256]           [B,64,256]        [B,64,256]
       |                         |                         |                    |
-      v                         |                         |                    |
-Random Masking                  |                         |                    |
-[32,256,768]                   |                         |                    |
-      |                         \                        |                   /
-      |                          \                       |                  /
-      |                           \                      |                 /
-      |                        Modality Projection [32,256] -> [32,768]
-      |                                       |
-      |              /-------------------------/
-      v             v
-Cross-Attention Blocks
-[32,256,768]
-      |
-      v
-Transformer Blocks
-[32,256,768]
-      |
+      v                         v                         v                    v
++Position Embed   Aux LayerNorm  Aux LayerNorm   Aux LayerNorm
+      |                |              |               |
+      v                v              v               v
+Random Masking    Modality Projection (aux_embed_dim -> embed_dim)
+(mask_ratio=0.75)         |
+      |                   |
+      |    /---------------/
+      v   v
++------------------+
+|Cross-Attn Blocks |
+|(16 layers)       |
++------------------+
+         |
+         v
++------------------+
+|Transformer Blocks|
+|(16 layers)       |
++------------------+
+         |
     /----|----\
     |         |
     v         v
 Decoder     Contrastive
 Path        Path
 
-Decoder Path (HSI data):   Contrastive Path (HSI data):
-------------               ---------------
-    |                          |
-    v                          v
-Decoder Embed            Mean Pooling
-[32,256,512]             [32,768]
-    |                         |
-    v                         v
-Append Mask Tokens       Projection Head
-[32,1024,512]           [32,768]
-    |                         |
-    v                         v
-+Decoder Pos Embed      Contrastive Loss
-[32,1024,512]
-    |
-    v
-Decoder Blocks
-[32,1024,512]
-    |
-    v
-Decoder Norm
-[32,1024,512]
-    |
-    v
-Decoder Prediction
-[32,1024,768]
+Patch Embedding Calculations:
+---------------------------
+1. HSI Patch Embedding:
+   - Input Size: 224 × 224 × 12
+   - Patch Size: 16 × 16 spatial, 3 temporal
+   - Grid Size: (224/16) × (224/16) × (12/3)
+   - Patch Grid: 14 × 14 × 4
+   - Total Patches: 14 × 14 × 4 = 784 patches
+   - Output Shape: [B, 784, 768]
 
-Dimension Calculations:
---------------------
-num_patches = (H/patch_size) * (W/patch_size) * (T/t_patch_size)
-            = (128/8) * (128/8) * (12/3)
-            = 16 * 16 * 4
-            = 1024 tokens
+2. Auxiliary Patch Embedding:
+   - Input Size: 128 × 128
+   - Patch Size: 16 × 16
+   - Grid Size: 8 × 8
+   - Total Patches: 8 × 8 = 64 patches
+   - Output Shape per Modality: [B, 64, 256]
 
-visible_tokens = num_patches * (1 - mask_ratio)
-               = 1024 * (1 - 0.75)
-               = 256 tokens
+Masking Scenario:
+----------------
+- Mask Ratio: 0.75
+- Total Patches: 784
+- Visible Tokens: 25% of 784 = 196 tokens
+- Masked Tokens: 588 tokens
 
-Configuration Parameters:
-----------------------
-embed_dim: 768          # Main embedding dimension
-aux_embed_dim: 256      # Auxiliary embedding dimension
-depth: 12              # Number of transformer blocks
-num_heads: 12          # Number of attention heads
-decoder_embed_dim: 512  # Decoder embedding dimension
-decoder_depth: 8       # Number of decoder layers
-decoder_num_heads: 16  # Number of decoder attention heads
-mlp_ratio: 4.0        # MLP hidden dimension ratio
-mask_ratio: 0.75      # Ratio of tokens to mask
-aux_encoder_type: cnn  # Type of auxiliary encoder
+Computational Characteristics:
+----------------------------
+- Input Tensor Size: ~50 MB
+- Model Parameters: ~100M
+- Forward Pass Computation: ~10 GFLOPs
 
 Training Objectives:
------------------
-1. Reconstruction Loss:
-   - L2 loss on masked tokens
-   - Computed in embedding space
-   - Weighted by mask
+------------------
+1. Reconstruction Loss
+   - L2 loss on 588 masked tokens
+   - Computed in 768-dimensional embedding space
+   - Weighted by masking pattern
 
-2. Contrastive Loss:
-   - Between HSI and auxiliaries
-   - Temperature-scaled similarity
-   - Cross entropy with batch indices
-   - Averaged across modalities
+2. Contrastive Loss
+   - Align HSI representations with 3 auxiliary modalities
+   - Temperature: 0.07
+   - Similarity computed in 768-dimensional space
 
-Key Features:
------------
-- Modular architecture
-- Flexible auxiliary encoders
-- Handles missing modalities
-- Configurable masking
-- Multi-objective training
-- Layer normalization
-- Dropout support
-- Separate positional embeddings
-
-Note: All dimensions shown are for example case with:
-- batch_size = 32
-- img_size = 128x128
-- num_frames = 12
-- t_patch_size = 3
-- patch_size = 8x8
+Example Code:
+------------
+model = MultiModalSpectralGPT(
+    hsi_img_size=224,
+    aux_img_size=128,
+    patch_size=16,
+    in_chans=1,
+    aux_chans=3,
+    embed_dim=768,
+    aux_embed_dim=256,
+    depth=16,
+    num_heads=12,
+    num_frames=12,
+    t_patch_size=3,
+    aux_encoder_type='vit',
+    mask_ratio=0.75
+)
 """
-
-
-"""Contrastive Loss Workflow - ASCII Visualization
-
-+---------------------------------------------------+
-|                Input Modalities                   |
-+-------------------+-------------------+-----------+
-| HSI               | Auxiliary         | Batch     |
-| [B,C,T,H,W]       | Modalities        | Indices   |
-|                   | [B,aux_chans,H,W] | [B]       |
-+-------------------+-------------------+-----------+
-             |               |               |
-             v               v               |
-    +--------+-------+  +----+------+        |
-    | HSI Feature    |  | Aux       |        |
-    | Extraction     |  | Encoders  |        |
-    | - Patch Embed  |  | - IR      |        |
-    | - Transformers |  | - AF      |        |
-    | - Mean Pooling |  | - Thick.  |        |
-    +--------+-------+  +----+------+        |
-             |               |               |
-             v               v               |
-    +--------+---------------+-------+       |
-    |    Feature Projection          |       |
-    | - Contrastive Space Embedding  |       |
-    | - Normalize Dimensions         |       |
-    +--------+---------------+-------+       |
-             |               |               |
-             v               v               |
-    +--------+---------------+-------+       |
-    |    Similarity Matrix           |       |
-    | - Dot Product                  |       |
-    | - Temperature Scaling (τ=0.07) |       |
-    +--------+---------------+-------+       |
-             |               |               |
-             v               v               |
-    +--------+---------------+-------+       |
-    |    Cross-Entropy Loss          |       |
-    | - Batch Indices as Labels      |       |
-    | - Per-Modality Loss Computation|       |
-    +--------+---------------+-------+       |
-             |               |               |
-             v               v               |
-    +--------+---------------+-------+       |
-    |    Loss Aggregation            |       |
-    | - Average Across Modalities    |       |
-    +--------------------------------+       |
-             |                               |
-             v                               |
-    +--------+-------------------------------+
-    |    Final Contrastive Loss              |
-    +----------------------------------------+
-
-Mathematical Formulation:
-L_contrast = (1/|M|) * ∑(m ∈ M) 
-             -log(exp(sim(z_HSI, z_m) / τ) / ∑(k ≠ i) exp(sim(z_HSI, z_k) / τ))
-
-Key Characteristics:
-- Modality-specific processing
-- Temperature-scaled similarities
-- Batch-aware positive pair definition
-- Handles missing modalities
-"""
-

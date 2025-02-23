@@ -24,15 +24,16 @@ class MultiModalSpectralGPT(nn.Module):
 
     def __init__(
             self,
-            img_size=128,  # Input spatial dimensions (H=W)
-            patch_size=8,  # Spatial patch size for tokenization
+            hsi_img_size=224,  # Input spatial dimensions for HSI (H=W)
+            aux_img_size=128,  # Input spatial dimensions for auxiliary modalities
+            patch_size=16,  # Spatial patch size for tokenization
             in_chans=1,  # Input channels for HSI (typically 1)
             aux_chans=3,  # Channels for auxiliary modalities (e.g., RGB=3)
             embed_dim=768,  # Main transformer embedding dimension
-            depth=12,  # Number of transformer layers i.e. in hsi encoder
+            depth=16,  # Number of transformer layers i.e. in hsi encoder
             num_heads=12,  # Number of attention heads per transformer
             decoder_embed_dim=512,  # Embedding dimension in decoder
-            decoder_depth=8,  # Number of decoder transformer layers
+            decoder_depth=4,  # Number of decoder transformer layers
             decoder_num_heads=16,  # Number of attention heads in decoder
             mlp_ratio=4.0,  # Expansion ratio for MLP in transformer blocks
             num_frames=12,  # Number of spectral bands in HSI
@@ -47,14 +48,16 @@ class MultiModalSpectralGPT(nn.Module):
         super().__init__()
 
         # Store configuration parameters
-        self.img_size = img_size
+        self.hsi_img_size = hsi_img_size
+        self.aux_img_size = aux_img_size
         self.patch_size = patch_size
         self.mask_ratio = mask_ratio
+        self.aux_encoder_type = aux_encoder_type
 
         # Initialize HSI encoder with 3D patch embedding
         # This converts the input HSI volume into a sequence of tokens
         self.patch_embed = PatchEmbed(
-            img_size=img_size,
+            img_size=hsi_img_size,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
@@ -67,7 +70,6 @@ class MultiModalSpectralGPT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
 
         # Create encoders for each auxiliary modality
-        self.aux_encoder_type = aux_encoder_type
         self.aux_encoder = nn.ModuleDict({
             'ir': self._make_aux_encoder(aux_chans, aux_embed_dim),
             'af': self._make_aux_encoder(aux_chans, aux_embed_dim),
@@ -131,27 +133,99 @@ class MultiModalSpectralGPT(nn.Module):
         # Initialize weights
         self.initialize_weights()
 
-    def random_masking(self, x, mask_ratio):
-        """Perform per-sample random masking by per-sample shuffling.
-
-        This implements the MAE masking strategy where a random subset of tokens
-        is masked out. The masking is done by shuffling and selecting a portion
-        to keep, rather than by directly masking random positions.
-
-        Args:
-            x: [N, L, D] input sequence where:
-               N = batch size
-               L = sequence length (number of patches)
-               D = embedding dimension
-            mask_ratio: proportion of tokens to mask (0 to 1)
-
-        Returns:
-            tuple: (
-                x_masked: kept tokens [N, L*(1-mask_ratio), D]
-                mask: binary mask [N, L], 1 is keep, 0 is remove
-                ids_restore: indices for restoring [N, L]
+    def _make_aux_encoder(self, in_channels, embed_dim):
+        """Creates an encoder for auxiliary modalities with separate image size and improved error handling."""
+        if self.aux_encoder_type == 'cnn':
+            return nn.Sequential(
+                nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3),
+                nn.ReLU(),
+                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(128, embed_dim, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(embed_dim, embed_dim)
             )
-        """
+        elif self.aux_encoder_type == 'vit':
+            return self.AuxViTEncoder(
+                img_size=self.aux_img_size,  # Use auxiliary-specific image size
+                patch_size=self.patch_size,
+                in_chans=in_channels,
+                embed_dim=embed_dim
+            )
+        else:
+            raise ValueError(f"Unknown auxiliary encoder type: {self.aux_encoder_type}")
+
+    class AuxViTEncoder(nn.Module):
+        """Custom ViT-style encoder for auxiliary modalities with robust 2D patch embedding."""
+
+        def __init__(
+                self,
+                img_size=128,
+                patch_size=8,
+                in_chans=3,
+                embed_dim=256
+        ):
+            super().__init__()
+
+            # Validate patch size
+            assert img_size % patch_size == 0, f"Image size {img_size} must be divisible by patch size {patch_size}"
+
+            # Custom 2D patch embedding for auxiliary modalities
+            self.patch_embed = nn.Conv2d(
+                in_channels=in_chans,
+                out_channels=embed_dim,
+                kernel_size=patch_size,
+                stride=patch_size
+            )
+
+            # Transformer blocks
+            self.blocks = nn.ModuleList([
+                Block(
+                    dim=embed_dim,
+                    num_heads=8,
+                    mlp_ratio=4.0,
+                    qkv_bias=True,
+                    norm_layer=partial(nn.LayerNorm, eps=1e-6)
+                ) for _ in range(4)
+            ])
+
+            # Final layer norm
+            self.norm = nn.LayerNorm(embed_dim)
+
+        def forward(self, x):
+            # Ensure input is 4D (B, C, H, W)
+            if x.ndim == 3:
+                x = x.unsqueeze(0)  # Add batch dimension if missing
+
+            # Patch embedding
+            x = self.patch_embed(x)  # Output: [B, embed_dim, H/patch_size, W/patch_size]
+
+            # Flatten spatial dimensions
+            B, C, H, W = x.shape
+            x = x.flatten(2)  # Output: [B, embed_dim, H*W]
+            x = x.transpose(1, 2)  # Output: [B, H*W, embed_dim]
+
+            # Process through transformer blocks
+            for blk in self.blocks:
+                x = blk(x)
+
+            # Layer norm
+            x = self.norm(x)
+
+            # Global average pooling
+            x = x.mean(dim=1)  # Mean across patch tokens
+
+            return x
+
+    # The rest of the methods (random_masking, forward_encoder, forward_decoder,
+    # forward_loss, forward, encode_auxiliary, contrastive_loss)
+    # remain exactly the same as in the previous implementation.
+
+    def random_masking(self, x, mask_ratio):
+        """Perform per-sample random masking by per-sample shuffling."""
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
         len_keep = max(1, len_keep)  # Keep at least one token
@@ -176,27 +250,7 @@ class MultiModalSpectralGPT(nn.Module):
         return x_masked, mask, ids_restore
 
     def forward_encoder(self, hsi_img, aux_data=None):
-        """Forward pass through encoder with masking and auxiliary conditioning.
-
-        This function:
-        1. Embeds the HSI input into tokens
-        2. Reshapes from [B, T, HW, D] to [B, T*HW, D]
-        3. Applies positional embeddings
-        4. Performs random masking
-        5. Conditions on auxiliary modalities if present
-        6. Processes through transformer blocks
-
-        Args:
-            hsi_img: Input HSI image [B, C, T, H, W]
-            aux_data: Optional dictionary of auxiliary modality data
-
-        Returns:
-            tuple: (
-                x: encoded features [B, L*(1-mask_ratio), D]
-                mask: binary mask [B, L]
-                ids_restore: restoration indices [B, L]
-            )
-        """
+        """Forward pass through encoder with masking and auxiliary conditioning."""
         # Convert input to sequence of embedded patches
         x = self.patch_embed(hsi_img)  # Shape: [B, T, HW, D]
 
@@ -227,22 +281,7 @@ class MultiModalSpectralGPT(nn.Module):
         return x, mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
-        """Decoder to reconstruct masked tokens in embedding space.
-
-        This function:
-        1. Projects encoder features to decoder dimension
-        2. Appends mask tokens for masked positions
-        3. Reorders tokens to original sequence
-        4. Applies decoder transformer blocks
-        5. Predicts original embeddings
-
-        Args:
-            x: Encoded features [B, L*(1-mask_ratio), D]
-            ids_restore: Token restoration indices [B, L]
-
-        Returns:
-            torch.Tensor: Reconstructed embeddings [B, L, embed_dim]
-        """
+        """Decoder to reconstruct masked tokens in embedding space."""
         # Project to decoder dimension
         x = self.decoder_embed(x)
 
@@ -272,19 +311,7 @@ class MultiModalSpectralGPT(nn.Module):
         return x
 
     def forward_loss(self, imgs, pred, mask):
-        """Compute reconstruction loss in embedding space.
-
-        The loss is computed as the mean squared error between predicted
-        and actual embeddings, but only for the masked tokens.
-
-        Args:
-            imgs: Input images [B, C, T, H, W]
-            pred: Decoder predictions [B, L, embed_dim]
-            mask: Binary mask [B, L], 1 for masked tokens
-
-        Returns:
-            torch.Tensor: Reconstruction loss value
-        """
+        """Compute reconstruction loss in embedding space."""
         # Get target embeddings [B, T, HW, D]
         target = self.patch_embed(imgs)
 
@@ -302,26 +329,7 @@ class MultiModalSpectralGPT(nn.Module):
         return loss_recon
 
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
-        """Forward pass through the full model.
-
-        This is the main entry point that:
-        1. Processes inputs through encoder
-        2. Reconstructs masked tokens with decoder
-        3. Computes reconstruction and contrastive losses
-
-        Args:
-            hsi_img: Input HSI image [B, C, T, H, W]
-            aux_data: Optional dictionary of auxiliary images
-            batch_idx: Optional indices for contrastive pairs
-
-        Returns:
-            dict: Results including:
-                - loss: Combined loss
-                - loss_recon: Reconstruction loss
-                - loss_contrast: Contrastive loss
-                - pred: Predictions
-                - mask: Masking pattern
-        """
+        """Forward pass through the full model."""
         # Move auxiliary data to correct device
         device = hsi_img.device
         if aux_data is not None:
@@ -394,7 +402,7 @@ class MultiModalSpectralGPT(nn.Module):
             if embeddings is not None:
                 # Project to main embedding dimension first
                 embeddings = self.modality_proj(embeddings)  # Project from aux_embed_dim to embed_dim
-                # Now project through contrastive head (i,e, map to contrastive embedding space)
+                # Now project through contrastive head (i.e., map to contrastive embedding space)
                 z_aux = self.proj_head(embeddings)  # [B, D]
 
                 # Calculate similarity matrix [B, B]
@@ -408,89 +416,6 @@ class MultiModalSpectralGPT(nn.Module):
                 num_modalities += 1
 
         return total_loss / max(num_modalities, 1)
-
-    def _make_aux_encoder(self, in_channels, embed_dim):
-        """Creates an encoder for auxiliary modalities with improved error handling."""
-        if self.aux_encoder_type == 'cnn':
-            return nn.Sequential(
-                nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3),
-                nn.ReLU(),
-                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(128, embed_dim, kernel_size=3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool2d((1, 1)),
-                nn.Flatten(),
-                nn.Linear(embed_dim, embed_dim)
-            )
-        elif self.aux_encoder_type == 'vit':
-            return self.AuxViTEncoder(
-                img_size=self.img_size,
-                patch_size=self.patch_size,
-                in_chans=in_channels,
-                embed_dim=embed_dim
-            )
-        else:
-            raise ValueError(f"Unknown auxiliary encoder type: {self.aux_encoder_type}")
-
-    class AuxViTEncoder(nn.Module):
-        """Custom ViT-style encoder for auxiliary modalities with robust 2D patch embedding."""
-
-        def __init__(
-                self,
-                img_size=128,
-                patch_size=8,
-                in_chans=3,
-                embed_dim=256
-        ):
-            super().__init__()
-            # Custom 2D patch embedding for auxiliary modalities
-            self.patch_embed = nn.Conv2d(
-                in_channels=in_chans,
-                out_channels=embed_dim,
-                kernel_size=patch_size,
-                stride=patch_size
-            )
-
-            # Transformer blocks
-            self.blocks = nn.ModuleList([
-                Block(
-                    dim=embed_dim,
-                    num_heads=8,
-                    mlp_ratio=4.0,
-                    qkv_bias=True,
-                    norm_layer=partial(nn.LayerNorm, eps=1e-6)
-                ) for _ in range(4)
-            ])
-
-            # Final layer norm
-            self.norm = nn.LayerNorm(embed_dim)
-
-        def forward(self, x):
-            # Ensure input is 4D (B, C, H, W)
-            if x.ndim == 3:
-                x = x.unsqueeze(0)  # Add batch dimension if missing
-
-            # Patch embedding
-            x = self.patch_embed(x)  # Output: [B, embed_dim, H/patch_size, W/patch_size]
-
-            # Flatten spatial dimensions
-            B, C, H, W = x.shape
-            x = x.flatten(2)  # Output: [B, embed_dim, H*W]
-            x = x.transpose(1, 2)  # Output: [B, H*W, embed_dim]
-
-            # Process through transformer blocks
-            for blk in self.blocks:
-                x = blk(x)
-
-            # Layer norm
-            x = self.norm(x)
-
-            # Global average pooling
-            x = x.mean(dim=1)  # Mean across patch tokens
-
-            return x
 
     def initialize_weights(self):
         """Initialize model weights."""

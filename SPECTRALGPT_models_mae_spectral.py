@@ -8,6 +8,10 @@
 # timm: https://github.com/rwightman/pytorch-image-models/tree/master/timm
 # DeiT: https://github.com/facebookresearch/deit
 # MAE: https://github.com/facebookresearch/mae
+
+
+
+#NOTE THIS CODE IS NOT ACTUALLY USED BY OUR MODEL - SERVED AS INSPIRATION FOR DESIGN OF OUR OWN MAE
 # --------------------------------------------------------
 
 from functools import partial
