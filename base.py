@@ -1,8 +1,74 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from functools import partial
 from util.video_vit import PatchEmbed, Block
 from einops import rearrange
+
+
+class SpatialRegistration(nn.Module):
+    """
+    Preprocessing module to ensure all modalities are spatially registered
+    to the same dimensions before entering the model.
+    """
+
+    def __init__(self, analysis_dim):
+        """
+        Initialize the spatial registration module.
+
+        Args:
+            analysis_dim (int): The target spatial dimension for all modalities.
+        """
+        super().__init__()
+        self.analysis_dim = analysis_dim
+
+    def forward(self, hsi_img, aux_data):
+        """
+        Resizes all input modalities to the same spatial dimensions.
+
+        Args:
+            hsi_img (torch.Tensor): HSI image tensor of shape [B, C, T, H, W]
+            aux_data (dict): Dictionary of auxiliary modalities
+                             Each modality has shape [B, C, H, W]
+
+        Returns:
+            tuple: (spatially_registered_hsi, spatially_registered_aux_data)
+        """
+        # Get batch size from HSI image
+        batch_size = hsi_img.shape[0]
+
+        # Resize HSI temporal dimension maintaining all spectral bands
+        B, C, T, H, W = hsi_img.shape
+
+        # First reshape to [B*T, C, H, W] for batch-compatible resizing
+        hsi_reshaped = hsi_img.view(B * T, C, H, W)
+
+        # Resize spatial dimensions
+        hsi_resized = F.interpolate(
+            hsi_reshaped,
+            size=(self.analysis_dim, self.analysis_dim),
+            mode='bilinear',
+            align_corners=False
+        )
+
+        # Reshape back to [B, C, T, analysis_dim, analysis_dim]
+        hsi_registered = hsi_resized.view(B, C, T, self.analysis_dim, self.analysis_dim)
+
+        # Process auxiliary modalities
+        aux_registered = {}
+        for modality, data in aux_data.items():
+            if data is not None:
+                # Resize to target dimension
+                aux_registered[modality] = F.interpolate(
+                    data,
+                    size=(self.analysis_dim, self.analysis_dim),
+                    mode='bilinear',
+                    align_corners=False
+                )
+            else:
+                aux_registered[modality] = None
+
+        return hsi_registered, aux_registered
 
 
 class MultiModalSpectralGPT(nn.Module):
@@ -15,6 +81,7 @@ class MultiModalSpectralGPT(nn.Module):
     3. Contrastive learning to align representations across modalities
 
     The architecture consists of:
+    - Spatial Registration: Ensures all modalities are spatially aligned to analysis_dim
     - HSI Encoder: Processes 3D HSI data using patch embedding and transformer blocks
     - Auxiliary Encoders: Process additional modalities (IR, AF, thickness)
     - Cross-Attention: Conditions HSI features on auxiliary information
@@ -24,8 +91,7 @@ class MultiModalSpectralGPT(nn.Module):
 
     def __init__(
             self,
-            hsi_img_size=224,  # Input spatial dimensions for HSI (H=W)
-            aux_img_size=128,  # Input spatial dimensions for auxiliary modalities
+            analysis_dim=224,  # Common spatial dimension for all modalities
             patch_size=16,  # Spatial patch size for tokenization
             in_chans=1,  # Input channels for HSI (typically 1)
             aux_chans=3,  # Channels for auxiliary modalities (e.g., RGB=3)
@@ -48,8 +114,7 @@ class MultiModalSpectralGPT(nn.Module):
         super().__init__()
 
         # Store configuration parameters
-        self.hsi_img_size = hsi_img_size
-        self.aux_img_size = aux_img_size
+        self.analysis_dim = analysis_dim
         self.patch_size = patch_size
         self.mask_ratio = mask_ratio
         self.aux_encoder_type = aux_encoder_type
@@ -57,10 +122,13 @@ class MultiModalSpectralGPT(nn.Module):
         # Set the expected number of modalities for loss standardization
         self.num_expected_modalities = 3  # ir, af, thickness
 
+        # Add spatial registration module for consistent dimensions
+        self.spatial_registration = SpatialRegistration(analysis_dim)
+
         # Initialize HSI encoder with 3D patch embedding
         # This converts the input HSI volume into a sequence of tokens
         self.patch_embed = PatchEmbed(
-            img_size=hsi_img_size,
+            img_size=analysis_dim,
             patch_size=patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
@@ -137,7 +205,7 @@ class MultiModalSpectralGPT(nn.Module):
         self.initialize_weights()
 
     def _make_aux_encoder(self, in_channels, embed_dim):
-        """Creates an encoder for auxiliary modalities with separate image size and improved error handling."""
+        """Creates an encoder for auxiliary modalities."""
         if self.aux_encoder_type == 'cnn':
             return nn.Sequential(
                 nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3),
@@ -153,7 +221,7 @@ class MultiModalSpectralGPT(nn.Module):
             )
         elif self.aux_encoder_type == 'vit':
             return self.AuxViTEncoder(
-                img_size=self.aux_img_size,  # Use auxiliary-specific image size
+                img_size=self.analysis_dim,  # Use common analysis dimension
                 patch_size=self.patch_size,
                 in_chans=in_channels,
                 embed_dim=embed_dim
@@ -255,10 +323,10 @@ class MultiModalSpectralGPT(nn.Module):
 
         # Reshape from [B, T, HW, D] to [B, T*HW, D]
         B, T, HW, D = x.shape
-        x = x.reshape(B, T * HW, D)  # Shape: [B, 1024, D]
+        x = x.reshape(B, T * HW, D)  # Shape: [B, T*HW, D]
 
         # Add positional embeddings
-        x = x + self.pos_embed  # Shape: [B, 1024, D]
+        x = x + self.pos_embed  # Shape: [B, T*HW, D]
 
         # Apply random masking
         x, mask, ids_restore = self.random_masking(x, self.mask_ratio)
@@ -367,6 +435,9 @@ class MultiModalSpectralGPT(nn.Module):
 
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
         """Forward pass through the full model with standardized contrastive loss."""
+        # Apply spatial registration to ensure all modalities have the same dimensions
+        hsi_img, aux_data = self.spatial_registration(hsi_img, aux_data)
+
         # Move auxiliary data to correct device
         device = hsi_img.device
         if aux_data is not None:

@@ -13,15 +13,15 @@ def calculate_num_patches(img_size, patch_size, num_frames, t_patch_size):
 
 
 def create_dummy_data(batch_size=3):
-    """Create dummy data for testing the model."""
-    # Create HSI data: [B, C, T, H, W]
-    hsi_data = torch.randn(batch_size, 1, 12, 224, 224)
+    """Create dummy data for testing the model with different input sizes."""
+    # Create HSI data: [B, C, T, H, W] with larger size
+    hsi_data = torch.randn(batch_size, 1, 12, 256, 256)
 
     # Create auxiliary data with different sizes
     aux_data = {
         'ir': torch.randn(batch_size, 3, 128, 128),
-        'af': torch.randn(batch_size, 3, 128, 128),
-        'thickness': torch.randn(batch_size, 1, 128, 128)
+        'af': torch.randn(batch_size, 3, 192, 192),
+        'thickness': torch.randn(batch_size, 1, 100, 100)
     }
 
     # Create batch indices for contrastive learning
@@ -34,36 +34,39 @@ def test_model():
     """Test the MultiModalSpectralGPT model with dummy data."""
 
     # Model parameters
-    hsi_img_size = 224  # HSI image size
-    aux_img_size = 128  # Auxiliary image size
+    analysis_dim = 224  # Common spatial dimensions for all modalities
     patch_size = 16
     num_frames = 12
     t_patch_size = 3
     embed_dim = 768
 
     # Calculate the actual number of patches for HSI
-    num_patches = calculate_num_patches(hsi_img_size, patch_size, num_frames, t_patch_size)
+    num_patches = calculate_num_patches(analysis_dim, patch_size, num_frames, t_patch_size)
     print(f"Number of patches that will be generated: {num_patches}")
 
-    # Create model with correct dimensions
+    # Create model with consistent analysis_dim
     model = MultiModalSpectralGPT(
-        hsi_img_size=hsi_img_size,     # Specify HSI image size
-        aux_img_size=aux_img_size,      # Specify auxiliary image size
+        analysis_dim=analysis_dim,  # Common spatial dimension
         patch_size=patch_size,
         embed_dim=embed_dim,
         num_frames=num_frames,
         t_patch_size=t_patch_size,
-        in_chans=1,                     # HSI channels
-        aux_chans=3,                    # Auxiliary channels
-        aux_encoder_type='vit'          # Choose auxiliary encoder type
+        in_chans=1,  # HSI channels
+        aux_chans=3,  # Auxiliary channels
+        aux_encoder_type='vit'  # Choose auxiliary encoder type
     )
 
     # Verify positional embedding size
     print(f"Position embedding shape: {model.pos_embed.shape}")
     print(f"Expected shape: [1, {num_patches}, {embed_dim}]")
 
-    # Generate dummy data
+    # Generate dummy data with varied input sizes to test spatial registration
     hsi_data, aux_data, batch_indices = create_dummy_data(batch_size=3)
+
+    print("\nInput data shapes before spatial registration:")
+    print(f"HSI data shape: {hsi_data.shape}")
+    for modality, data in aux_data.items():
+        print(f"{modality} data shape: {data.shape}")
 
     # Move everything to GPU if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -74,10 +77,16 @@ def test_model():
     aux_data = {k: v.to(device) for k, v in aux_data.items()}
     batch_indices = batch_indices.to(device)
 
-    print("\nTesting model with dummy data...")
-    print(f"HSI data shape: {hsi_data.shape}")
-    for modality, data in aux_data.items():
+    # Get the registered dimensions by manually applying spatial registration
+    with torch.no_grad():
+        hsi_registered, aux_registered = model.spatial_registration(hsi_data, aux_data)
+
+    print("\nData shapes after spatial registration:")
+    print(f"HSI data shape: {hsi_registered.shape}")
+    for modality, data in aux_registered.items():
         print(f"{modality} data shape: {data.shape}")
+
+    print("\nTesting model with dummy data...")
 
     # Test forward pass
     try:
