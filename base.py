@@ -54,6 +54,9 @@ class MultiModalSpectralGPT(nn.Module):
         self.mask_ratio = mask_ratio
         self.aux_encoder_type = aux_encoder_type
 
+        # Set the expected number of modalities for loss standardization
+        self.num_expected_modalities = 3  # ir, af, thickness
+
         # Initialize HSI encoder with 3D patch embedding
         # This converts the input HSI volume into a sequence of tokens
         self.patch_embed = PatchEmbed(
@@ -220,10 +223,6 @@ class MultiModalSpectralGPT(nn.Module):
 
             return x
 
-    # The rest of the methods (random_masking, forward_encoder, forward_decoder,
-    # forward_loss, forward, encode_auxiliary, contrastive_loss)
-    # remain exactly the same as in the previous implementation.
-
     def random_masking(self, x, mask_ratio):
         """Perform per-sample random masking by per-sample shuffling."""
         N, L, D = x.shape
@@ -328,8 +327,46 @@ class MultiModalSpectralGPT(nn.Module):
 
         return loss_recon
 
+    def contrastive_loss(self, hsi_features, aux_embeddings, batch_idx):
+        """Calculate contrastive loss with fixed normalization."""
+        device = hsi_features.device
+
+        # Project features to contrastive space
+        z_hsi = self.proj_head(hsi_features.mean(dim=1))
+
+        # Calculate individual losses for available modalities
+        individual_losses = []
+
+        for modality, embeddings in aux_embeddings.items():
+            if embeddings is not None:
+                # Project embeddings
+                embeddings = self.modality_proj(embeddings)
+                z_aux = self.proj_head(embeddings)
+
+                # Calculate similarity and loss
+                sim_matrix = torch.matmul(z_hsi, z_aux.T) / self.temperature
+                labels = batch_idx.to(device)
+                loss = nn.CrossEntropyLoss()(sim_matrix, labels)
+
+                individual_losses.append(loss)
+
+        # If no modalities available, return zero loss
+        if not individual_losses:
+            return torch.tensor(0.0, device=device)
+
+        # Average the available losses
+        avg_loss = torch.stack(individual_losses).mean()
+
+        # Scale to expected total (to maintain consistent magnitude)
+        # This ensures total loss doesn't decrease when modalities are missing
+        num_available_modalities = len(individual_losses)
+        scaling_factor = self.num_expected_modalities / num_available_modalities
+        scaled_loss = avg_loss * scaling_factor
+
+        return scaled_loss
+
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
-        """Forward pass through the full model."""
+        """Forward pass through the full model with standardized contrastive loss."""
         # Move auxiliary data to correct device
         device = hsi_img.device
         if aux_data is not None:
@@ -347,14 +384,24 @@ class MultiModalSpectralGPT(nn.Module):
 
         # Calculate contrastive loss if auxiliary data present
         loss_contrast = torch.tensor(0.0, device=device)
+        num_available = 0
         if aux_data is not None and batch_idx is not None:
-            aux_embeddings = self.encode_auxiliary(aux_data)
-            loss_contrast = self.contrastive_loss(latent, aux_embeddings, batch_idx)
+            # Count available modalities for logging
+            num_available = sum(1 for v in aux_data.values() if v is not None)
+
+            # Only compute contrastive loss if at least one modality is available
+            if num_available > 0:
+                aux_embeddings = self.encode_auxiliary(aux_data)
+                loss_contrast = self.contrastive_loss(latent, aux_embeddings, batch_idx)
+
+        # Calculate total loss
+        loss = loss_recon + loss_contrast
 
         return {
-            'loss': loss_recon + loss_contrast,
+            'loss': loss,
             'loss_recon': loss_recon,
             'loss_contrast': loss_contrast,
+            'num_modalities': torch.tensor(num_available, device=device),
             'pred': pred,
             'mask': mask
         }
@@ -377,45 +424,6 @@ class MultiModalSpectralGPT(nn.Module):
                 aux_embeddings[modality] = self.aux_encoder[modality](data)
                 aux_embeddings[modality] = self.aux_norm(aux_embeddings[modality])
         return aux_embeddings
-
-    def contrastive_loss(self, hsi_features, aux_embeddings, batch_idx):
-        """Calculate contrastive loss between HSI and auxiliary modalities.
-
-        Args:
-            hsi_features: HSI features [B, L*(1-mask_ratio), D]
-            aux_embeddings: Dictionary of auxiliary embeddings
-            batch_idx: Batch indices for positive pairs
-
-        Returns:
-            torch.Tensor: Contrastive loss value
-        """
-        device = hsi_features.device
-
-        # Project features to contrastive space
-        # First average across the sequence dimension (dim=1)
-        z_hsi = self.proj_head(hsi_features.mean(dim=1))  # [B, D]
-
-        total_loss = torch.tensor(0.0, device=device)
-        num_modalities = 0
-
-        for modality, embeddings in aux_embeddings.items():
-            if embeddings is not None:
-                # Project to main embedding dimension first
-                embeddings = self.modality_proj(embeddings)  # Project from aux_embed_dim to embed_dim
-                # Now project through contrastive head (i.e., map to contrastive embedding space)
-                z_aux = self.proj_head(embeddings)  # [B, D]
-
-                # Calculate similarity matrix [B, B]
-                sim_matrix = torch.matmul(z_hsi, z_aux.T) / self.temperature
-
-                # Use batch indices for positive pairs
-                labels = batch_idx.to(device)
-                loss = nn.CrossEntropyLoss()(sim_matrix, labels)
-
-                total_loss += loss
-                num_modalities += 1
-
-        return total_loss / max(num_modalities, 1)
 
     def initialize_weights(self):
         """Initialize model weights."""
