@@ -1,22 +1,36 @@
 """
-Multi-Modal Guided SpectralGPT Architecture (Updated)
-===================================================
+Spatially Registered Multi-Modal Guided SpectralGPT Architecture
+===============================================================
 
 Key Updates:
 ------------
-- Separate image sizes for HSI and auxiliary modalities
+- Uniform spatial dimensions across all modalities using analysis_dim
+- Spatial registration preprocessing module
+- Single configurable dimension for all modalities
 - Flexible patch embedding
 - Configurable auxiliary encoder types (ViT or CNN)
 
-Input Processing:
----------------
-HSI Input                 IR Input                  AF Input              Thickness Input
-[B,C,T,H,W]              [B,aux_chans,H,W]         [B,aux_chans,H,W]    [B,1,H,W]
+Input Processing with Spatial Registration:
+------------------------------------------
+Original HSI Input       Original IR Input        Original AF Input        Original Thickness Input
+[B,C,T,H,W]              [B,aux_chans,H,W]         [B,aux_chans,H,W]        [B,1,H,W]
+      |                         |                         |                    |
+      v                         v                         v                    v
++------------------+   +------------------+   +------------------+   +------------------+
+|Spatial Registration|  |Spatial Registration|  |Spatial Registration|  |Spatial Registration|
+|(analysis_dim)     |  |(analysis_dim)     |  |(analysis_dim)     |  |(analysis_dim)     |
++------------------+   +------------------+   +------------------+   +------------------+
+      |                         |                         |                    |
+      v                         v                         v                    v
+Registered HSI        Registered IR           Registered AF           Registered Thickness
+[B,C,T,analysis_dim,  [B,aux_chans,          [B,aux_chans,          [B,1,analysis_dim,
+ analysis_dim]         analysis_dim,          analysis_dim,          analysis_dim]
+                       analysis_dim]          analysis_dim]
       |                         |                         |                    |
       v                         v                         v                    v
 +------------+          +--------------+          +--------------+    +--------------+
 |3D PatchEmbed|         |Aux Encoder   |          |Aux Encoder   |    |Aux Encoder   |
-|(hsi_img_size|         |(CNN or ViT)  |          |(CNN or ViT)  |    |(CNN or ViT)  |
+|(analysis_dim|         |(CNN or ViT)  |          |(CNN or ViT)  |    |(CNN or ViT)  |
 | patch_size) |         |              |          |              |    |              |
 +------------+          +--------------+          +--------------+    +--------------+
       |                         |                         |                    |
@@ -56,8 +70,7 @@ Path        Path
 
 Configuration Parameters:
 ----------------------
-- hsi_img_size: Spatial dimensions for HSI (e.g., 500x500)
-- aux_img_size: Spatial dimensions for auxiliary modalities (e.g., 128x128)
+- analysis_dim: Common spatial dimension for all modalities (e.g., 224)
 - patch_size: Spatial patch size for tokenization
 - in_chans: Input channels for HSI (typically 1)
 - aux_chans: Channels for auxiliary modalities (e.g., 3 for RGB)
@@ -69,31 +82,35 @@ Configuration Parameters:
 
 Detailed Forward Pass:
 --------------------
-1. Patch Embedding
+1. Spatial Registration
+   - Resize all modalities to same spatial dimensions (analysis_dim × analysis_dim)
+   - Preserve temporal dimension in HSI
+
+2. Patch Embedding
    - HSI: 3D patch embedding with spatial and temporal patches
    - Auxiliary: 2D patch embedding (ViT or CNN)
 
-2. Positional Embedding
+3. Positional Embedding
    - Add learnable position embeddings to patch tokens
 
-3. Random Masking
+4. Random Masking
    - Randomly mask a proportion of tokens (default 75%)
    - Maintain original token order for reconstruction
 
-4. Cross-Modal Conditioning
+5. Cross-Modal Conditioning
    - Project auxiliary features to main embedding dimension
    - Apply cross-attention to condition HSI features
 
-5. Transformer Processing
+6. Transformer Processing
    - Apply transformer blocks to process tokens
    - Normalize features
 
-6. Decoding Path
+7. Decoding Path
    - Project features to decoder dimension
    - Append mask tokens
    - Reconstruct original token embeddings
 
-7. Contrastive Learning
+8. Contrastive Learning
    - Mean pool features
    - Project to contrastive embedding space
    - Compute similarity across modalities
@@ -113,8 +130,7 @@ Training Objectives:
 Example Configuration:
 --------------------
 model = MultiModalSpectralGPT(
-    hsi_img_size=500,
-    aux_img_size=128,
+    analysis_dim=224,
     patch_size=16,
     in_chans=1,
     aux_chans=3,
@@ -129,13 +145,12 @@ model = MultiModalSpectralGPT(
 
 
 """
-Multi-Modal Guided SpectralGPT Architecture (Concrete Implementation)
-===================================================================
+Spatially Registered Multi-Modal Guided SpectralGPT Architecture (Concrete Implementation)
+=======================================================================================
 
 Concrete Model Configuration:
 ----------------------------
-- hsi_img_size: 224 (default spatial dimensions for HSI)
-- aux_img_size: 128 (default auxiliary modalities dimensions)
+- analysis_dim: 224 (common spatial dimension for all modalities)
 - patch_size: 16 (spatial patch size)
 - in_chans: 1 (HSI input channels)
 - aux_chans: 3 (Auxiliary modalities channels, e.g., RGB)
@@ -150,17 +165,26 @@ Concrete Model Configuration:
 
 Input Processing Specifics:
 -------------------------
-HSI Input                 IR Input                  AF Input              Thickness Input
-[B,1,12,224,224]         [B,3,128,128]             [B,3,128,128]        [B,1,128,128]
+Original HSI Input       Original IR Input        Original AF Input        Original Thickness Input
+[B,1,12,256,256]        [B,3,128,128]            [B,3,192,192]           [B,1,100,100]
+      |                         |                         |                    |
+      v                         v                         v                    v
++------------------+   +------------------+   +------------------+   +------------------+
+|Spatial Registration|  |Spatial Registration|  |Spatial Registration|  |Spatial Registration|
+|(analysis_dim=224) |  |(analysis_dim=224) |  |(analysis_dim=224) |  |(analysis_dim=224) |
++------------------+   +------------------+   +------------------+   +------------------+
+      |                         |                         |                    |
+      v                         v                         v                    v
+[B,1,12,224,224]         [B,3,224,224]             [B,3,224,224]        [B,1,224,224]
       |                         |                         |                    |
       v                         v                         v                    v
 +------------+          +--------------+          +--------------+    +--------------+
 |3D PatchEmbed|         |ViT Encoder   |          |ViT Encoder   |    |ViT Encoder   |
-|(224x224,16)|          |(128x128,16)  |          |(128x128,16)  |    |(128x128,16)  |
+|(224x224,16)|          |(224x224,16)  |          |(224x224,16)  |    |(224x224,16)  |
 +------------+          +--------------+          +--------------+    +--------------+
       |                         |                         |                    |
       v                         v                         v                    v
-[B,784,768]         [B,64,256]           [B,64,256]        [B,64,256]
+[B,784,768]         [B,196,256]           [B,196,256]        [B,196,256]
       |                         |                         |                    |
       v                         v                         v                    v
 +Position Embed   Aux LayerNorm  Aux LayerNorm   Aux LayerNorm
@@ -191,7 +215,7 @@ Path        Path
 Patch Embedding Calculations:
 ---------------------------
 1. HSI Patch Embedding:
-   - Input Size: 224 × 224 × 12
+   - Input Size: 224 × 224 × 12 (after registration)
    - Patch Size: 16 × 16 spatial, 3 temporal
    - Grid Size: (224/16) × (224/16) × (12/3)
    - Patch Grid: 14 × 14 × 4
@@ -199,11 +223,22 @@ Patch Embedding Calculations:
    - Output Shape: [B, 784, 768]
 
 2. Auxiliary Patch Embedding:
-   - Input Size: 128 × 128
+   - Input Size: 224 × 224 (after registration)
    - Patch Size: 16 × 16
-   - Grid Size: 8 × 8
-   - Total Patches: 8 × 8 = 64 patches
-   - Output Shape per Modality: [B, 64, 256]
+   - Grid Size: 14 × 14
+   - Total Patches: 14 × 14 = 196 patches
+   - Output Shape per Modality: [B, 196, 256]
+
+Spatial Registration Process:
+---------------------------
+1. HSI Registration:
+   - For each temporal slice t in [0, T-1]:
+     - Resize spatial dimensions from original to [analysis_dim × analysis_dim]
+   - Preserve all spectral/temporal information
+
+2. Auxiliary Registration:
+   - Resize spatial dimensions from original to [analysis_dim × analysis_dim]
+   - Preserve channel information
 
 Masking Scenario:
 ----------------
@@ -214,9 +249,9 @@ Masking Scenario:
 
 Computational Characteristics:
 ----------------------------
-- Input Tensor Size: ~50 MB
+- Input Tensor Size: ~60 MB
 - Model Parameters: ~100M
-- Forward Pass Computation: ~10 GFLOPs
+- Forward Pass Computation: ~12 GFLOPs
 
 Training Objectives:
 ------------------
@@ -233,8 +268,7 @@ Training Objectives:
 Example Code:
 ------------
 model = MultiModalSpectralGPT(
-    hsi_img_size=224,
-    aux_img_size=128,
+    analysis_dim=224,
     patch_size=16,
     in_chans=1,
     aux_chans=3,
