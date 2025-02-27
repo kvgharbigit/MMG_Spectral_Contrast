@@ -4,24 +4,44 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+from timm.models.layers import to_2tuple
 from base import MultiModalSpectralGPT
 
 
-def calculate_num_patches(img_size, patch_size, num_frames, t_patch_size):
-    """Calculate the number of patches that will be generated."""
-    return (img_size // patch_size) * (img_size // patch_size) * (num_frames // t_patch_size)
+def calculate_num_patches(hsi_img, patch_size, t_patch_size):
+    """
+    Dynamically calculate the number of patches based on preprocessed HSI image.
+
+    Args:
+        hsi_img (torch.Tensor): Preprocessed HSI image tensor of shape [B, C, T, H, W]
+        patch_size (tuple): Spatial patch size
+        t_patch_size (int): Temporal/spectral patch size
+
+    Returns:
+        int: Number of patches
+    """
+    # Get dimensions after preprocessing
+    _, _, T, H, W = hsi_img.shape
+
+    # Calculate number of patches
+    spatial_patches_h = H // patch_size[0]
+    spatial_patches_w = W // patch_size[1]
+    temporal_patches = T // t_patch_size
+
+    return spatial_patches_h * spatial_patches_w * temporal_patches
 
 
 def create_dummy_data(batch_size=3):
     """Create dummy data for testing the model with different input sizes."""
     # Create HSI data: [B, C, T, H, W] with larger size
-    hsi_data = torch.randn(batch_size, 1, 12, 256, 256)
+    # Updated to 500x500 spatial size and 91 spectral bands
+    hsi_data = torch.randn(batch_size, 1, 91, 500, 500)  # Test resizing
 
-    # Create auxiliary data with different sizes
+    # Create auxiliary data with different sizes - NOW 1 CHANNEL EACH
     aux_data = {
-        'ir': torch.randn(batch_size, 3, 128, 128),
-        'af': torch.randn(batch_size, 3, 192, 192),
-        'thickness': torch.randn(batch_size, 1, 100, 100)
+        'ir': torch.randn(batch_size, 1, 128, 128),
+        'af': torch.randn(batch_size, 1, 256, 256),
+        'thickness': torch.randn(batch_size, 1, 200, 200)
     }
 
     # Create batch indices for contrastive learning
@@ -34,31 +54,24 @@ def test_model():
     """Test the MultiModalSpectralGPT model with dummy data."""
 
     # Model parameters
-    analysis_dim = 224  # Common spatial dimensions for all modalities
-    patch_size = 16
-    num_frames = 12
-    t_patch_size = 3
+    analysis_dim = 500  # Spatial dimension matching HSI input
+    patch_size = (25, 25)  # Specify as a tuple
+    t_patch_size = 5  # Adjust temporal patch size to divide spectral bands evenly
     embed_dim = 768
 
-    # Calculate the actual number of patches for HSI
-    num_patches = calculate_num_patches(analysis_dim, patch_size, num_frames, t_patch_size)
-    print(f"Number of patches that will be generated: {num_patches}")
+    # Verify that analysis_dim is divisible by patch_size
+    assert analysis_dim % patch_size[0] == 0, f"{analysis_dim} must be divisible by {patch_size[0]}"
 
-    # Create model with consistent analysis_dim
+    # Create model with updated parameters
     model = MultiModalSpectralGPT(
         analysis_dim=analysis_dim,  # Common spatial dimension
-        patch_size=patch_size,
+        patch_size=patch_size,  # Use tuple
         embed_dim=embed_dim,
-        num_frames=num_frames,
         t_patch_size=t_patch_size,
         in_chans=1,  # HSI channels
-        aux_chans=3,  # Auxiliary channels
+        aux_chans=1,  # NOW 1 CHANNEL FOR AUXILIARY CHANNELS
         aux_encoder_type='vit'  # Choose auxiliary encoder type
     )
-
-    # Verify positional embedding size
-    print(f"Position embedding shape: {model.pos_embed.shape}")
-    print(f"Expected shape: [1, {num_patches}, {embed_dim}]")
 
     # Generate dummy data with varied input sizes to test spatial registration
     hsi_data, aux_data, batch_indices = create_dummy_data(batch_size=3)
@@ -85,6 +98,21 @@ def test_model():
     print(f"HSI data shape: {hsi_registered.shape}")
     for modality, data in aux_registered.items():
         print(f"{modality} data shape: {data.shape}")
+
+    # Manually set up patch embedding
+    model._setup_patch_embedding(hsi_registered)
+
+    # Dynamically calculate number of patches after preprocessing
+    num_patches = calculate_num_patches(
+        hsi_registered,
+        patch_size,
+        t_patch_size
+    )
+    print(f"\nNumber of patches that will be generated: {num_patches}")
+
+    # Verify positional embedding size
+    print(f"Position embedding shape: {model.pos_embed.shape}")
+    print(f"Expected shape: [1, {num_patches}, {embed_dim}]")
 
     print("\nTesting model with dummy data...")
 

@@ -2,313 +2,194 @@
 Spatially Registered Multi-Modal Guided SpectralGPT Architecture
 ===============================================================
 
-Key Updates:
-------------
-- Uniform spatial dimensions across all modalities using analysis_dim
-- Spatial registration preprocessing module
-- Single configurable dimension for all modalities
-- Flexible patch embedding
-- Configurable auxiliary encoder types (ViT or CNN)
-- GLOBAL AVERAGING in auxiliary encoders for co-registration robustness
+Overarching Model Architecture Diagram:
+---------------------------------------
+                  Input Modalities
+    HSI             IR             AF         Thickness
+[B,1,91,500,500] [B,1,128,128] [B,1,256,256] [B,1,200,200]
+    |               |               |             |
+    v               v               v             v
++-----------------------------------------------------------+
+|                Spatial Registration                        |
+|  - Resize to common dimension (500x500)                   |
+|  - Select spectral bands for HSI                          |
++-----------------------------------------------------------+
+    |               |               |             |
+    v               v               v             v
+[B,1,30,500,500] [B,1,500,500] [B,1,500,500] [B,1,500,500]
+    |               |               |             |
+    v               v               v             v
++-----------------------------------------------------------+
+|                Patch Embedding                             |
+|  - 3D Patch Embedding (HSI)                               |
+|  - 2D Patch Embedding (Auxiliary)                         |
+|  - Global Averaging for Auxiliary Modalities               |
++-----------------------------------------------------------+
+    |               |               |             |
+    v               v               v             v
+[B,2400,768]   [B,256]         [B,256]       [B,256]
+    |               |               |             |
+    v               v               v             v
++-----------------------------------------------------------+
+|            Cross-Attention Conditioning                    |
+|  - Project auxiliary features                             |
+|  - Condition HSI tokens with auxiliary global vectors     |
++-----------------------------------------------------------+
+    |
+    v
++-----------------------------------------------------------+
+|                Transformer Blocks                          |
+|  - Process conditioned HSI tokens                         |
+|  - Apply self-attention and feed-forward layers           |
++-----------------------------------------------------------+
+    |
+    v
++-----------------------------------------------------------+
+|                 Decoding Path                              |
+|  - Reconstruct masked tokens                              |
+|  - Compute reconstruction loss                            |
++-----------------------------------------------------------+
+    |
+    v
++-----------------------------------------------------------+
+|            Contrastive Learning                            |
+|  - Global averaging of HSI features                       |
+|  - Project to common embedding space                      |
+|  - Compute inter-modality similarities                    |
++-----------------------------------------------------------+
+    |
+    v
+   Loss
+ (Reconstruction
+   + Contrastive)
 
-Input Processing with Spatial Registration:
-------------------------------------------
+"""
+
+"""
+Input Processing Diagram:
+------------------------
 Original HSI Input       Original IR Input        Original AF Input        Original Thickness Input
-[B,C,T,H,W]              [B,aux_chans,H,W]         [B,aux_chans,H,W]        [B,1,H,W]
+[B,1,91,500,500]         [B,1,128,128]            [B,1,256,256]           [B,1,200,200]
       |                         |                         |                    |
       v                         v                         v                    v
 +------------------+   +------------------+   +------------------+   +------------------+
-|Spatial Registration|  |Spatial Registration|  |Spatial Registration|  |Spatial Registration|
-|(analysis_dim)     |  |(analysis_dim)     |  |(analysis_dim)     |  |(analysis_dim)     |
+|Spectral/Spatial  |  |Spatial Registration|  |Spatial Registration|  |Spatial Registration|
+|Registration     |  |(analysis_dim=500) |  |(analysis_dim=500) |  |(analysis_dim=500) |
 +------------------+   +------------------+   +------------------+   +------------------+
       |                         |                         |                    |
       v                         v                         v                    v
-Registered HSI        Registered IR           Registered AF           Registered Thickness
-[B,C,T,analysis_dim,  [B,aux_chans,          [B,aux_chans,          [B,1,analysis_dim,
- analysis_dim]         analysis_dim,          analysis_dim,          analysis_dim]
-                       analysis_dim]          analysis_dim]
+[B,1,30,500,500]         [B,1,500,500]             [B,1,500,500]        [B,1,500,500]
       |                         |                         |                    |
       v                         v                         v                    v
 +------------+          +--------------+          +--------------+    +--------------+
-|3D PatchEmbed|         |Aux Encoder   |          |Aux Encoder   |    |Aux Encoder   |
-|(analysis_dim|         |(CNN or ViT)  |          |(CNN or ViT)  |    |(CNN or ViT)  |
-| patch_size) |         |+GlobalAverage|          |+GlobalAverage|    |+GlobalAverage|
-+------------+          +--------------+          +--------------+    +--------------+
-      |                         |                         |                    |
-      v                         v                         v                    v
-[B,num_patches,        [B,aux_embed_dim]         [B,aux_embed_dim]     [B,aux_embed_dim]
- embed_dim]             (global vector)           (global vector)       (global vector)
-      |                         |                         |                    |
-      v                         v                         v                    v
-+Position Embed        Auxiliary LayerNorm       Auxiliary LayerNorm  Auxiliary LayerNorm
-      |                         |                         |                    |
+|3D PatchEmbed|         |ViT Encoder   |          |ViT Encoder   |    |ViT Encoder   |
+|(500,25x25,5)|         |(500,25x25,16)|          |(500,25x25,16)|    |(500,25x25,16)|
++------------+          |+mean(dim=1)  |          |+mean(dim=1)  |    |+mean(dim=1)  |
+      |                 +--------------+          +--------------+    +--------------+
       v                         |                         |                    |
-Random Masking                  |                         |                    |
-(mask_ratio=0.75)              |                         |                    |
-      |                         \                        |                   /
-      |                          \                       |                  /
-      |                           \                      |                 /
-      |                        Modality Projection (aux_embed_dim -> embed_dim)
-      |                                       |
-      |              /-------------------------/
-      v             v
-+------------------+
-|Cross-Attn Blocks |
-|(depth layers)    |
-+------------------+
-         |
-         v
-+------------------+
-|Transformer Blocks|
-|(depth=12)        |
-+------------------+
-         |
-    /----|----\
-    |         |
-    v         v
-Decoder     Contrastive Path
-Path        [Global Averaging]
-              ↓
-            Similarity
-            Calculation
+      v                         v                         v                    v
+[B,2400,768]             [B,256]                  [B,256]               [B,256]
+(patch tokens)     (global vector after       (global vector after  (global vector after
+                   explicit averaging)        explicit averaging)   explicit averaging)
 
-Configuration Parameters:
-----------------------
-- analysis_dim: Common spatial dimension for all modalities (e.g., 224)
-- patch_size: Spatial patch size for tokenization
-- in_chans: Input channels for HSI (typically 1)
-- aux_chans: Channels for auxiliary modalities (e.g., 3 for RGB)
-- embed_dim: Main transformer embedding dimension (e.g., 768)
-- aux_embed_dim: Embedding dimension for auxiliary features (e.g., 256)
-- depth: Number of transformer layers
-- num_heads: Number of attention heads
-- aux_encoder_type: Type of auxiliary encoder ('cnn' or 'vit')
+Project Overview:
+----------------
+A transformer-based architecture for processing hyperspectral imagery (HSI)
+with multi-modal auxiliary inputs, combining:
+1. Masked Autoencoder (MAE) for self-supervised learning
+2. Cross-modal conditioning via cross-attention
+3. Contrastive learning for multi-modal representation alignment
 
-Detailed Forward Pass:
---------------------
-1. Spatial Registration
-   - Resize all modalities to same spatial dimensions (analysis_dim × analysis_dim)
-   - Preserve temporal dimension in HSI
+Key Architectural Components:
+----------------------------
+- Spatial Registration Module
+- 3D Patch Embedding
+- Cross-Attention Mechanism
+- Transformer Encoder
+- Masked Autoencoder Decoder
+- Contrastive Learning Path
 
-2. Patch Embedding
-   - HSI: 3D patch embedding with spatial and temporal patches
-   - Auxiliary: 2D patch embedding (ViT or CNN)
-   - CRUCIAL: Auxiliary ViT encoders include an explicit mean() operation to create global vectors
+Input Processing Configuration:
+------------------------------
+Input Dimensions:
+- HSI: [B, 1, 91, 500, 500]
+  * Batch dimension: B
+  * Channels: 1
+  * Spectral bands: 91
+  * Spatial: 500 × 500
 
-3. Positional Embedding
-   - Add learnable position embeddings to patch tokens
+Auxiliary Modalities:
+- IR: [B, 1, 128, 128]
+- AF: [B, 1, 256, 256]
+- Thickness: [B, 1, 200, 200]
 
-4. Random Masking
-   - Randomly mask a proportion of tokens (default 75%)
-   - Maintain original token order for reconstruction
+Preprocessing Steps:
+-------------------
+1. Spectral Band Selection:
+   - Reduce 91 spectral bands to 30
+   - Selection strategy:
+     * Indices: [0, 2, 4, 6, ..., 56, 80]
+     * 29 bands from 0-56 range (every 2nd band)
+     * Additional band at index 80
+   - Reduction Ratio: ~33% of original spectral information
 
-5. Cross-Modal Conditioning
-   - Project auxiliary features to main embedding dimension
-   - Apply cross-attention to condition HSI features
+2. Spatial Registration:
+   - Resize all modalities to common spatial dimension (500 × 500)
+   - Preserve key spectral and spatial characteristics
 
-Cross-Attention Mechanism (Enables Feature Association Despite Misregistration):
------------------------------------------------------------------------------
-
-   HSI Patch Tokens          Auxiliary Global Vectors (from all modalities)
-   [B, n_visible, 768]        [B, 3, 768]  (after modality projection)
+Cross-Attention Mechanism Diagram:
+---------------------------------
+   HSI Patch Tokens          Auxiliary Global Vectors
+   [B, n_visible, 768]        [B, 3, 768]
         |                       |
         |                       |
         v                       v
    +------------------------------------------------------+
-   |                                                      |
    |               Cross-Attention Block                  |
    |                                                      |
    |   1. Concatenate HSI tokens with auxiliary tokens    |
    |      [B, n_visible, 768] + [B, 3, 768]               |
    |      → [B, n_visible+3, 768]                         |
    |                                                      |
-   |   2. Self-attention allows information flow between  |
-   |      HSI patches and global auxiliary features       |
+   |   2. Self-attention between HSI and auxiliary        |
    |                                                      |
-   |   3. Extract only the HSI tokens after attention     |
-   |      [B, n_visible+3, 768] → [B, n_visible, 768]     |
+   |   3. Extract updated HSI tokens                      |
+   |      [B, n_visible, 768]                             |
    |                                                      |
    +------------------------------------------------------+
                   |
                   v
-        Updated HSI Patch Tokens
-        [B, n_visible, 768]
-                  |
-                  v
-        Add to original HSI tokens
-        (residual connection)
-                  |
-                  v
-        [B, n_visible, 768]
-                  |
-                  v
-         Next Cross-Attention Block
-                  |
-                  v
-       Main Transformer Blocks
-                  |
-                  v
-       Global Averaging (for contrastive)
-       [B, n_visible, 768] → [B, 768]
+       Global Averaging
+       [B, 768]
 
-Key Properties of Cross-Attention:
-- Conditions HSI patch tokens with global auxiliary features BEFORE HSI global averaging
-- Each HSI patch can attend to global auxiliary features regardless of spatial position
-- Allows auxiliary information to guide the HSI representation at patch level
-- Repeatedly applied through multiple cross-attention blocks for deep integration
-- Global auxiliary features influence patch-level HSI features before they're globally pooled
-- This approach provides fine-grained conditioning while maintaining robustness to misregistration
-
-6. Transformer Processing
-   - Apply transformer blocks to process tokens
-   - Normalize features
-
-7. Decoding Path
-   - Project features to decoder dimension
-   - Append mask tokens
-   - Reconstruct original token embeddings
-
-8. Contrastive Learning
-   - Mean pool HSI features to create global vector (crucial for misregistration robustness)
-   - Project to contrastive embedding space
-   - Compute similarity across modalities with temperature scaling
-
-Training Objectives:
------------------
-1. Reconstruction Loss
-   - L2 loss on masked tokens
-   - Computed in embedding space
-   - Weighted by masking pattern
-
-2. Contrastive Loss
-   - Align GLOBAL representations across modalities (key to handling misregistration)
-   - Temperature-scaled similarity
-   - Cross-entropy loss with batch indices
-
-Example Configuration:
---------------------
-model = MultiModalSpectralGPT(
-    analysis_dim=224,
-    patch_size=16,
-    in_chans=1,
-    aux_chans=3,
-    embed_dim=768,
-    aux_embed_dim=256,
-    depth=12,
-    num_heads=12,
-    aux_encoder_type='vit',
-    mask_ratio=0.75
-)
-"""
-
-
-"""
-Spatially Registered Multi-Modal Guided SpectralGPT Architecture (Concrete Implementation)
-=======================================================================================
-
-Concrete Model Configuration:
-----------------------------
-- analysis_dim: 224 (common spatial dimension for all modalities)
-- patch_size: 16 (spatial patch size)
-- in_chans: 1 (HSI input channels)
-- aux_chans: 3 (Auxiliary modalities channels, e.g., RGB)
-- embed_dim: 768 (main transformer embedding dimension)
-- aux_embed_dim: 256 (auxiliary features embedding dimension)
-- depth: 16 (number of transformer layers)
-- num_heads: 12 (number of attention heads)
-- num_frames: 12 (spectral bands in HSI)
-- t_patch_size: 3 (temporal/spectral patch size)
-- aux_encoder_type: 'vit' (auxiliary encoder type)
-- mask_ratio: 0.75 (proportion of tokens masked)
-
-Input Processing Specifics:
--------------------------
-Original HSI Input       Original IR Input        Original AF Input        Original Thickness Input
-[B,1,12,256,256]        [B,3,128,128]            [B,3,192,192]           [B,1,100,100]
-      |                         |                         |                    |
-      v                         v                         v                    v
-+------------------+   +------------------+   +------------------+   +------------------+
-|Spatial Registration|  |Spatial Registration|  |Spatial Registration|  |Spatial Registration|
-|(analysis_dim=224) |  |(analysis_dim=224) |  |(analysis_dim=224) |  |(analysis_dim=224) |
-+------------------+   +------------------+   +------------------+   +------------------+
-      |                         |                         |                    |
-      v                         v                         v                    v
-[B,1,12,224,224]         [B,3,224,224]             [B,3,224,224]        [B,1,224,224]
-      |                         |                         |                    |
-      v                         v                         v                    v
-+------------+          +--------------+          +--------------+    +--------------+
-|3D PatchEmbed|         |ViT Encoder   |          |ViT Encoder   |    |ViT Encoder   |
-|(224x224,16)|          |(224x224,16)  |          |(224x224,16)  |    |(224x224,16)  |
-+------------+          |+mean(dim=1)  |          |+mean(dim=1)  |    |+mean(dim=1)  |
-      |                 +--------------+          +--------------+    +--------------+
-      v                         |                         |                    |
-      v                         v                         v                    v
-[B,784,768]              [B,256]                  [B,256]               [B,256]
-(patch tokens)     (global vector after       (global vector after  (global vector after
-                   explicit averaging)        explicit averaging)   explicit averaging)
-      |                         |                         |                    |
-      v                         v                         v                    v
-+Position Embed   Aux LayerNorm  Aux LayerNorm   Aux LayerNorm
-      |                |              |               |
-      v                v              v               v
-Random Masking    Modality Projection (aux_embed_dim -> embed_dim)
-(mask_ratio=0.75)         |
-      |                   |
-      |    /---------------/
-      v   v
-+------------------+
-|Cross-Attn Blocks |
-|(16 layers)       |
-+------------------+
-         |
-         v
-+------------------+
-|Transformer Blocks|
-|(16 layers)       |
-+------------------+
-         |
-    /----|----\
-    |         |
-    v         v
-Decoder     Contrastive Path
-Path        [hsi_features.mean(dim=1)]
-              ↓
-            Similarity Matrix
-            (Cross-Entropy Loss)
-
-Contrastive Learning Stage:
-                      
-    HSI Features          IR Features           AF Features         Thickness Features
-    [B,784,768]           [B,256]              [B,256]             [B,256]
-        |                    |                    |                    |
-        v                    v                    v                    v
-    Global Avg           Already Global        Already Global       Already Global
-        |                    |                    |                    |
-        v                    v                    v                    v
-    [B,768]              [B,256]              [B,256]             [B,256]
-        |                    |                    |                    |
-        v                    v                    v                    v
-    Proj Head            Proj Head            Proj Head           Proj Head
-        |                    |                    |                    |
-        v                    v                    v                    v
-    [B,768]              [B,768]              [B,768]             [B,768]
-        |                    |                    |                    |
-        |                   /                    /                    /
-        |                  /                    /                    /
-        |                 /                    /                    /
-        |                /                    /                    /
-        v               v                    v                    v
+Contrastive Learning Stage Diagram:
+----------------------------------
+    HSI Features          Auxiliary Features
+    [B,2400,768]           [B,256]
+        |                    |
+        v                    v
+    Global Avg           Already Global
+        |                    |
+        v                    v
+    [B,768]              [B,768]
+        |                    |
+        v                    v
+    Proj Head           Proj Head
+        |                    |
+        v                    v
+    [B,768]              [B,768]
+        |                   /
+        |                  /
+        v                 v
     +------------------------------------------------------------+
-    |                  Similarity Matrices                        |
-    |  HSI-IR: sim = torch.matmul(z_hsi, z_ir.T)/temperature     |
-    |  HSI-AF: sim = torch.matmul(z_hsi, z_af.T)/temperature     |
-    |  HSI-Thickness: sim = torch.matmul(z_hsi, z_thick.T)/temp  |
+    |                 Similarity Matrices                         |
+    |  sim = torch.matmul(z_hsi, z_aux.T)/temperature            |
     +------------------------------------------------------------+
                               |
                               v
     +------------------------------------------------------------+
-    |              Cross-Entropy Loss per Modality                |
-    |  (Encouraging same-patient matches across modalities)       |
+    |              Cross-Entropy Loss                             |
+    |  (Encouraging same-patient matches)                         |
     +------------------------------------------------------------+
                               |
                               v
@@ -317,101 +198,107 @@ Contrastive Learning Stage:
 Patch Embedding Calculations:
 ---------------------------
 1. HSI Patch Embedding:
-   - Input Size: 224 × 224 × 12 (after registration)
-   - Patch Size: 16 × 16 spatial, 3 temporal
-   - Grid Size: (224/16) × (224/16) × (12/3)
-   - Patch Grid: 14 × 14 × 4
-   - Total Patches: 14 × 14 × 4 = 784 patches
-   - Output Shape: [B, 784, 768]
+   - Input Size: 500 × 500 × 30 (after band selection)
+   - Patch Size: 25 × 25 spatial, 5 temporal
+   - Grid Size: (500/25) × (500/25) × (30/5)
+   - Patch Grid: 20 × 20 × 6
+   - Total Patches: 20 × 20 × 6 = 2,400 patches
+   - Output Shape: [B, 2400, 768]
 
 2. Auxiliary Patch Embedding (ViT):
-   - Input Size: 224 × 224 (after registration)
-   - Patch Size: 16 × 16
-   - Grid Size: 14 × 14
-   - Total Patches: 14 × 14 = 196 patches
-   - Output Shape: [B, 196, 256]
+   - Input Size: 500 × 500 (after registration)
+   - Patch Size: 25 × 25
+   - Grid Size: 20 × 20
+   - Total Patches: 20 × 20 = 400 patches
+   - Output Shape: [B, 400, 256]
    - CRITICAL: Final averaging step (x.mean(dim=1)) → [B, 256]
 
-Spatial Registration Process:
----------------------------
-1. HSI Registration:
-   - For each temporal slice t in [0, T-1]:
-     - Resize spatial dimensions from original to [analysis_dim × analysis_dim]
-   - Preserve all spectral/temporal information
-
-2. Auxiliary Registration:
-   - Resize spatial dimensions from original to [analysis_dim × analysis_dim]
-   - Preserve channel information
-
-Global Averaging for Co-Registration Robustness:
-----------------------------------------------
-- ViT Auxiliary Encoder: Explicit global averaging (x.mean(dim=1))
-- CNN Auxiliary Encoder: Global pooling via AdaptiveAvgPool2d + Flatten 
-- Contrastive Path: HSI features global averaging (hsi_features.mean(dim=1))
-
-Contrastive Learning Flow (Key to Misregistration Robustness):
-------------------------------------------------------------
-1. Extract global vectors from each modality:
-   - HSI: Apply mean pooling across all patch tokens → [B, embed_dim]
-   - Auxiliary modalities: Already global vectors from encoders → [B, aux_embed_dim]
-
-2. Project all vectors to common embedding space:
-   - HSI: Through projection head → [B, embed_dim]
-   - Auxiliary: Through modality projection + projection head → [B, embed_dim]
-
-3. Compute pairwise similarities (separate for each auxiliary modality):
-   - sim_matrix = torch.matmul(z_hsi, z_aux.T) / temperature
-   - For batch size B, creates B×B similarity matrix
-   - Diagonal elements represent same-patient matches across modalities
-
-4. Apply cross-entropy loss with labels = batch indices:
-   - Encourages high similarity for same patient across modalities
-   - Discourages similarity between different patients
-
-5. Average individual losses across available modalities:
-   - Handles missing modalities gracefully
-   - Scales by expected number of modalities for consistent loss magnitude
-
-Masking Scenario:
-----------------
-- Mask Ratio: 0.75
-- Total Patches: 784
-- Visible Tokens: 25% of 784 = 196 tokens
-- Masked Tokens: 588 tokens
-
-Computational Characteristics:
-----------------------------
-- Input Tensor Size: ~60 MB
-- Model Parameters: ~100M
-- Forward Pass Computation: ~12 GFLOPs
+Configuration Parameters:
+----------------------
+model = MultiModalSpectralGPT(
+    analysis_dim=500,           # Common spatial dimension
+    patch_size=(25, 25),        # Spatial patch size
+    embed_dim=768,              # Main transformer embedding dimension
+    t_patch_size=5,             # Temporal/spectral patch size
+    in_chans=1,                 # HSI input channels
+    aux_chans=1,                # Auxiliary modality channels
+    num_frames=30,              # Selected spectral bands
+    aux_encoder_type='vit',     # Auxiliary encoder type
+    depth=16,                   # Transformer layers
+    num_heads=12,               # Attention heads
+    mask_ratio=0.75,            # Proportion of masked tokens
+    temperature=0.07            # Contrastive loss temperature
+)
 
 Training Objectives:
 ------------------
-1. Reconstruction Loss
-   - L2 loss on 588 masked tokens
+1. Reconstruction Loss:
+   - L2 loss on masked tokens
    - Computed in 768-dimensional embedding space
    - Weighted by masking pattern
+   - Mask Ratio: 0.75 (75% of tokens masked)
 
-2. Contrastive Loss
-   - Align GLOBAL HSI representations with GLOBAL auxiliary modality representations
-   - Temperature: 0.07
-   - Similarity computed in 768-dimensional space
-   - CRITICAL: Global averaging makes contrastive learning robust to imperfect co-registration
+2. Contrastive Loss:
+   - Align global HSI representations with auxiliary modality representations
+   - Temperature-scaled similarity calculation
+   - Encourages same-patient matches across modalities
+   - Handles missing modalities gracefully
 
-Example Code:
-------------
-model = MultiModalSpectralGPT(
-    analysis_dim=224,
-    patch_size=16,
-    in_chans=1,
-    aux_chans=3,
-    embed_dim=768,
-    aux_embed_dim=256,
-    depth=16,
-    num_heads=12,
-    num_frames=12,
-    t_patch_size=3,
-    aux_encoder_type='vit',
-    mask_ratio=0.75
-)
+Misregistration Robustness Strategies:
+-------------------------------------
+1. Global Averaging
+   - ViT Auxiliary Encoder: Explicit mean() operation
+   - Contrastive Path: Mean pooling across patch tokens
+   - Reduces sensitivity to precise spatial alignment
+
+2. Cross-Attention Conditioning
+   - Allows information flow between HSI patches and global auxiliary features
+   - Patch-level feature integration independent of spatial position
+
+3. Flexible Modality Handling
+   - Supports variable availability of auxiliary modalities
+   - Scales contrastive loss based on available modalities
+
+Computational Characteristics:
+----------------------------
+- Input Tensor Size: ~100 MB
+- Model Parameters: ~100M
+- Forward Pass Computation: ~15 GFLOPs
+
+Implementation Workflow:
+----------------------
+1. Spatial Registration
+   - Resize all input modalities
+   - Select spectral bands for HSI
+
+2. Patch Embedding
+   - Convert images to patch tokens
+   - Apply positional embeddings
+
+3. Random Masking
+   - Mask 75% of HSI patch tokens
+   - Preserve token order for reconstruction
+
+4. Cross-Modal Conditioning
+   - Project auxiliary features
+   - Apply cross-attention to condition HSI features
+
+5. Transformer Processing
+   - Apply transformer blocks
+   - Normalize features
+
+6. Decoding
+   - Project to decoder dimension
+   - Reconstruct masked tokens
+
+7. Contrastive Learning
+   - Compute global representations
+   - Calculate inter-modality similarities
+
+Extensibility Considerations:
+---------------------------
+- Configurable encoder types (ViT/CNN)
+- Adaptable to different input modalities
+- Flexible patch size and embedding dimensions
+- Handles variable input sizes through spatial registration
 """

@@ -2,132 +2,116 @@
 
 This model builds on a **Masked Autoencoder (MAE)** framework with **modality-guided encoding** rather than hard fusion of auxiliary images, and introduces **contrastive learning** to align auxiliary image embeddings with HSI representations.
 
+## **Key Updates**
+
+- **Channel Configuration**: All input modalities (HSI and auxiliary) now use single-channel (grayscale) inputs
+- **Flexible Encoder Types**: Auxiliary modalities can now use either CNN or ViT-style encoders
+- **Robust Spatial Registration**: Enhanced preprocessing to handle varied input sizes
+- **Dynamic Patch Embedding**: Patch embedding now adapts to input dimensions dynamically
+
 ## **Overview of the Pipeline**
 
 1. **Spatial Registration**:
    - Uniform spatial dimensions across all modalities using a common `analysis_dim`
    - Preprocessing module ensures consistent spatial dimensions before model processing
    - Preserves spectral/temporal information in HSI data
+   - Selects specific spectral bands from the HSI image
+   - Resizes inputs to a consistent 500x500 spatial dimension
 
 2. **HSI Encoder** (SpectralGPT-style):
    - Uses a Vision Transformer (ViT)-like spatial-spectral encoder
    - Processes **3D spatial-spectral patches** from the **HSI image**
-   - Divides 224×224×12 HSI volumes into 14×14×4 patches (total 784 tokens)
+   - Dynamically divides HSI volumes into patches based on input dimensions
+   - Supports variable input sizes with adaptive patch embedding
 
 3. **Auxiliary Encoders**:
-   - Each auxiliary image (IR, AF, Thickness) is **separately tokenized** using either ViT or CNN encoders
+   - Supports two encoder types for auxiliary modalities:
+     a. CNN Encoder: Convolutional layers with global average pooling
+     b. ViT-style Encoder: Transformer-based patch embedding and processing
+   - Each auxiliary image (IR, AF, Thickness) is **separately tokenized**
    - **Global averaging** applied to create modality-specific global vectors
-   - These global vectors enable **robustness to misregistration** between modalities
+   - Enables **robustness to misregistration** between modalities
 
 4. **Cross-Attention Conditioning**:
-   - Auxiliary embeddings do not go into the main encoder directly but act as **conditioning inputs**
-   - HSI tokens are conditioned via **cross-attention layers** with auxiliary global vectors
-   - Each HSI patch can attend to global auxiliary features regardless of spatial position
-   - Ensures HSI remains the **primary representation** while still benefiting from auxiliary guidance
+   - Auxiliary embeddings condition HSI tokens via cross-attention layers
+   - Each HSI patch can attend to global auxiliary features
+   - Ensures HSI remains the **primary representation** while benefiting from auxiliary guidance
 
 5. **Main Transformer Processing**:
-   - Conditioned tokens pass through primary transformer blocks for deep feature extraction
+   - Conditioned tokens pass through primary transformer blocks
    - Maintains the pure HSI representation while leveraging auxiliary information
 
 6. **Dual Learning Objectives**:
    - **MAE Reconstruction**: Masked HSI tokens (75%) are reconstructed from visible tokens (25%)
    - **Contrastive Learning**: Global HSI embeddings are aligned with auxiliary modality embeddings
 
-## **Detailed Architecture**
+## **Detailed Modifications**
 
-### **1️⃣ Input Processing & Spatial Registration**
+### **1️⃣ Input Processing**
 
-- HSI Input: `[B, C, T, H, W]` → Resized to `[B, C, T, 224, 224]`
-- Auxiliary Inputs: Various sizes → All resized to `[B, C, 224, 224]`
-- Consistent spatial dimensions for all modalities ensure proper alignment
+- **Channel Configuration**:
+  - HSI Input: Now uses single-channel input
+  - Auxiliary Inputs: All use single-channel (1 channel) images
+  - Supports flexible encoding strategies (CNN or ViT)
 
-### **2️⃣ Tokenization & Embedding**
+- **Spatial Registration**:
+  - Fixed target dimension of 500x500 for all modalities
+  - Spectral band selection: Selected indices include every 2nd index from 0 to 57, plus wavelength at index 80
+  - Bilinear interpolation for resizing spatial dimensions
 
-- **HSI Tokenization**:
-  - 3D patch embedding with 16×16 spatial and 3-band spectral patches
-  - Results in 784 tokens per HSI volume (14×14×4 grid)
-  - Output shape: `[B, 784, 768]`
+### **2️⃣ Auxiliary Encoding**
 
-- **Auxiliary Tokenization**:
-  - Each modality processed through dedicated ViT/CNN encoder
-  - Critical: Global averaging produces a single feature vector per modality
-  - Output shape: `[B, 256]` per auxiliary modality
+- **Encoder Flexibility**:
+  - `aux_encoder_type` parameter allows switching between:
+    - 'cnn': Convolutional encoder with pooling
+    - 'vit': Vision Transformer-style encoder
+  - Robust to different input modalities
+  - Consistent global feature extraction
 
-### **3️⃣ Cross-Attention Conditioning**
+### **3️⃣ Contrastive Learning Enhancements**
 
-- HSI tokens `[B, n_visible, 768]` and auxiliary global vectors `[B, 1, 768]` are concatenated
-- Self-attention allows information flow between HSI patches and global auxiliary features
-- Only the updated HSI tokens are retained after attention
-- Residual connections preserve the original HSI signal
-- This approach provides fine-grained conditioning while maintaining robustness to misregistration
-
-### **4️⃣ Main Transformer Processing**
-
-- Conditioned HSI tokens are processed through 16 transformer blocks
-- Self-attention and MLP layers extract rich spatial-spectral representations
-- Final output: `[B, n_visible, 768]`
-
-### **5️⃣ Decoding & Reconstruction**
-
-- Visible tokens are projected to decoder dimension
-- Mask tokens are appended for reconstruction
-- Decoder reconstructs original token embeddings in embedding space
-- L2 loss applied only on masked tokens (75% of total)
-
-### **6️⃣ Contrastive Learning**
-
-- Global averaging across HSI tokens: `[B, 784, 768]` → `[B, 768]`
-- Computing similarity matrices between HSI and each auxiliary modality
-- Cross-entropy loss encourages same-patient matches across modalities
-- Temperature scaling (0.07) sharpens similarity distributions
-
-## **🔬 Loss Functions**
-
-1. **Reconstruction Loss**: L2 loss on masked HSI tokens
-   ```
-   loss_recon = ((pred - target)²).mean(dim=-1)
-   loss_recon = (loss_recon * mask).sum() / mask.sum()
-   ```
-
-2. **Contrastive Loss**: Alignment between global representations
-   ```
-   # For each modality
-   sim_matrix = torch.matmul(z_hsi, z_aux.T) / temperature
-   loss = CrossEntropyLoss()(sim_matrix, batch_indices)
-   # Average across available modalities with scaling
-   ```
+- Dynamic loss scaling based on available modalities
+- Handles scenarios with missing auxiliary data
+- Standardized loss computation across modalities
+- Temperature-scaled similarity matrix for robust representation alignment
 
 ## **🧩 Handling Missing Modalities**
 
-- If an auxiliary modality is missing, its conditioning step is skipped
-- Contrastive loss scales dynamically based on available modalities
-- The model learns to operate with any subset of auxiliary modalities
-- During inference for downstream tasks, the encoder can operate solely on HSI images
+- Gracefully handles scenarios with partial or missing auxiliary data
+- Contrastive loss dynamically adjusts based on available modalities
+- Can operate with any subset of auxiliary modalities during training or inference
 
-## **🔄 Using the Pretrained HSI Encoder**
+## **🚀 Advantages**
+
+✅ **Adaptive Input Handling**: Works with varied input sizes and modalities
+✅ **Encoder Flexibility**: Choice between CNN and ViT-style auxiliary encoders
+✅ **Robust Spatial Registration**: Consistent preprocessing across modalities
+✅ **Dynamic Patch Embedding**: Adapts to input dimensions
+✅ **Modality Agnostic**: Functions with any combination of available auxiliary modalities
+
+## **🔬 Technical Specifications**
+
+- **Parameters**: ~100M parameters
+- **Computational Complexity**: ~12 GFLOPs for forward pass
+- **Input Dimension**: 500x500 spatial, variable spectral/temporal dimensions
+- **Encoder Types**: Transformer-based with cross-attention conditioning
+- **Loss Functions**: 
+  - Reconstruction Loss (L2)
+  - Contrastive Alignment Loss
+
+## **🛠 Configuration Options**
+
+- `analysis_dim`: Target spatial dimension (default: 500)
+- `patch_size`: Spatial patch size for tokenization
+- `aux_encoder_type`: Encoder type for auxiliary modalities ('cnn' or 'vit')
+- `mask_ratio`: Proportion of tokens to mask (default: 0.75)
+- `temperature`: Scaling factor for contrastive loss (default: 0.07)
+
+## **🔄 Model Usage**
 
 For downstream tasks:
-1. Extract the core HSI encoder components:
-   - Spatial registration, patch embedding, positional embedding
-   - Main transformer blocks (excluding cross-attention)
-   - Apply fine-tuning to adapt to the distribution shift
+1. Extract core HSI encoder components
+2. Fine-tune to adapt to specific distribution shifts
+3. Operate with or without auxiliary modalities
 
-2. The standalone HSI encoder processes input without auxiliary modalities:
-   ```
-   HSI Input → Spatial Registration → Patch Embedding → 
-   Positional Embedding → Transformer Blocks → Final Features
-   ```
-
-## **🚀 Advantages of This Approach**
-
-✅ **Robustness to Misregistration**: Global auxiliary features enable conditioning without precise spatial alignment
-
-✅ **Retains HSI as the primary feature space**: Cross-attention provides soft guidance without fusion biases
-
-✅ **Dynamic Modality Handling**: Functions with any combination of available auxiliary modalities
-
-✅ **Transferability**: HSI encoder can be extracted and fine-tuned for downstream tasks
-
-✅ **Strong Generalization**: Contrastive learning and MAE pretraining combine to create robust representations
-
-✅ **Computational Efficiency**: ~100M parameters, ~12 GFLOPs for forward pass
+Provides a flexible, robust framework for multi-modal hyperspectral image processing with self-supervised learning capabilities.

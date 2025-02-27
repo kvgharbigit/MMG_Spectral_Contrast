@@ -3,68 +3,129 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 from util.video_vit import PatchEmbed, Block
+from timm.models.layers import to_2tuple
+
+from einops import rearrange
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from functools import partial
+from util.video_vit import PatchEmbed, Block
+from timm.models.layers import to_2tuple
+
 from einops import rearrange
 
 
 class SpatialRegistration(nn.Module):
     """
     Preprocessing module to ensure all modalities are spatially registered
-    to the same dimensions before entering the model.
+    and spectral bands are selected as specified.
     """
 
-    def __init__(self, analysis_dim):
+    def __init__(self, analysis_dim=500, target_bands=30):
         """
         Initialize the spatial registration module.
 
         Args:
             analysis_dim (int): The target spatial dimension for all modalities.
+            target_bands (int): The target number of spectral bands.
         """
         super().__init__()
         self.analysis_dim = analysis_dim
+        self.target_bands = target_bands
+        self.selected_indices = None  # To track selected indices for use in other methods
+
+    def select_spectral_bands(self, hsi_img):
+        """
+        Select specific spectral bands from the HSI image.
+
+        Args:
+            hsi_img (torch.Tensor): HSI image tensor of shape [B, C, T, H, W]
+
+        Returns:
+            torch.Tensor: Processed HSI image with selected bands
+        """
+        # Original spectral dimensions
+        B, C, T, H, W = hsi_img.shape
+
+        # Check if already has the target number of bands
+        if T == self.target_bands:
+            # No need to select bands, return as is
+            self.selected_indices = list(range(T))
+            return hsi_img
+
+        # Create indices for band selection
+        # 0:58:2 → Every 2nd index from 0 to 57
+        # 80 → Add wavelength at index 80
+        selected_indices = list(range(0, 58, 2)) + [80]
+
+        # Sort indices to maintain order
+        selected_indices = sorted(set(selected_indices))
+
+        # Store selected indices for reference
+        self.selected_indices = selected_indices
+
+        # Select the specified bands
+        selected_bands = hsi_img[:, :, selected_indices, :, :]
+
+        return selected_bands
 
     def forward(self, hsi_img, aux_data):
         """
-        Resizes all input modalities to the same spatial dimensions.
+        Preprocesses HSI image by:
+        1. Selecting specific spectral bands
+        2. Resizing spatial dimensions
 
         Args:
             hsi_img (torch.Tensor): HSI image tensor of shape [B, C, T, H, W]
             aux_data (dict): Dictionary of auxiliary modalities
-                             Each modality has shape [B, C, H, W]
 
         Returns:
             tuple: (spatially_registered_hsi, spatially_registered_aux_data)
         """
-        # Get batch size from HSI image
-        batch_size = hsi_img.shape[0]
+        # First, select specified spectral bands
+        hsi_img = self.select_spectral_bands(hsi_img)
 
-        # Resize HSI temporal dimension maintaining all spectral bands
+        # Get updated dimensions after band selection
         B, C, T, H, W = hsi_img.shape
 
-        # First reshape to [B*T, C, H, W] for batch-compatible resizing
-        hsi_reshaped = hsi_img.view(B * T, C, H, W)
+        # Check if spatial dimensions already match the target dimension
+        if H == self.analysis_dim and W == self.analysis_dim:
+            # If already 500x500, no need to resize
+            hsi_registered = hsi_img
+        else:
+            # Reshape for resizing if spatial dimensions are not 500x500
+            # First reshape to [B*T, C, H, W] for batch-compatible resizing
+            hsi_reshaped = hsi_img.view(B * T, C, H, W)
 
-        # Resize spatial dimensions
-        hsi_resized = F.interpolate(
-            hsi_reshaped,
-            size=(self.analysis_dim, self.analysis_dim),
-            mode='bilinear',
-            align_corners=False
-        )
+            # Resize spatial dimensions
+            hsi_resized = F.interpolate(
+                hsi_reshaped,
+                size=(self.analysis_dim, self.analysis_dim),
+                mode='bilinear',
+                align_corners=False
+            )
 
-        # Reshape back to [B, C, T, analysis_dim, analysis_dim]
-        hsi_registered = hsi_resized.view(B, C, T, self.analysis_dim, self.analysis_dim)
+            # Reshape back to [B, C, T, analysis_dim, analysis_dim]
+            hsi_registered = hsi_resized.view(B, C, T, self.analysis_dim, self.analysis_dim)
 
-        # Process auxiliary modalities
+        # Process auxiliary modalities (same as before)
         aux_registered = {}
         for modality, data in aux_data.items():
             if data is not None:
-                # Resize to target dimension
-                aux_registered[modality] = F.interpolate(
-                    data,
-                    size=(self.analysis_dim, self.analysis_dim),
-                    mode='bilinear',
-                    align_corners=False
-                )
+                # Check if auxiliary data already has the target dimensions
+                if data.shape[2] == self.analysis_dim and data.shape[3] == self.analysis_dim:
+                    aux_registered[modality] = data
+                else:
+                    # Resize to target dimension
+                    aux_registered[modality] = F.interpolate(
+                        data,
+                        size=(self.analysis_dim, self.analysis_dim),
+                        mode='bilinear',
+                        align_corners=False
+                    )
             else:
                 aux_registered[modality] = None
 
@@ -79,22 +140,14 @@ class MultiModalSpectralGPT(nn.Module):
     1. Masked Autoencoder (MAE) for self-supervised learning of HSI data
     2. Soft conditioning with auxiliary modalities via cross-attention
     3. Contrastive learning to align representations across modalities
-
-    The architecture consists of:
-    - Spatial Registration: Ensures all modalities are spatially aligned to analysis_dim
-    - HSI Encoder: Processes 3D HSI data using patch embedding and transformer blocks
-    - Auxiliary Encoders: Process additional modalities (IR, AF, thickness)
-    - Cross-Attention: Conditions HSI features on auxiliary information
-    - MAE Decoder: Reconstructs masked tokens in embedding space
-    - Contrastive Head: Aligns features across different modalities
     """
 
     def __init__(
             self,
-            analysis_dim=224,  # Common spatial dimension for all modalities
-            patch_size=16,  # Spatial patch size for tokenization
+            analysis_dim=500,  # Common spatial dimension for all modalities
+            patch_size=(25, 25),  # Spatial patch size for tokenization
             in_chans=1,  # Input channels for HSI (typically 1)
-            aux_chans=3,  # Channels for auxiliary modalities (e.g., RGB=3)
+            aux_chans=1,  # Channels for auxiliary modalities (all now 1 channel/grayscale)
             embed_dim=768,  # Main transformer embedding dimension
             depth=16,  # Number of transformer layers i.e. in hsi encoder
             num_heads=12,  # Number of attention heads per transformer
@@ -102,8 +155,8 @@ class MultiModalSpectralGPT(nn.Module):
             decoder_depth=4,  # Number of decoder transformer layers
             decoder_num_heads=16,  # Number of attention heads in decoder
             mlp_ratio=4.0,  # Expansion ratio for MLP in transformer blocks
-            num_frames=12,  # Number of spectral bands in HSI
-            t_patch_size=3,  # Temporal/spectral patch size
+            num_frames=30,  # Number of frames/spectral bands
+            t_patch_size=5,  # Temporal/spectral patch size
             norm_layer=partial(nn.LayerNorm, eps=1e-6),  # Normalization layer
             aux_embed_dim=256,  # Embedding dimension for auxiliary features
             temperature=0.07,  # Temperature for contrastive loss scaling
@@ -113,48 +166,39 @@ class MultiModalSpectralGPT(nn.Module):
     ):
         super().__init__()
 
+        # Convert patch_size to tuple if it isn't already
+        patch_size = to_2tuple(patch_size)
+
         # Store configuration parameters
         self.analysis_dim = analysis_dim
         self.patch_size = patch_size
         self.mask_ratio = mask_ratio
         self.aux_encoder_type = aux_encoder_type
+        self.embed_dim = embed_dim
+        self.t_patch_size = t_patch_size
 
         # Set the expected number of modalities for loss standardization
         self.num_expected_modalities = 3  # ir, af, thickness
 
         # Add spatial registration module for consistent dimensions
-        self.spatial_registration = SpatialRegistration(analysis_dim)
+        self.spatial_registration = SpatialRegistration(analysis_dim, num_frames)
 
-        # Initialize HSI encoder with 3D patch embedding
-        # This converts the input HSI volume into a sequence of tokens
-        self.patch_embed = PatchEmbed(
-            img_size=analysis_dim,
-            patch_size=patch_size,
-            in_chans=in_chans,
-            embed_dim=embed_dim,
-            frames=num_frames,
-            t_patch_size=t_patch_size
-        )
-
-        # Create learnable position embeddings for each patch
-        num_patches = self.patch_embed.num_patches
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
 
         # Create encoders for each auxiliary modality
         self.aux_encoder = nn.ModuleDict({
             'ir': self._make_aux_encoder(aux_chans, aux_embed_dim),
             'af': self._make_aux_encoder(aux_chans, aux_embed_dim),
-            'thickness': self._make_aux_encoder(1, aux_embed_dim)
+            'thickness': self._make_aux_encoder(aux_chans, aux_embed_dim)
         })
 
-        # Normalization layer for auxiliary features
+        # Add normalization layers for auxiliary encoders
         self.aux_norm = nn.LayerNorm(aux_embed_dim)
+
+        # Normalization layer for auxiliary features
+        self.modality_proj = nn.Linear(aux_embed_dim, embed_dim)
 
         # Learnable mask token for MAE decoder
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
-
-        # Project auxiliary features to main embedding dimension
-        self.modality_proj = nn.Linear(aux_embed_dim, embed_dim)
 
         # Cross-attention blocks for conditioning on auxiliary features
         self.cross_attn = nn.ModuleList([
@@ -172,9 +216,7 @@ class MultiModalSpectralGPT(nn.Module):
         # Projects encoder features to decoder dimension
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
         # Position embeddings for decoder
-        self.decoder_pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches, decoder_embed_dim)
-        )
+        self.decoder_pos_embed = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
         # Decoder transformer blocks
         self.decoder_blocks = nn.ModuleList([
             Block(
@@ -200,6 +242,11 @@ class MultiModalSpectralGPT(nn.Module):
             nn.Linear(embed_dim, embed_dim)
         )
         self.temperature = temperature
+
+        # Patch embedding will be dynamically set in forward method
+        self.patch_embed = None
+        self.pos_embed = None
+        self.num_patches = None
 
         # Initialize weights
         self.initialize_weights()
@@ -241,8 +288,12 @@ class MultiModalSpectralGPT(nn.Module):
         ):
             super().__init__()
 
+            # Convert patch_size to tuple if it isn't already
+            patch_size = to_2tuple(patch_size)
+
             # Validate patch size
-            assert img_size % patch_size == 0, f"Image size {img_size} must be divisible by patch size {patch_size}"
+            assert img_size % patch_size[
+                0] == 0, f"Image size {img_size} must be divisible by patch size {patch_size[0]}"
 
             # Custom 2D patch embedding for auxiliary modalities
             self.patch_embed = nn.Conv2d(
@@ -290,6 +341,41 @@ class MultiModalSpectralGPT(nn.Module):
             x = x.mean(dim=1)  # Mean across patch tokens
 
             return x
+
+    def _setup_patch_embedding(self, hsi_img):
+        """
+        Dynamically set up patch embedding based on preprocessed HSI image.
+
+        Args:
+            hsi_img (torch.Tensor): Preprocessed HSI image tensor
+        """
+        # Get dimensions of preprocessed HSI image
+        _, _, T, H, W = hsi_img.shape
+
+        # Dynamically create patch embedding
+        self.patch_embed = PatchEmbed(
+            img_size=H,  # Use actual height after preprocessing
+            patch_size=self.patch_size,
+            in_chans=1,  # Assuming single channel after preprocessing
+            embed_dim=self.embed_dim,
+            frames=T,  # Use actual number of frames/bands
+            t_patch_size=self.t_patch_size
+        )
+
+        # Dynamically calculate and set number of patches
+        self.num_patches = self.patch_embed.num_patches
+
+        # Create learnable position embeddings for each patch
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.embed_dim))
+
+        # Re-initialize position embeddings
+        torch.nn.init.normal_(self.pos_embed, std=0.02)
+
+    def initialize_weights(self):
+        """Initialize model weights."""
+        # Note: Actual positional embedding initialization is deferred to forward pass
+        # Initialize mask token
+        torch.nn.init.normal_(self.mask_token, std=0.02)
 
     def random_masking(self, x, mask_ratio):
         """Perform per-sample random masking by per-sample shuffling."""
@@ -438,6 +524,9 @@ class MultiModalSpectralGPT(nn.Module):
         # Apply spatial registration to ensure all modalities have the same dimensions
         hsi_img, aux_data = self.spatial_registration(hsi_img, aux_data)
 
+        # Dynamically set up patch embedding based on preprocessed image
+        self._setup_patch_embedding(hsi_img)
+
         # Move auxiliary data to correct device
         device = hsi_img.device
         if aux_data is not None:
@@ -495,17 +584,3 @@ class MultiModalSpectralGPT(nn.Module):
                 aux_embeddings[modality] = self.aux_encoder[modality](data)
                 aux_embeddings[modality] = self.aux_norm(aux_embeddings[modality])
         return aux_embeddings
-
-    def initialize_weights(self):
-        """Initialize model weights."""
-        # Initialize position embeddings with correct size
-        torch.nn.init.normal_(self.pos_embed, std=0.02)
-        torch.nn.init.normal_(self.decoder_pos_embed, std=0.02)
-
-        # Initialize mask token
-        torch.nn.init.normal_(self.mask_token, std=0.02)
-
-        # Print shapes for verification
-        print(f"Position embedding shape: {self.pos_embed.shape}")
-        print(f"Decoder position embedding shape: {self.decoder_pos_embed.shape}")
-        print(f"Mask token shape: {self.mask_token.shape}")
