@@ -1,13 +1,14 @@
-# **Model Architecture: Multi-Modal Guided SpectralGPT with Contrastive Learning**
+# **Model Architecture: Multi-Modal Guided SpectralGPT with Dual-Mode Contrastive Learning**
 
-This model builds on a **Masked Autoencoder (MAE)** framework with **modality-guided encoding** rather than hard fusion of auxiliary images, and introduces **contrastive learning** to align auxiliary image embeddings with HSI representations.
+This model builds on a **Masked Autoencoder (MAE)** framework with **modality-guided encoding** rather than hard fusion of auxiliary images, and introduces **dual-mode contrastive learning** to align auxiliary image embeddings with HSI representations at either patient-level or spatial patch-level.
 
-## **Key Updates**
+## **Key Features**
 
-- **Channel Configuration**: All input modalities (HSI and auxiliary) now use single-channel (grayscale) inputs
-- **Flexible Encoder Types**: Auxiliary modalities can now use either CNN or ViT-style encoders
+- **Channel Configuration**: All input modalities (HSI and auxiliary) use single-channel (grayscale) inputs
+- **ViT-style Encoders**: All auxiliary modalities use Vision Transformer encoders for consistent processing
 - **Robust Spatial Registration**: Enhanced preprocessing to handle varied input sizes
-- **Dynamic Patch Embedding**: Patch embedding now adapts to input dimensions dynamically
+- **Dynamic Patch Embedding**: Patch embedding adapts to input dimensions dynamically
+- **Dual-Mode Contrastive Learning**: Choice between global (patient-level) and spatial (patch-level) contrastive learning
 
 ## **Overview of the Pipeline**
 
@@ -25,11 +26,9 @@ This model builds on a **Masked Autoencoder (MAE)** framework with **modality-gu
    - Supports variable input sizes with adaptive patch embedding
 
 3. **Auxiliary Encoders**:
-   - Supports two encoder types for auxiliary modalities:
-     a. CNN Encoder: Convolutional layers with global average pooling
-     b. ViT-style Encoder: Transformer-based patch embedding and processing
+   - ViT-style Encoder: Transformer-based patch embedding and processing
    - Each auxiliary image (IR, AF, Thickness) is **separately tokenized**
-   - **Global averaging** applied to create modality-specific global vectors
+   - Creates both global and patch-level representations
    - Enables **robustness to misregistration** between modalities
 
 4. **Cross-Attention Conditioning**:
@@ -37,56 +36,78 @@ This model builds on a **Masked Autoencoder (MAE)** framework with **modality-gu
    - Each HSI patch can attend to global auxiliary features
    - Ensures HSI remains the **primary representation** while benefiting from auxiliary guidance
 
-5. **Main Transformer Processing**:
-   - Conditioned tokens pass through primary transformer blocks
-   - Maintains the pure HSI representation while leveraging auxiliary information
+5. **Dual Learning Paths**:
+   - **MAE Reconstruction Path**: Uses masked tokens (75%) for reconstruction task
+   - **Contrastive Learning Path**: Uses unmasked tokens for modality alignment
 
-6. **Dual Learning Objectives**:
-   - **MAE Reconstruction**: Masked HSI tokens (75%) are reconstructed from visible tokens (25%)
-   - **Contrastive Learning**: Global HSI embeddings are aligned with auxiliary modality embeddings
+6. **Dual-Mode Contrastive Learning**:
+   - **Global Mode**: Aligns patient-level representations across modalities
+     - Mean pooling across all patches
+     - Patient-level similarity comparison
+   - **Spatial Mode**: Aligns patch-level representations across modalities
+     - Groups HSI patches by spatial location
+     - Concatenates spectral information for each location
+     - Patch-by-patch similarity comparison
 
-## **Detailed Modifications**
+## **Detailed Dual-Mode Contrastive Learning**
 
-### **1️⃣ Input Processing**
+### **1️⃣ Global Contrastive Learning (Original)**
 
-- **Channel Configuration**:
-  - HSI Input: Now uses single-channel input
-  - Auxiliary Inputs: All use single-channel (1 channel) images
-  - Supports flexible encoding strategies (CNN or ViT)
+- **Feature Pooling**:
+  - Global averaging of HSI features across all patches
+  - Global auxiliary features from ViT encoder
+  
+- **Projection**:
+  - Both HSI and auxiliary features project to contrastive space using `proj_head_global`
+  
+- **Similarity Computation**:
+  - Computes cross-modality similarity between patients
+  - Labels correspond to batch indices (diagonal matches)
+  
+- **Advantages**:
+  - More robust to spatial misregistration
+  - Simpler implementation
+  - Lower computational complexity
 
-- **Spatial Registration**:
-  - Fixed target dimension of 500x500 for all modalities
-  - Spectral band selection: Selected indices include every 2nd index from 0 to 57, plus wavelength at index 80
-  - Bilinear interpolation for resizing spatial dimensions
+### **2️⃣ Spatial Contrastive Learning (New)**
 
-### **2️⃣ Auxiliary Encoding**
+- **HSI Feature Organization**:
+  - Reorganizes HSI patches to group by spatial location
+  - Concatenates spectral features for each spatial location
+  
+- **Projection Pipeline**:
+  - HSI spatial features: Project with specialized `proj_head_spatial` to handle spectral concatenation
+  - Auxiliary patch features: First project to `embed_dim`, then use `proj_head_global`
+  
+- **Similarity Computation**:
+  - Compares patches at corresponding spatial locations
+  - Labels identify spatial correspondence (same location across modalities)
+  
+- **Advantages**:
+  - Preserves spatial correspondence between modalities
+  - Captures fine-grained local alignment
+  - Better represents spatial structure of the data
 
-- **Encoder Flexibility**:
-  - `aux_encoder_type` parameter allows switching between:
-    - 'cnn': Convolutional encoder with pooling
-    - 'vit': Vision Transformer-style encoder
-  - Robust to different input modalities
-  - Consistent global feature extraction
+## **🧩 Implementation Details**
 
-### **3️⃣ Contrastive Learning Enhancements**
-
-- Dynamic loss scaling based on available modalities
-- Handles scenarios with missing auxiliary data
-- Standardized loss computation across modalities
-- Temperature-scaled similarity matrix for robust representation alignment
-
-## **🧩 Handling Missing Modalities**
-
-- Gracefully handles scenarios with partial or missing auxiliary data
-- Contrastive loss dynamically adjusts based on available modalities
-- Can operate with any subset of auxiliary modalities during training or inference
+- **Patch Organization**: 
+  - HSI: 6 spectral chunks × 400 spatial patches = 2,400 total patches
+  - Each spatial location contains 6 spectral patches that are grouped together
+  
+- **Projection Heads**:
+  - `proj_head_global`: Standard projection for embedding dimension (768→768)
+  - `proj_head_spatial`: Handles concatenated spectral features (4608→768)
+  
+- **Patch Processing**:
+  - Spatial dimensions: 500×500 → 20×20 patches (25×25 each)
+  - Spectral dimensions: 30 bands → 6 chunks (5 bands each)
 
 ## **🚀 Advantages**
 
 ✅ **Adaptive Input Handling**: Works with varied input sizes and modalities
-✅ **Encoder Flexibility**: Choice between CNN and ViT-style auxiliary encoders
+✅ **Configurable Contrastive Learning**: Choose between global and spatial alignment
 ✅ **Robust Spatial Registration**: Consistent preprocessing across modalities
-✅ **Dynamic Patch Embedding**: Adapts to input dimensions
+✅ **Unmasked Contrastive Learning**: Uses complete representations for alignment
 ✅ **Modality Agnostic**: Functions with any combination of available auxiliary modalities
 
 ## **🔬 Technical Specifications**
@@ -97,13 +118,13 @@ This model builds on a **Masked Autoencoder (MAE)** framework with **modality-gu
 - **Encoder Types**: Transformer-based with cross-attention conditioning
 - **Loss Functions**: 
   - Reconstruction Loss (L2)
-  - Contrastive Alignment Loss
+  - Contrastive Alignment Loss (Global or Spatial mode)
 
 ## **🛠 Configuration Options**
 
 - `analysis_dim`: Target spatial dimension (default: 500)
 - `patch_size`: Spatial patch size for tokenization
-- `aux_encoder_type`: Encoder type for auxiliary modalities ('cnn' or 'vit')
+- `contrastive_mode`: Type of contrastive learning ('global' or 'spatial')
 - `mask_ratio`: Proportion of tokens to mask (default: 0.75)
 - `temperature`: Scaling factor for contrastive loss (default: 0.07)
 
@@ -113,5 +134,6 @@ For downstream tasks:
 1. Extract core HSI encoder components
 2. Fine-tune to adapt to specific distribution shifts
 3. Operate with or without auxiliary modalities
+4. Choose the contrastive mode that best suits your application needs
 
-Provides a flexible, robust framework for multi-modal hyperspectral image processing with self-supervised learning capabilities.
+This model provides a flexible, robust framework for multi-modal hyperspectral image processing with self-supervised learning capabilities and configurable contrastive learning approaches.

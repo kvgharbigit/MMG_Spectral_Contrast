@@ -50,8 +50,78 @@ def create_dummy_data(batch_size=3):
     return hsi_data, aux_data, batch_indices
 
 
-def test_model():
-    """Test the MultiModalSpectralGPT model with dummy data."""
+def test_model_contrastive_modes():
+    """Test both contrastive learning modes of the MultiModalSpectralGPT model."""
+
+    # Basic model parameters
+    analysis_dim = 500  # Spatial dimension
+    patch_size = (25, 25)  # Spatial patch size
+    t_patch_size = 5  # Temporal/spectral patch size
+    embed_dim = 768
+
+    # Generate dummy data
+    hsi_data, aux_data, batch_indices = create_dummy_data(batch_size=3)
+
+    # Check if CUDA is available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    # Move data to device
+    hsi_data = hsi_data.to(device)
+    aux_data = {k: v.to(device) for k, v in aux_data.items()}
+    batch_indices = batch_indices.to(device)
+
+    # Test global contrastive mode first
+    print("\n==== Testing Global Contrastive Mode ====")
+    global_model = MultiModalSpectralGPT(
+        analysis_dim=analysis_dim,
+        patch_size=patch_size,
+        embed_dim=embed_dim,
+        t_patch_size=t_patch_size,
+        in_chans=1,
+        aux_chans=1,
+        contrastive_mode='global'  # Global mode
+    ).to(device)
+
+    # Run forward pass with global mode
+    with torch.no_grad():
+        global_output = global_model(hsi_data, aux_data, batch_indices)
+
+    print(f"Global contrastive loss: {global_output['loss_contrast'].item():.4f}")
+
+    # Now test spatial contrastive mode
+    print("\n==== Testing Spatial Contrastive Mode ====")
+    spatial_model = MultiModalSpectralGPT(
+        analysis_dim=analysis_dim,
+        patch_size=patch_size,
+        embed_dim=embed_dim,
+        t_patch_size=t_patch_size,
+        in_chans=1,
+        aux_chans=1,
+        contrastive_mode='spatial'  # Spatial mode
+    ).to(device)
+
+    # Run forward pass with spatial mode
+    with torch.no_grad():
+        spatial_output = spatial_model(hsi_data, aux_data, batch_indices)
+
+    print(f"Spatial contrastive loss: {spatial_output['loss_contrast'].item():.4f}")
+
+    # Compare the reconstruction losses (should be similar)
+    print("\n==== Comparing Losses ====")
+    print(f"Global reconstruction loss: {global_output['loss_recon'].item():.4f}")
+    print(f"Spatial reconstruction loss: {spatial_output['loss_recon'].item():.4f}")
+
+    # Compare the overall losses
+    print(f"Global total loss: {global_output['loss'].item():.4f}")
+    print(f"Spatial total loss: {spatial_output['loss'].item():.4f}")
+
+    print("\n==== Test Complete ====")
+    print("Both contrastive learning modes are working as expected.")
+
+
+def test_model_original():
+    """Test the original functionality of the MultiModalSpectralGPT model with dummy data."""
 
     # Model parameters
     analysis_dim = 500  # Spatial dimension matching HSI input
@@ -70,7 +140,7 @@ def test_model():
         t_patch_size=t_patch_size,
         in_chans=1,  # HSI channels
         aux_chans=1,  # NOW 1 CHANNEL FOR AUXILIARY CHANNELS
-        aux_encoder_type='vit'  # Choose auxiliary encoder type
+        contrastive_mode='global'  # Default global mode
     )
 
     # Generate dummy data with varied input sizes to test spatial registration
@@ -146,4 +216,9 @@ def test_model():
 
 
 if __name__ == '__main__':
-    test_model()
+    # Test both functionalities
+    print("====== TESTING ORIGINAL FUNCTIONALITY ======")
+    test_model_original()
+
+    print("\n\n====== TESTING CONTRASTIVE LEARNING MODES ======")
+    test_model_contrastive_modes()

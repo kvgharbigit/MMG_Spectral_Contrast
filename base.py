@@ -8,16 +8,6 @@ from timm.models.layers import to_2tuple
 from einops import rearrange
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from functools import partial
-from util.video_vit import PatchEmbed, Block
-from timm.models.layers import to_2tuple
-
-from einops import rearrange
-
-
 class SpatialRegistration(nn.Module):
     """
     Preprocessing module to ensure all modalities are spatially registered
@@ -161,7 +151,7 @@ class MultiModalSpectralGPT(nn.Module):
             aux_embed_dim=256,  # Embedding dimension for auxiliary features
             temperature=0.07,  # Temperature for contrastive loss scaling
             mask_ratio=0.75,  # Proportion of tokens to mask in MAE
-            aux_encoder_type='vit',  # Type of auxiliary encoder ('cnn' or 'vit')
+            contrastive_mode='global',  # Type of contrastive learning ('global' or 'spatial')
             **kwargs
     ):
         super().__init__()
@@ -173,9 +163,14 @@ class MultiModalSpectralGPT(nn.Module):
         self.analysis_dim = analysis_dim
         self.patch_size = patch_size
         self.mask_ratio = mask_ratio
-        self.aux_encoder_type = aux_encoder_type
         self.embed_dim = embed_dim
         self.t_patch_size = t_patch_size
+        self.contrastive_mode = contrastive_mode  # Parameter for contrastive learning mode
+
+        # Derived parameters for patch organization
+        self.patches_per_dim = analysis_dim // patch_size[0]  # Number of patches in one spatial dimension
+        self.spatial_patches = self.patches_per_dim * self.patches_per_dim  # Total spatial patches
+        self.spectral_patches = num_frames // t_patch_size  # Number of spectral/temporal patches
 
         # Set the expected number of modalities for loss standardization
         self.num_expected_modalities = 3  # ir, af, thickness
@@ -183,8 +178,7 @@ class MultiModalSpectralGPT(nn.Module):
         # Add spatial registration module for consistent dimensions
         self.spatial_registration = SpatialRegistration(analysis_dim, num_frames)
 
-
-        # Create encoders for each auxiliary modality
+        # Create ViT encoders for each auxiliary modality
         self.aux_encoder = nn.ModuleDict({
             'ir': self._make_aux_encoder(aux_chans, aux_embed_dim),
             'af': self._make_aux_encoder(aux_chans, aux_embed_dim),
@@ -235,13 +229,27 @@ class MultiModalSpectralGPT(nn.Module):
         self.decoder_pred = nn.Linear(decoder_embed_dim, embed_dim)
 
         # Contrastive learning components
-        # Projects features to space for contrastive learning
-        self.proj_head = nn.Sequential(
+        self.temperature = temperature
+
+        # Calculate spectral dim for spatial contrastive learning
+        spectral_dim = self.spectral_patches * embed_dim
+
+        # For global contrastive learning mode
+        self.proj_head_global = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU(),
             nn.Linear(embed_dim, embed_dim)
         )
-        self.temperature = temperature
+
+        # For spatial contrastive learning mode
+        self.proj_head_spatial = nn.Sequential(
+            nn.Linear(spectral_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+
+        # Project auxiliary patch embeddings to fixed embedding dim
+        self.aux_spatial_proj = nn.Linear(aux_embed_dim, embed_dim)
 
         # Patch embedding will be dynamically set in forward method
         self.patch_embed = None
@@ -252,29 +260,13 @@ class MultiModalSpectralGPT(nn.Module):
         self.initialize_weights()
 
     def _make_aux_encoder(self, in_channels, embed_dim):
-        """Creates an encoder for auxiliary modalities."""
-        if self.aux_encoder_type == 'cnn':
-            return nn.Sequential(
-                nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3),
-                nn.ReLU(),
-                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(128, embed_dim, kernel_size=3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool2d((1, 1)),
-                nn.Flatten(),
-                nn.Linear(embed_dim, embed_dim)
-            )
-        elif self.aux_encoder_type == 'vit':
-            return self.AuxViTEncoder(
-                img_size=self.analysis_dim,  # Use common analysis dimension
-                patch_size=self.patch_size,
-                in_chans=in_channels,
-                embed_dim=embed_dim
-            )
-        else:
-            raise ValueError(f"Unknown auxiliary encoder type: {self.aux_encoder_type}")
+        """Creates a ViT encoder for auxiliary modalities."""
+        return self.AuxViTEncoder(
+            img_size=self.analysis_dim,  # Use common analysis dimension
+            patch_size=self.patch_size,
+            in_chans=in_channels,
+            embed_dim=embed_dim
+        )
 
     class AuxViTEncoder(nn.Module):
         """Custom ViT-style encoder for auxiliary modalities with robust 2D patch embedding."""
@@ -481,12 +473,138 @@ class MultiModalSpectralGPT(nn.Module):
 
         return loss_recon
 
-    def contrastive_loss(self, hsi_features, aux_embeddings, batch_idx):
-        """Calculate contrastive loss with fixed normalization."""
+    def group_hsi_patches_by_spatial_location(self, features):
+        """
+        Reorganizes HSI patch tokens to group them by spatial location.
+
+        Args:
+            features (torch.Tensor): HSI patch features of shape [B, T*HW, D]
+                where T is the number of spectral chunks, HW is spatial patches
+
+        Returns:
+            torch.Tensor: Reorganized features of shape [B, HW, T*D]
+                where each row contains all spectral information for a spatial patch
+        """
+        B, L, D = features.shape
+
+        # Calculate the number of spatial and spectral patches
+        spatial_patches = self.spatial_patches
+        spectral_patches = self.spectral_patches
+
+        # Reshape into [B, spectral_patches, spatial_patches, D]
+        features = features.reshape(B, spectral_patches, spatial_patches, D)
+
+        # Transpose to [B, spatial_patches, spectral_patches, D]
+        features = features.transpose(1, 2)
+
+        # Concatenate spectral features for each spatial patch
+        features = features.reshape(B, spatial_patches, spectral_patches * D)
+
+        return features
+
+    def encode_auxiliary_patches(self, aux_data):
+        """
+        Encode auxiliary modalities into patch-level features for spatial contrastive learning.
+
+        Args:
+            aux_data: Dictionary of auxiliary images
+
+        Returns:
+            dict: Dictionary of encoded auxiliary patch embeddings
+        """
+        aux_patch_embeddings = {}
+
+        for modality, data in aux_data.items():
+            if data is not None:
+                # Patch embed using the auxiliary encoder's patch_embed
+                x = self.aux_encoder[modality].patch_embed(data)
+
+                # Flatten spatial dimensions
+                B, C, H, W = x.shape
+                x = x.flatten(2)  # Output: [B, embed_dim, H*W]
+                x = x.transpose(1, 2)  # Output: [B, H*W, embed_dim]
+
+                # Process through transformer blocks
+                for blk in self.aux_encoder[modality].blocks:
+                    x = blk(x)
+
+                # Apply normalization
+                x = self.aux_encoder[modality].norm(x)
+
+                # Skip the global pooling step to keep patch tokens
+                aux_patch_embeddings[modality] = x
+
+        return aux_patch_embeddings
+
+    def contrastive_loss_spatial(self, hsi_features, aux_embeddings, batch_idx):
+        """
+        Calculate contrastive loss at the spatial patch level.
+
+        Args:
+            hsi_features (torch.Tensor): HSI token features [B, T*HW, D]
+            aux_embeddings (dict): Dictionary of auxiliary patch embeddings
+            batch_idx (torch.Tensor): Batch indices for cross-batch negatives
+
+        Returns:
+            torch.Tensor: Spatial contrastive loss
+        """
+        device = hsi_features.device
+        B = hsi_features.shape[0]
+
+        # Group HSI patches by spatial location
+        hsi_spatial = self.group_hsi_patches_by_spatial_location(hsi_features)
+
+        # The grouped shape is [B, HW, T*D]
+        # Project with spatial-specific head
+        z_hsi = self.proj_head_spatial(hsi_spatial)  # [B, HW, T*D] -> [B, HW, D]
+
+        # Calculate individual losses for available modalities
+        individual_losses = []
+
+        for modality, embeddings in aux_embeddings.items():
+            if embeddings is not None:
+                # First project to embedding dim
+                projected_aux = self.aux_spatial_proj(embeddings)
+
+                # Then use global projection head (works with embed_dim)
+                z_aux = self.proj_head_global(projected_aux)
+
+                # Calculate patch-wise similarity matrix
+                # For each sample in batch and each patch location
+                # Shape: [B*HW, B*HW]
+                z_hsi_flat = z_hsi.reshape(B * self.spatial_patches, -1)
+                z_aux_flat = z_aux.reshape(B * self.spatial_patches, -1)
+
+                sim_matrix = torch.matmul(z_hsi_flat, z_aux_flat.T) / self.temperature
+
+                # Create labels: patches at same spatial location and same batch are positives
+                # We need labels of shape [B*HW] where the value indicates the positive match index
+                labels = torch.arange(B * self.spatial_patches, device=device)
+
+                # Calculate loss
+                loss = nn.CrossEntropyLoss()(sim_matrix, labels)
+                individual_losses.append(loss)
+
+        # If no modalities available, return zero loss
+        if not individual_losses:
+            return torch.tensor(0.0, device=device)
+
+        # Average the available losses and scale
+        avg_loss = torch.stack(individual_losses).mean()
+        scaling_factor = self.num_expected_modalities / len(individual_losses)
+        scaled_loss = avg_loss * scaling_factor
+
+        return scaled_loss
+
+    def contrastive_loss_global(self, hsi_features, aux_embeddings, batch_idx):
+        """Calculate contrastive loss with global representations (original method)."""
         device = hsi_features.device
 
+        # Get global HSI representation (mean across all patches)
+        global_hsi = hsi_features.mean(dim=1)
+
         # Project features to contrastive space
-        z_hsi = self.proj_head(hsi_features.mean(dim=1))
+        z_hsi = self.proj_head_global(global_hsi)
 
         # Calculate individual losses for available modalities
         individual_losses = []
@@ -495,7 +613,7 @@ class MultiModalSpectralGPT(nn.Module):
             if embeddings is not None:
                 # Project embeddings
                 embeddings = self.modality_proj(embeddings)
-                z_aux = self.proj_head(embeddings)
+                z_aux = self.proj_head_global(embeddings)
 
                 # Calculate similarity and loss
                 sim_matrix = torch.matmul(z_hsi, z_aux.T) / self.temperature
@@ -519,53 +637,6 @@ class MultiModalSpectralGPT(nn.Module):
 
         return scaled_loss
 
-    def forward(self, hsi_img, aux_data=None, batch_idx=None):
-        """Forward pass through the full model with standardized contrastive loss."""
-        # Apply spatial registration to ensure all modalities have the same dimensions
-        hsi_img, aux_data = self.spatial_registration(hsi_img, aux_data)
-
-        # Dynamically set up patch embedding based on preprocessed image
-        self._setup_patch_embedding(hsi_img)
-
-        # Move auxiliary data to correct device
-        device = hsi_img.device
-        if aux_data is not None:
-            aux_data = {k: v.to(device) if v is not None else None
-                        for k, v in aux_data.items()}
-
-        # Encode with masking
-        latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
-
-        # Decode and reconstruct
-        pred = self.forward_decoder(latent, ids_restore)
-
-        # Calculate reconstruction loss
-        loss_recon = self.forward_loss(hsi_img, pred, mask)
-
-        # Calculate contrastive loss if auxiliary data present
-        loss_contrast = torch.tensor(0.0, device=device)
-        num_available = 0
-        if aux_data is not None and batch_idx is not None:
-            # Count available modalities for logging
-            num_available = sum(1 for v in aux_data.values() if v is not None)
-
-            # Only compute contrastive loss if at least one modality is available
-            if num_available > 0:
-                aux_embeddings = self.encode_auxiliary(aux_data)
-                loss_contrast = self.contrastive_loss(latent, aux_embeddings, batch_idx)
-
-        # Calculate total loss
-        loss = loss_recon + loss_contrast
-
-        return {
-            'loss': loss,
-            'loss_recon': loss_recon,
-            'loss_contrast': loss_contrast,
-            'num_modalities': torch.tensor(num_available, device=device),
-            'pred': pred,
-            'mask': mask
-        }
-
     def encode_auxiliary(self, aux_data):
         """Encode auxiliary modalities.
 
@@ -584,3 +655,66 @@ class MultiModalSpectralGPT(nn.Module):
                 aux_embeddings[modality] = self.aux_encoder[modality](data)
                 aux_embeddings[modality] = self.aux_norm(aux_embeddings[modality])
         return aux_embeddings
+
+    def forward(self, hsi_img, aux_data=None, batch_idx=None):
+        """Forward pass through the full model with configurable contrastive loss mode."""
+        # Apply spatial registration to ensure all modalities have the same dimensions
+        hsi_img, aux_data = self.spatial_registration(hsi_img, aux_data)
+
+        # Dynamically set up patch embedding based on preprocessed image
+        self._setup_patch_embedding(hsi_img)
+
+        # Create unmasked embeddings for contrastive learning
+        unmasked_features = None
+        if aux_data is not None and batch_idx is not None:
+            # Get the unmasked patch embeddings for contrastive learning
+            unmasked_features = self.patch_embed(hsi_img)  # Shape: [B, T, HW, D]
+            B, T, HW, D = unmasked_features.shape
+            unmasked_features = unmasked_features.reshape(B, T * HW, D)  # Shape: [B, T*HW, D]
+            unmasked_features = unmasked_features + self.pos_embed  # Add positional embeddings
+
+        # Move auxiliary data to correct device
+        device = hsi_img.device
+        if aux_data is not None:
+            aux_data = {k: v.to(device) if v is not None else None
+                        for k, v in aux_data.items()}
+
+        # Encode with masking for reconstruction
+        latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
+
+        # Decode and reconstruct
+        pred = self.forward_decoder(latent, ids_restore)
+
+        # Calculate reconstruction loss
+        loss_recon = self.forward_loss(hsi_img, pred, mask)
+
+        # Calculate contrastive loss if auxiliary data present
+        loss_contrast = torch.tensor(0.0, device=device)
+        num_available = 0
+        if aux_data is not None and batch_idx is not None and unmasked_features is not None:
+            # Count available modalities for logging
+            num_available = sum(1 for v in aux_data.values() if v is not None)
+
+            # Only compute contrastive loss if at least one modality is available
+            if num_available > 0:
+                # For global mode, use the original approach
+                if self.contrastive_mode == 'global':
+                    aux_embeddings = self.encode_auxiliary(aux_data)
+                    loss_contrast = self.contrastive_loss_global(unmasked_features, aux_embeddings, batch_idx)
+                else:
+                    # For spatial mode, work with unmasked features
+                    aux_patch_embeddings = self.encode_auxiliary_patches(aux_data)
+                    loss_contrast = self.contrastive_loss_spatial(unmasked_features, aux_patch_embeddings, batch_idx)
+
+        # Calculate total loss
+        loss = loss_recon + loss_contrast
+
+        return {
+            'loss': loss,
+            'loss_recon': loss_recon,
+            'loss_contrast': loss_contrast,
+            'num_modalities': torch.tensor(num_available, device=device),
+            'pred': pred,
+            'mask': mask,
+            'contrastive_mode': self.contrastive_mode
+        }
