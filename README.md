@@ -4,85 +4,130 @@ This model builds on a **Masked Autoencoder (MAE)** framework with **modality-gu
 
 ## **Overview of the Pipeline**
 
-1. **HSI Encoder** (SpectralGPT-style):
-    - Uses a Vision Transformer (ViT)-like spatial-spectral encoder.
-    - Processes **3D spatial-spectral patches** from the **HSI image**.
-    - Learns high-level spectral-spatial representations.
-2. **Modality Conditioners ( Cross-Attention)**
-    - Auxiliary images (IR, AF, Thickness) are embedded separately into a **modality-specific token space**.
-    - These embeddings **do not go into the encoder directly** but instead act as **conditioning inputs** via cross-attention layers
-    - Ensures HSI remains the **primary representation** while still benefiting from auxiliary guidance.
-3. **Decoding & Pretraining Objectives**
-    - **Main Task: MAE Reconstruction of HSI** (masked tokens are reconstructed from latent embeddings).
-    - **Contrastive Learning: Auxiliary Image Alignment**
-        - Instead of reconstructing auxiliary images, we use contrastive learning to enforce **embedding alignment** between the HSI latent space and the auxiliary modality embeddings.
+1. **Spatial Registration**:
+   - Uniform spatial dimensions across all modalities using a common `analysis_dim`
+   - Preprocessing module ensures consistent spatial dimensions before model processing
+   - Preserves spectral/temporal information in HSI data
+
+2. **HSI Encoder** (SpectralGPT-style):
+   - Uses a Vision Transformer (ViT)-like spatial-spectral encoder
+   - Processes **3D spatial-spectral patches** from the **HSI image**
+   - Divides 224×224×12 HSI volumes into 14×14×4 patches (total 784 tokens)
+
+3. **Auxiliary Encoders**:
+   - Each auxiliary image (IR, AF, Thickness) is **separately tokenized** using either ViT or CNN encoders
+   - **Global averaging** applied to create modality-specific global vectors
+   - These global vectors enable **robustness to misregistration** between modalities
+
+4. **Cross-Attention Conditioning**:
+   - Auxiliary embeddings do not go into the main encoder directly but act as **conditioning inputs**
+   - HSI tokens are conditioned via **cross-attention layers** with auxiliary global vectors
+   - Each HSI patch can attend to global auxiliary features regardless of spatial position
+   - Ensures HSI remains the **primary representation** while still benefiting from auxiliary guidance
+
+5. **Main Transformer Processing**:
+   - Conditioned tokens pass through primary transformer blocks for deep feature extraction
+   - Maintains the pure HSI representation while leveraging auxiliary information
+
+6. **Dual Learning Objectives**:
+   - **MAE Reconstruction**: Masked HSI tokens (75%) are reconstructed from visible tokens (25%)
+   - **Contrastive Learning**: Global HSI embeddings are aligned with auxiliary modality embeddings
 
 ## **Detailed Architecture**
 
-### **1️⃣ Input Processing**
+### **1️⃣ Input Processing & Spatial Registration**
 
-### **(a) HSI Input - Spectral Tokenization**
+- HSI Input: `[B, C, T, H, W]` → Resized to `[B, C, T, 224, 224]`
+- Auxiliary Inputs: Various sizes → All resized to `[B, C, 224, 224]`
+- Consistent spatial dimensions for all modalities ensure proper alignment
 
-- Divide HSI image into non **overlapping 3D patches** (spatial-spectral cubes).
-- Feed into a **Transformer-based encoder**.
+### **2️⃣ Tokenization & Embedding**
 
-### **(b) Auxiliary Images - Modality-Specific Tokens**
+- **HSI Tokenization**:
+  - 3D patch embedding with 16×16 spatial and 3-band spectral patches
+  - Results in 784 tokens per HSI volume (14×14×4 grid)
+  - Output shape: `[B, 784, 768]`
 
-- Each auxiliary image (IR, AF, Thickness) is **separately tokenized**.
-- Images are either 1 channel (grayscale) or 3 channel (rgb)
-- Instead of encoding them fully, extract **global embeddings** using ViT blocks.
-- Pass them as **learned conditioning tokens** (not direct fusion).
-- These tokens are injected via **cross-attention layers** during HSI encoding.
+- **Auxiliary Tokenization**:
+  - Each modality processed through dedicated ViT/CNN encoder
+  - Critical: Global averaging produces a single feature vector per modality
+  - Output shape: `[B, 256]` per auxiliary modality
 
----
+### **3️⃣ Cross-Attention Conditioning**
 
-### **2️⃣ SpectralGPT Encoder (Spatial-Spectral Transformer)**
+- HSI tokens `[B, n_visible, 768]` and auxiliary global vectors `[B, 1, 768]` are concatenated
+- Self-attention allows information flow between HSI patches and global auxiliary features
+- Only the updated HSI tokens are retained after attention
+- Residual connections preserve the original HSI signal
+- This approach provides fine-grained conditioning while maintaining robustness to misregistration
 
-- A **ViT-style transformer with spectral attention** processes HSI patches.
-- **Masked Autoencoding:** Randomly mask a portion of the patches during training.
-- **Cross-Attention (Optional):** If auxiliary data is present, attention heads query modality tokens.
-- Outputs a set of **latent representations**.
+### **4️⃣ Main Transformer Processing**
 
----
+- Conditioned HSI tokens are processed through 16 transformer blocks
+- Self-attention and MLP layers extract rich spatial-spectral representations
+- Final output: `[B, n_visible, 768]`
 
-### **3️⃣ Decoding & Contrastive Learning**
+### **5️⃣ Decoding & Reconstruction**
 
-- **Masked Token Reconstruction (HSI)**
-    - A ViT decoder reconstructs missing HSI patches from the learned latent representations.
-- **Contrastive Learning for Multi-Modal Alignment**
-    - Instead of reconstructing auxiliary images, we enforce **embedding-level alignment** using contrastive learning.
-    - The HSI latent embeddings and auxiliary modality embeddings should be **closer for the same patient** and **distant for different patients**.
-    - This encourages the HSI encoder to extract **features that correlate well** with auxiliary modalities without forcing direct reconstruction.
+- Visible tokens are projected to decoder dimension
+- Mask tokens are appended for reconstruction
+- Decoder reconstructs original token embeddings in embedding space
+- L2 loss applied only on masked tokens (75% of total)
 
----
+### **6️⃣ Contrastive Learning**
+
+- Global averaging across HSI tokens: `[B, 784, 768]` → `[B, 768]`
+- Computing similarity matrices between HSI and each auxiliary modality
+- Cross-entropy loss encourages same-patient matches across modalities
+- Temperature scaling (0.07) sharpens similarity distributions
 
 ## **🔬 Loss Functions**
 
-1. **Main Loss:** **MAE Loss (L2) on Masked HSI Tokens**
-2. **Contrastive Loss for Modality Alignment:**
-    - **Sim()** is a similarity function (e.g., cosine similarity) that maximizes intra-patient similarity and minimizes inter-patient similarity.
-    - values can be tuned to balance contrastive learning with the MAE objective.
+1. **Reconstruction Loss**: L2 loss on masked HSI tokens
+   ```
+   loss_recon = ((pred - target)²).mean(dim=-1)
+   loss_recon = (loss_recon * mask).sum() / mask.sum()
+   ```
 
----
+2. **Contrastive Loss**: Alignment between global representations
+   ```
+   # For each modality
+   sim_matrix = torch.matmul(z_hsi, z_aux.T) / temperature
+   loss = CrossEntropyLoss()(sim_matrix, batch_indices)
+   # Average across available modalities with scaling
+   ```
 
 ## **🧩 Handling Missing Modalities**
 
-- If an auxiliary modality is missing, simply **skip its token embedding**.
-- The model learns to **not rely on any single modality** for HSI encoding.
-- During inference, the encoder operates **solely on HSI images** (pure spatial-spectral generalization).
+- If an auxiliary modality is missing, its conditioning step is skipped
+- Contrastive loss scales dynamically based on available modalities
+- The model learns to operate with any subset of auxiliary modalities
+- During inference for downstream tasks, the encoder can operate solely on HSI images
 
----
+## **🔄 Using the Pretrained HSI Encoder**
+
+For downstream tasks:
+1. Extract the core HSI encoder components:
+   - Spatial registration, patch embedding, positional embedding
+   - Main transformer blocks (excluding cross-attention)
+   - Apply fine-tuning to adapt to the distribution shift
+
+2. The standalone HSI encoder processes input without auxiliary modalities:
+   ```
+   HSI Input → Spatial Registration → Patch Embedding → 
+   Positional Embedding → Transformer Blocks → Final Features
+   ```
 
 ## **🚀 Advantages of This Approach**
 
-✅ **Retains HSI as the primary feature space** → No fusion biases.
+✅ **Robustness to Misregistration**: Global auxiliary features enable conditioning without precise spatial alignment
 
-✅ **Auxiliary images act as soft guidance** → They improve pretraining but don’t degrade spectral learning.
+✅ **Retains HSI as the primary feature space**: Cross-attention provides soft guidance without fusion biases
 
-✅ **Handles missing modalities dynamically** → Works even with partial auxiliary data.
+✅ **Dynamic Modality Handling**: Functions with any combination of available auxiliary modalities
 
-✅ **Uses MAE-style training for robust pretraining** → Captures robust spectral-spatial dependencies.
+✅ **Transferability**: HSI encoder can be extracted and fine-tuned for downstream tasks
 
-✅ **Contrastive Learning improves feature generalization** → Ensures the HSI encoder aligns with auxiliary modalities **without overfitting to them**.
+✅ **Strong Generalization**: Contrastive learning and MAE pretraining combine to create robust representations
 
----
+✅ **Computational Efficiency**: ~100M parameters, ~12 GFLOPs for forward pass
