@@ -27,6 +27,26 @@ class SpatialRegistration(nn.Module):
         self.target_bands = target_bands
         self.selected_indices = None  # To track selected indices for use in other methods
 
+    def detect_mask(self, image):
+        """Detect black mask in an image tensor.
+
+        Args:
+            image (torch.Tensor): Image tensor of shape [B, C, H, W]
+
+        Returns:
+            torch.Tensor: Binary mask (1 for valid regions, 0 for masked regions)
+        """
+        # Assuming black regions have pixel values near zero
+        threshold = 0.05
+
+        # Create binary mask (1 for valid pixels, 0 for masked/black pixels)
+        if image.shape[1] > 1:
+            mask = (image.mean(dim=1, keepdim=True) > threshold).float()
+        else:
+            mask = (image > threshold).float()
+
+        return mask
+
     def select_spectral_bands(self, hsi_img):
         """
         Select specific spectral bands from the HSI image.
@@ -67,6 +87,7 @@ class SpatialRegistration(nn.Module):
         Preprocesses HSI image by:
         1. Selecting specific spectral bands
         2. Resizing spatial dimensions
+        3. Applying consistent masking from thickness modality to all modalities
 
         Args:
             hsi_img (torch.Tensor): HSI image tensor of shape [B, C, T, H, W]
@@ -101,7 +122,7 @@ class SpatialRegistration(nn.Module):
             # Reshape back to [B, C, T, analysis_dim, analysis_dim]
             hsi_registered = hsi_resized.view(B, C, T, self.analysis_dim, self.analysis_dim)
 
-        # Process auxiliary modalities (same as before)
+        # Process auxiliary modalities (resize first)
         aux_registered = {}
         for modality, data in aux_data.items():
             if data is not None:
@@ -118,6 +139,30 @@ class SpatialRegistration(nn.Module):
                     )
             else:
                 aux_registered[modality] = None
+
+            # Detect mask from thickness image if available
+            thickness_mask = None
+            if 'thickness' in aux_registered and aux_registered['thickness'] is not None:
+                thickness_mask = self.detect_mask(aux_registered['thickness'])
+
+                # Apply mask to HSI (across all spectral bands)
+                for t in range(T):
+                    # Use torch.where instead of multiplication
+                    hsi_registered[:, :, t] = torch.where(
+                        thickness_mask > 0.03,  # Condition: where mask is above threshold
+                        hsi_registered[:, :, t],  # True: keep original values
+                        torch.zeros_like(hsi_registered[:, :, t])  # False: set to zero
+                    )
+
+                # Apply mask to all auxiliary modalities
+                for modality in aux_registered:
+                    if aux_registered[modality] is not None:
+                        # Use torch.where instead of multiplication
+                        aux_registered[modality] = torch.where(
+                            thickness_mask > 0.05,  # Condition: where mask is above threshold
+                            aux_registered[modality],  # True: keep original values
+                            torch.zeros_like(aux_registered[modality])  # False: set to zero
+                        )
 
         return hsi_registered, aux_registered
 
