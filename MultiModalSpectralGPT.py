@@ -60,53 +60,100 @@ class SpatialRegistration(nn.Module):
         # Original spectral dimensions
         B, C, T, H, W = hsi_img.shape
 
+        # Print detailed debugging information
+        print(f"Band Selection Debug:")
+        print(f"  Input shape: {hsi_img.shape}")
+        print(f"  Total bands: {T}")
+        print(f"  Target bands: {self.target_bands}")
+
         # Check if already has the target number of bands
         if T == self.target_bands:
-            # No need to select bands, return as is
+            print("  No band selection needed - already correct number of bands")
             self.selected_indices = list(range(T))
             return hsi_img
 
-        # Create indices for band selection
-        # 0:58:2 → Every 2nd index from 0 to 57
-        # 80 → Add wavelength at index 80
-        selected_indices = list(range(0, 58, 2)) + [80]
+        # Determine band selection strategy
+        if T <= self.target_bands:
+            # If fewer bands than target, use all
+            selected_indices = list(range(T))
+        else:
+            # Create evenly spaced indices
+            step = max(1, (T - 1) // (self.target_bands - 1))
+            selected_indices = list(range(0, T, step))[:self.target_bands]
 
-        # Sort indices to maintain order
-        selected_indices = sorted(set(selected_indices))
+        # Ensure we have exactly the target number of bands
+        if len(selected_indices) > self.target_bands:
+            selected_indices = selected_indices[:self.target_bands]
+        elif len(selected_indices) < self.target_bands:
+            # Pad with the last index if needed
+            selected_indices.extend([selected_indices[-1]] * (self.target_bands - len(selected_indices)))
+
+        # Print selected indices
+        print(f"  Selected indices: {selected_indices}")
+        print(f"  Number of selected indices: {len(selected_indices)}")
 
         # Store selected indices for reference
         self.selected_indices = selected_indices
 
         # Select the specified bands
-        selected_bands = hsi_img[:, :, selected_indices, :, :]
+        try:
+            # Use torch.index_select for more flexible indexing
+            index_tensor = torch.tensor(selected_indices, device=hsi_img.device, dtype=torch.long)
 
-        return selected_bands
+            # Perform indexing with detailed error handling
+            try:
+                selected_bands = torch.index_select(hsi_img, 2, index_tensor)
+            except Exception as select_error:
+                print(f"Error during torch.index_select: {select_error}")
+                print(f"Input tensor shape: {hsi_img.shape}")
+                print(f"Index tensor: {index_tensor}")
+                raise
+
+            # Print shape after selection
+            print(f"  Output shape: {selected_bands.shape}")
+
+            return selected_bands
+        except Exception as e:
+            print(f"Comprehensive error selecting bands: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def forward(self, hsi_img, aux_data):
         """
         Preprocesses HSI image by:
-        1. Selecting specific spectral bands
-        2. Resizing spatial dimensions
-        3. Creating mask from thickness modality but NOT applying it
+        1. Checking if format is already correct (30 bands, 500x500)
+        2. Selecting specific spectral bands if needed
+        3. Resizing spatial dimensions if needed
+        4. Creating mask from thickness modality
         """
-        # First, select specified spectral bands
-        hsi_img = self.select_spectral_bands(hsi_img)
-
-        # Get updated dimensions after band selection
         B, C, T, H, W = hsi_img.shape
 
-        # Resize HSI if needed
-        if H == self.analysis_dim and W == self.analysis_dim:
+        # First check if HSI is already in the correct format
+        if T == self.target_bands and H == self.analysis_dim and W == self.analysis_dim:
+            print("HSI already in correct format, skipping preprocessing.")
+            # Still need to set selected_indices for reference
+            self.selected_indices = list(range(T))
             hsi_registered = hsi_img
         else:
-            hsi_reshaped = hsi_img.view(B * T, C, H, W)
-            hsi_resized = F.interpolate(
-                hsi_reshaped,
-                size=(self.analysis_dim, self.analysis_dim),
-                mode='bilinear',
-                align_corners=False
-            )
-            hsi_registered = hsi_resized.view(B, C, T, self.analysis_dim, self.analysis_dim)
+            # First, select specified spectral bands if needed
+            if T != self.target_bands:
+                hsi_img = self.select_spectral_bands(hsi_img)
+                # Get updated dimensions after band selection
+                B, C, T, H, W = hsi_img.shape
+
+            # Resize HSI if needed
+            if H == self.analysis_dim and W == self.analysis_dim:
+                hsi_registered = hsi_img
+            else:
+                hsi_reshaped = hsi_img.view(B * T, C, H, W)
+                hsi_resized = F.interpolate(
+                    hsi_reshaped,
+                    size=(self.analysis_dim, self.analysis_dim),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                hsi_registered = hsi_resized.view(B, C, T, self.analysis_dim, self.analysis_dim)
 
         # Process auxiliary modalities (resize only)
         aux_registered = {}

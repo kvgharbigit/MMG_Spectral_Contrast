@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from timm.layers import to_2tuple
-from base import MultiModalSpectralGPT
+from MultiModalSpectralGPT import MultiModalSpectralGPT
 import glob
 from PIL import Image
 import tifffile

@@ -1,0 +1,45 @@
+# Default configuration for MultiModalSpectralGPT training
+output_dir: './outputs'
+
+# MLflow configuration
+mlflow:
+  tracking_uri: 'file:./mlruns'
+  experiment_name: 'MultiModalSpectralGPT'
+
+# Model parameters
+model:
+  analysis_dim: 500
+  patch_size: 25
+  embed_dim: 768
+  t_patch_size: 5
+  in_chans: 1
+  aux_chans: 1
+  depth: 16
+  num_heads: 12
+  mask_ratio: 0.75
+  temperature: 0.07
+  contrastive_mode: 'global'  # Options: 'global', 'spatial'
+
+# Optimizer parameters
+optimizer:
+  lr: 1e-4
+  weight_decay: 1e-5
+  clip_grad_norm: 1.0
+
+# Dataloader parameters
+dataloader:
+  data_dir: './dummydata'
+  batch_size: 1
+  shuffle: true
+  num_workers: 4
+
+# Training parameters
+training:
+  epochs: 50
+  eval_freq: 1
+  save_freq: 5
+  resume: null  # Path to checkpoint for resuming training
+  early_stopping:
+    enabled: true
+    patience: 10  # Number of epochs with no improvement to wait before stopping
+    min_delta: 0.001  # Minimum change in loss to qualify as an improvement
