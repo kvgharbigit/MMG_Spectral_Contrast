@@ -170,6 +170,66 @@ Thickness Mask Transformation:
    - Average across spectral dimension to get [B, 400]
    - Only retain spatial patches with mask value > 0.5
 
+Cross-Attention Conditioning Mechanism:
+----------------------------------
+The cross-attention mechanism allows auxiliary modalities to guide the HSI encoder by providing conditioning signals.
+
+Tensor Dimensions and Transformations:
+1. HSI Encoder Features (after masking): [B, num_unmasked, embed_dim]
+   - B: Batch size
+   - num_unmasked: Number of unmasked tokens (~600 with 75% masking)
+   - embed_dim: 768
+
+2. Auxiliary Global Features: [B, aux_embed_dim]
+   - B: Batch size
+   - aux_embed_dim: 256
+
+3. Projection and Preparation:
+   - Project auxiliary: [B, aux_embed_dim] → [B, embed_dim]
+   - Add dimension: [B, embed_dim] → [B, 1, embed_dim]
+
+4. Concatenation for Cross-Attention:
+   - HSI tokens: [B, num_unmasked, embed_dim]
+   - Auxiliary token: [B, 1, embed_dim]
+   - Concatenated: [B, num_unmasked+1, embed_dim]
+
+5. Apply Cross-Attention Block:
+   - Input: [B, num_unmasked+1, embed_dim]
+   - Self-attention allows HSI tokens to attend to auxiliary token
+   - Output: [B, num_unmasked+1, embed_dim]
+
+6. Extract Conditioned HSI Tokens:
+   - Take first num_unmasked tokens: [B, num_unmasked, embed_dim]
+   - Add residual connection to original HSI tokens
+   - Process through next cross-attention layer with next modality
+
+The Implementation Code:
+```python
+# For each auxiliary modality
+for modality, embedding in aux_embeddings.items():
+    # Project auxiliary embedding to the HSI embedding dimension
+    cond_tokens = self.modality_proj(embedding).unsqueeze(1)  # Shape: [B, 1, embed_dim]
+
+    # Apply cross-attention for each layer
+    for block in self.cross_attn:
+        # Concatenate HSI tokens with auxiliary token
+        concat_tokens = torch.cat([x, cond_tokens], dim=1)  # Shape: [B, num_unmasked+1, embed_dim]
+
+        # Apply self-attention block (allows HSI tokens to attend to auxiliary)
+        attended = block(concat_tokens)  # Shape: [B, num_unmasked+1, embed_dim]
+
+        # Take only the HSI tokens and add residual connection
+        x = x + attended[:, :-1, :]  # Shape: [B, num_unmasked, embed_dim]
+```
+
+This approach allows:
+1. Each HSI token to selectively attend to auxiliary information
+2. Soft conditioning rather than hard fusion of modalities
+3. Auxiliary guidance of the HSI encoder
+4. Processing multiple auxiliary modalities sequentially
+
+For thickness modality, the encoder can be modified to focus only on valid regions by using a weighted average pooling approach, where black rim areas are excluded from the global representation.
+
 Projection Heads:
 ---------------
 1. Global Projection Head:

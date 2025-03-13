@@ -841,7 +841,8 @@ class MultiModalSpectralGPT(nn.Module):
         pred = self.forward_decoder(latent, ids_restore)
 
         # Calculate reconstruction loss using new method that considers thickness mask
-        loss_recon = self.forward_loss_with_thickness_mask(hsi_img, pred, mask, thickness_mask)
+        # Calculate reconstruction loss without considering thickness mask
+        loss_recon = self.forward_loss(hsi_img, pred, mask)  # Use original forward_loss method without thickness mask
 
         # Calculate contrastive loss if auxiliary data present
         loss_contrast = torch.tensor(0.0, device=device)
