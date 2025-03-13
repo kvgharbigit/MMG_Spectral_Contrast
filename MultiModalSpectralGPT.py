@@ -692,6 +692,14 @@ class MultiModalSpectralGPT(nn.Module):
         device = hsi_features.device
         B = hsi_features.shape[0]
 
+        # Skip contrastive loss for batch size of 1
+        if B <= 1:
+            return torch.tensor(0.0, device=device)
+
+        # Create new batch indices relative to this batch (0 to B-1)
+        # This replaces the absolute indices with relative ones
+        relative_batch_idx = torch.arange(B, device=device)
+
         # Apply masking if thickness mask is provided
         if thickness_mask is not None:
             # Convert pixel-level mask to patch-level mask
@@ -727,9 +735,9 @@ class MultiModalSpectralGPT(nn.Module):
 
                 # Calculate similarity and loss
                 sim_matrix = torch.matmul(z_hsi, z_aux.T) / self.temperature
-                labels = batch_idx.to(device)
-                loss = nn.CrossEntropyLoss()(sim_matrix, labels)
 
+                # Use relative indices for loss calculation
+                loss = nn.CrossEntropyLoss()(sim_matrix, relative_batch_idx)
                 individual_losses.append(loss)
 
         # Handle case with no modalities
