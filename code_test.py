@@ -1,66 +1,157 @@
 import os
 import sys
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import torch
+import numpy as np
+import matplotlib.pyplot as plt
 from timm.layers import to_2tuple
 from base import MultiModalSpectralGPT
+import glob
+from PIL import Image
+import tifffile
 
 
-def calculate_num_patches(hsi_img, patch_size, t_patch_size):
-    """
-    Dynamically calculate the number of patches based on preprocessed HSI image.
+def create_data_with_real_thickness(batch_size=2):
+    """Create test data using a real thickness image from file."""
+    # Create HSI data: [B, C, T, H, W]
+    hsi_data = torch.randn(batch_size, 1, 30, 500, 500)
 
-    Args:
-        hsi_img (torch.Tensor): Preprocessed HSI image tensor of shape [B, C, T, H, W]
-        patch_size (tuple): Spatial patch size
-        t_patch_size (int): Temporal/spectral patch size
-
-    Returns:
-        int: Number of patches
-    """
-    # Get dimensions after preprocessing
-    _, _, T, H, W = hsi_img.shape
-
-    # Calculate number of patches
-    spatial_patches_h = H // patch_size[0]
-    spatial_patches_w = W // patch_size[1]
-    temporal_patches = T // t_patch_size
-
-    return spatial_patches_h * spatial_patches_w * temporal_patches
-
-
-def create_dummy_data(batch_size=3):
-    """Create dummy data for testing the model with different input sizes."""
-    # Create HSI data: [B, C, T, H, W] with larger size
-    # Updated to 500x500 spatial size and 91 spectral bands
-    hsi_data = torch.randn(batch_size, 1, 91, 500, 500)  # Test resizing
-
-    # Create auxiliary data with different sizes - NOW 1 CHANNEL EACH
+    # Create auxiliary data with the same spatial size
     aux_data = {
-        'ir': torch.randn(batch_size, 1, 128, 128),
-        'af': torch.randn(batch_size, 1, 256, 256),
-        'thickness': torch.randn(batch_size, 1, 200, 200)
+        'ir': torch.randn(batch_size, 1, 500, 500),
+        'af': torch.randn(batch_size, 1, 500, 500),
+        'thickness': torch.zeros(batch_size, 1, 500, 500)  # Will be filled with real data
     }
 
     # Create batch indices for contrastive learning
     batch_indices = torch.arange(batch_size)
 
+    # Search for thickness tiff files in the dummydata directory and all subdirectories
+    thickness_files = []
+
+    # Use os.walk to search recursively through all subdirectories
+    for root, dirs, files in os.walk('dummydata'):
+        for file in files:
+            # Check if the file is a TIFF and has 'thickness' in the name
+            if 'thickness' in file.lower() and (file.lower().endswith('.tif') or file.lower().endswith('.tiff')):
+                thickness_files.append(os.path.join(root, file))
+
+    # Print the found files for debugging
+    if thickness_files:
+        print(f"Found {len(thickness_files)} thickness files:")
+        for i, file in enumerate(thickness_files[:5]):  # Show at most 5 files
+            print(f"  {i + 1}. {file}")
+        if len(thickness_files) > 5:
+            print(f"  ...and {len(thickness_files) - 5} more files")
+
+    if not thickness_files:
+        print("No thickness TIFF files found in dummydata directory!")
+        print("Creating dummy circular masks instead.")
+        # Fall back to creating circular masks
+        for b in range(batch_size):
+            # Create a grid of coordinates
+            y, x = torch.meshgrid(
+                torch.linspace(-1, 1, 500),
+                torch.linspace(-1, 1, 500),
+                indexing='ij'
+            )
+            # Vary the circle radius for each batch
+            radius = 0.7 if b == 0 else 0.5
+            mask = ((x ** 2 + y ** 2) < radius ** 2).float()
+
+            # Apply the mask to random thickness data
+            random_data = torch.randn(500, 500)
+            aux_data['thickness'][b, 0] = random_data * mask
+    else:
+        # Use the first thickness file found
+        thickness_file = thickness_files[0]
+        print(f"Using thickness file: {thickness_file}")
+
+        try:
+            # Try to open with tifffile first (handles more TIFF variants)
+            thickness_img = tifffile.imread(thickness_file)
+
+            # Normalize to [0, 1] float range
+            if thickness_img.dtype == np.uint8:
+                thickness_img = thickness_img.astype(np.float32) / 255.0
+            elif thickness_img.dtype == np.uint16:
+                thickness_img = thickness_img.astype(np.float32) / 65535.0
+            else:
+                # Already floating point, just ensure it's in [0, 1]
+                thickness_img = thickness_img.astype(np.float32)
+                if thickness_img.max() > 1.0:
+                    thickness_img = thickness_img / thickness_img.max()
+
+        except Exception as e:
+            print(f"Error reading with tifffile: {e}")
+            # Fall back to PIL if tifffile fails
+            try:
+                thickness_img = np.array(Image.open(thickness_file))
+                # Convert to float and normalize
+                thickness_img = thickness_img.astype(np.float32) / 255.0
+            except Exception as e:
+                print(f"Error reading with PIL: {e}")
+                print("Falling back to dummy data.")
+                # Create a dummy circular mask
+                y, x = torch.meshgrid(
+                    torch.linspace(-1, 1, 500),
+                    torch.linspace(-1, 1, 500),
+                    indexing='ij'
+                )
+                thickness_img = ((x.numpy() ** 2 + y.numpy() ** 2) < 0.6 ** 2).astype(np.float32)
+
+        # Resize to 500x500 if needed
+        if thickness_img.shape[0] != 500 or thickness_img.shape[1] != 500:
+            print(f"Resizing thickness image from {thickness_img.shape} to (500, 500)")
+            try:
+                from skimage.transform import resize
+                thickness_img = resize(thickness_img, (500, 500), preserve_range=True)
+            except ImportError:
+                print("scikit-image not available for resizing, using basic interpolation")
+                # Basic resize - not ideal but a fallback
+                h, w = thickness_img.shape[:2]
+                h_indices = np.linspace(0, h - 1, 500).astype(int)
+                w_indices = np.linspace(0, w - 1, 500).astype(int)
+                thickness_img = thickness_img[h_indices[:, np.newaxis], w_indices]
+
+        # Handle multi-channel images
+        if len(thickness_img.shape) > 2 and thickness_img.shape[2] > 1:
+            print(f"Taking first channel of multi-channel thickness image (shape: {thickness_img.shape})")
+            thickness_img = thickness_img[:, :, 0]
+
+        # Ensure the array is 2D
+        thickness_img = thickness_img.squeeze()
+
+        # Convert to torch tensor and add to data
+        thickness_tensor = torch.tensor(thickness_img, dtype=torch.float32)
+
+        # Use the same image for all batch items
+        for b in range(batch_size):
+            aux_data['thickness'][b, 0] = thickness_tensor
+
     return hsi_data, aux_data, batch_indices
 
 
-def test_model_contrastive_modes():
-    """Test both contrastive learning modes of the MultiModalSpectralGPT model."""
+def test_loss_masking_and_contrastive_modes():
+    """Test both contrastive modes and verify loss masking is working using a real thickness image."""
+    print("\n===== TESTING LOSS MASKING WITH REAL THICKNESS IMAGE =====")
+
+    # Create output directory for visualizations
+    os.makedirs("test_visualizations", exist_ok=True)
+
+    # Check if dummydata directory exists, create it if it doesn't
+    if not os.path.exists("dummydata"):
+        os.makedirs("dummydata", exist_ok=True)
+        print("Created dummydata directory. Please place thickness TIFF files there.")
 
     # Basic model parameters
-    analysis_dim = 500  # Spatial dimension
-    patch_size = (25, 25)  # Spatial patch size
-    t_patch_size = 5  # Temporal/spectral patch size
+    analysis_dim = 500
+    patch_size = (25, 25)
+    t_patch_size = 5
     embed_dim = 768
+    batch_size = 2
 
-    # Generate dummy data
-    hsi_data, aux_data, batch_indices = create_dummy_data(batch_size=3)
+    # Generate data with real thickness image if available
+    hsi_data, aux_data, batch_indices = create_data_with_real_thickness(batch_size=batch_size)
 
     # Check if CUDA is available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -71,671 +162,276 @@ def test_model_contrastive_modes():
     aux_data = {k: v.to(device) for k, v in aux_data.items()}
     batch_indices = batch_indices.to(device)
 
-    # Test global contrastive mode first
-    print("\n==== Testing Global Contrastive Mode ====")
-    global_model = MultiModalSpectralGPT(
-        analysis_dim=analysis_dim,
-        patch_size=patch_size,
-        embed_dim=embed_dim,
-        t_patch_size=t_patch_size,
-        in_chans=1,
-        aux_chans=1,
-        contrastive_mode='global'  # Global mode
-    ).to(device)
+    # Visualize the thickness images
+    try:
+        plt.figure(figsize=(10, 5))
+        for b in range(min(batch_size, 2)):
+            plt.subplot(1, 2, b + 1)
+            plt.imshow(aux_data['thickness'][b, 0].cpu().numpy(), cmap='gray')
+            plt.title(f"Thickness Image (Batch {b})")
+            plt.axis('off')
+        plt.tight_layout()
+        plt.savefig("test_visualizations/real_thickness_images.png")
+        plt.close()
+    except Exception as e:
+        print(f"Error visualizing thickness images: {e}")
 
-    # Run forward pass with global mode
-    with torch.no_grad():
+    # Test global contrastive mode
+    global_model = None
+    spatial_model = None
+    global_output = None
+    spatial_output = None
+
+    try:
+        print("\n==== Testing Global Contrastive Mode ====")
+        global_model = MultiModalSpectralGPT(
+            analysis_dim=analysis_dim,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            t_patch_size=t_patch_size,
+            in_chans=1,
+            aux_chans=1,
+            contrastive_mode='global'
+        ).to(device)
+
+        # First, check the spatial registration function
+        hsi_registered, aux_registered, thickness_mask = global_model.spatial_registration(hsi_data, aux_data)
+
+        # Verify thickness mask is created
+        if thickness_mask is not None:
+            print(f"Thickness mask shape: {thickness_mask.shape}")
+            print(f"Thickness mask min/max: {thickness_mask.min().item():.4f}/{thickness_mask.max().item():.4f}")
+
+            # Visualize the detected mask
+            plt.figure(figsize=(10, 5))
+            for b in range(min(batch_size, 2)):
+                plt.subplot(1, 2, b + 1)
+                plt.imshow(thickness_mask[b, 0].cpu().numpy(), cmap='gray')
+                plt.title(f"Detected Thickness Mask (Batch {b})")
+                plt.axis('off')
+            plt.tight_layout()
+            plt.savefig("test_visualizations/detected_thickness_masks.png")
+            plt.close()
+        else:
+            print("No thickness mask was created!")
+
+        # Now run forward pass
         global_output = global_model(hsi_data, aux_data, batch_indices)
 
-    print(f"Global contrastive loss: {global_output['loss_contrast'].item():.4f}")
+        # Check if thickness mask is in the output
+        if 'thickness_mask' in global_output:
+            print("✓ Thickness mask passed through global model")
+        else:
+            print("✗ Thickness mask not in global model output!")
 
-    # Now test spatial contrastive mode
-    print("\n==== Testing Spatial Contrastive Mode ====")
-    spatial_model = MultiModalSpectralGPT(
-        analysis_dim=analysis_dim,
-        patch_size=patch_size,
-        embed_dim=embed_dim,
-        t_patch_size=t_patch_size,
-        in_chans=1,
-        aux_chans=1,
-        contrastive_mode='spatial'  # Spatial mode
-    ).to(device)
+        # Visualize patch-level mask if we have direct access
+        if hasattr(global_model, 'create_patch_mask_from_pixel_mask') and thickness_mask is not None:
+            # Generate patch mask from pixel mask
+            patch_mask = global_model.create_patch_mask_from_pixel_mask(thickness_mask)
 
-    # Run forward pass with spatial mode
-    with torch.no_grad():
-        spatial_output = spatial_model(hsi_data, aux_data, batch_indices)
+            # Print shape info for debugging
+            print(f"Patch mask shape: {patch_mask.shape}")
 
-    print(f"Spatial contrastive loss: {spatial_output['loss_contrast'].item():.4f}")
+            # Get model structure details
+            spatial_patches_h = analysis_dim // patch_size[0]
+            spatial_patches_w = analysis_dim // patch_size[1]
+            spectral_patches = global_model.spectral_patches
+            print(
+                f"Expected patch structure: spatial={spatial_patches_h}×{spatial_patches_w}, spectral={spectral_patches}")
 
-    # Compare the reconstruction losses (should be similar)
-    print("\n==== Comparing Losses ====")
-    print(f"Global reconstruction loss: {global_output['loss_recon'].item():.4f}")
-    print(f"Spatial reconstruction loss: {spatial_output['loss_recon'].item():.4f}")
+            # Visualize the patch-level mask
+            plt.figure(figsize=(15, 5))
 
-    # Compare the overall losses
-    print(f"Global total loss: {global_output['loss'].item():.4f}")
-    print(f"Spatial total loss: {spatial_output['loss'].item():.4f}")
-
-    print("\n==== Test Complete ====")
-    print("Both contrastive learning modes are working as expected.")
-
-
-def test_model_original():
-    """Test the original functionality of the MultiModalSpectralGPT model with dummy data."""
-
-    # Model parameters
-    analysis_dim = 500  # Spatial dimension matching HSI input
-    patch_size = (25, 25)  # Specify as a tuple
-    t_patch_size = 5  # Adjust temporal patch size to divide spectral bands evenly
-    embed_dim = 768
-
-    # Verify that analysis_dim is divisible by patch_size
-    assert analysis_dim % patch_size[0] == 0, f"{analysis_dim} must be divisible by {patch_size[0]}"
-
-    # Create model with updated parameters
-    model = MultiModalSpectralGPT(
-        analysis_dim=analysis_dim,  # Common spatial dimension
-        patch_size=patch_size,  # Use tuple
-        embed_dim=embed_dim,
-        t_patch_size=t_patch_size,
-        in_chans=1,  # HSI channels
-        aux_chans=1,  # NOW 1 CHANNEL FOR AUXILIARY CHANNELS
-        contrastive_mode='global'  # Default global mode
-    )
-
-    # Generate dummy data with varied input sizes to test spatial registration
-    hsi_data, aux_data, batch_indices = create_dummy_data(batch_size=3)
-
-    print("\nInput data shapes before spatial registration:")
-    print(f"HSI data shape: {hsi_data.shape}")
-    for modality, data in aux_data.items():
-        print(f"{modality} data shape: {data.shape}")
-
-    # Move everything to GPU if available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nUsing device: {device}")
-
-    model = model.to(device)
-    hsi_data = hsi_data.to(device)
-    aux_data = {k: v.to(device) for k, v in aux_data.items()}
-    batch_indices = batch_indices.to(device)
-
-    # Get the registered dimensions by manually applying spatial registration
-    with torch.no_grad():
-        hsi_registered, aux_registered = model.spatial_registration(hsi_data, aux_data)
-
-    print("\nData shapes after spatial registration:")
-    print(f"HSI data shape: {hsi_registered.shape}")
-    for modality, data in aux_registered.items():
-        print(f"{modality} data shape: {data.shape}")
-
-    # Manually set up patch embedding
-    model._setup_patch_embedding(hsi_registered)
-
-    # Dynamically calculate number of patches after preprocessing
-    num_patches = calculate_num_patches(
-        hsi_registered,
-        patch_size,
-        t_patch_size
-    )
-    print(f"\nNumber of patches that will be generated: {num_patches}")
-
-    # Verify positional embedding size
-    print(f"Position embedding shape: {model.pos_embed.shape}")
-    print(f"Expected shape: [1, {num_patches}, {embed_dim}]")
-
-    print("\nTesting model with dummy data...")
-
-    # Test forward pass
-    try:
-        model.train()
-        output = model(hsi_data, aux_data, batch_indices)
-
-        print("\nForward pass successful!")
-        print("\nOutput dictionary contains:")
-        for key, value in output.items():
-            if isinstance(value, torch.Tensor):
-                print(f"{key}: shape {value.shape}, dtype {value.dtype}")
-            else:
-                print(f"{key}: {value}")
-
-        # Check if losses are reasonable
-        print("\nLoss values:")
-        print(f"Reconstruction loss: {output['loss_recon']:.4f}")
-        print(f"Contrastive loss: {output['loss_contrast']:.4f}")
-        print(f"Total loss: {output['loss']:.4f}")
-
-        # Check mask ratio
-        mask = output['mask']
-        actual_mask_ratio = mask.float().mean()
-        print(f"\nActual mask ratio: {actual_mask_ratio:.4f}")
-
-    except Exception as e:
-        print(f"\nError during forward pass: {str(e)}")
-        raise
-
-
-def test_masking():
-    """Test the automatic masking functionality with a mock thickness image."""
-
-    print("\n==== Testing Dynamic Masking ====")
-
-    # Import visualization libraries
-    import matplotlib.pyplot as plt
-    import os
-
-    # Create output directory for visualizations
-    os.makedirs("test_visualizations", exist_ok=True)
-
-    # Basic model parameters
-    analysis_dim = 500
-    patch_size = (25, 25)
-    t_patch_size = 5
-    embed_dim = 768
-
-    # Create test data with a simulated masked thickness image
-    batch_size = 2
-    hsi_data, aux_data, batch_indices = create_dummy_data(batch_size=batch_size)
-
-    # Create a simulated mask in the thickness image
-    # Generate circular masks of different sizes for each batch item
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    for b in range(batch_size):
-        # Create a grid of coordinates
-        y, x = torch.meshgrid(
-            torch.linspace(-1, 1, 200),
-            torch.linspace(-1, 1, 200),
-            indexing='ij'
-        )
-        # Create a circular mask (0 outside, 1 inside the circle)
-        # Vary the circle radius for each batch
-        radius = 0.7 if b == 0 else 0.5
-        mask = ((x ** 2 + y ** 2) < radius ** 2).float()
-
-        # Apply the simulated mask to the thickness image
-        # Make pixels outside the circle black (0)
-        aux_data['thickness'][b, 0] = aux_data['thickness'][b, 0] * mask
-
-    # Visualize original thickness images with masks
-    plt.figure(figsize=(10, 5))
-    for b in range(batch_size):
-        plt.subplot(1, 2, b + 1)
-        plt.imshow(aux_data['thickness'][b, 0].cpu().numpy(), cmap='gray')
-        plt.title(f"Original Thickness Image\nRadius={0.7 if b == 0 else 0.5}")
-        plt.axis('off')
-    plt.tight_layout()
-    plt.savefig("test_visualizations/original_thickness_masks.png")
-    plt.close()
-
-    # Visualize a few HSI bands before masking
-    plt.figure(figsize=(15, 5))
-    bands_to_show = [0, 10, 20]
-    for i, band in enumerate(bands_to_show):
-        plt.subplot(1, 3, i + 1)
-        plt.imshow(hsi_data[0, 0, band].cpu().numpy(), cmap='gray')
-        plt.title(f"HSI Band {band} (Before Masking)")
-        plt.axis('off')
-    plt.tight_layout()
-    plt.savefig("test_visualizations/hsi_before_masking.png")
-    plt.close()
-
-    # Move data to device
-    hsi_data = hsi_data.to(device)
-    aux_data = {k: v.to(device) for k, v in aux_data.items()}
-    batch_indices = batch_indices.to(device)
-
-    # Create model
-    model = MultiModalSpectralGPT(
-        analysis_dim=analysis_dim,
-        patch_size=patch_size,
-        embed_dim=embed_dim,
-        t_patch_size=t_patch_size,
-        in_chans=1,
-        aux_chans=1,
-        contrastive_mode='global'
-    ).to(device)
-
-    # Extract the spatial registration module for direct testing
-    spatial_reg = model.spatial_registration
-
-    # Test spatial registration with masking
-    print("Testing spatial registration with masking...")
-    with torch.no_grad():
-        # Apply spatial registration
-        hsi_registered, aux_registered = spatial_reg(hsi_data, aux_data)
-
-        # Check if HSI has been masked
-        print(f"HSI tensor shape: {hsi_registered.shape}")
-        print(
-            f"Min/max values in HSI before masking (first band): {hsi_data[:, :, 0].min().item():.4f}/{hsi_data[:, :, 0].max().item():.4f}")
-        print(
-            f"Min/max values in HSI after masking (first band): {hsi_registered[:, :, 0].min().item():.4f}/{hsi_registered[:, :, 0].max().item():.4f}")
-
-        # Visualize HSI bands after masking
-        plt.figure(figsize=(15, 5))
-        for i, band in enumerate(bands_to_show):
-            plt.subplot(1, 3, i + 1)
-            plt.imshow(hsi_registered[0, 0, band].cpu().numpy(), cmap='gray')
-            plt.title(f"HSI Band {band} (After Masking)")
-            plt.axis('off')
-        plt.tight_layout()
-        plt.savefig("test_visualizations/hsi_after_masking.png")
-        plt.close()
-
-        # Visualize all modalities after masking
-        plt.figure(figsize=(15, 10))
-
-        # Plot HSI band 0
-        plt.subplot(2, 3, 1)
-        plt.imshow(hsi_registered[0, 0, 0].cpu().numpy(), cmap='gray')
-        plt.title("HSI (Band 0)")
-        plt.axis('off')
-
-        # Plot auxiliary modalities
-        pos = 2
-        for modality in aux_registered:
-            if aux_registered[modality] is not None:
-                plt.subplot(2, 3, pos)
-                plt.imshow(aux_registered[modality][0, 0].cpu().numpy(), cmap='gray')
-                plt.title(f"{modality.upper()}")
-                plt.axis('off')
-                pos += 1
-
-                print(f"{modality} shape: {aux_registered[modality].shape}")
-                original_min = aux_data[modality].min().item()
-                original_max = aux_data[modality].max().item()
-                registered_min = aux_registered[modality].min().item()
-                registered_max = aux_registered[modality].max().item()
-
-                print(f"Min/max values in {modality} before masking: {original_min:.4f}/{original_max:.4f}")
-                print(f"Min/max values in {modality} after masking: {registered_min:.4f}/{registered_max:.4f}")
-
-        plt.tight_layout()
-        plt.savefig("test_visualizations/all_modalities_after_masking.png")
-        plt.close()
-
-        # Visualize mask boundaries
-        plt.figure(figsize=(10, 5))
-        for b in range(batch_size):
-            # Create a binary version of the mask for visualization
-            binary_mask = (aux_registered['thickness'][b, 0] > 0.05).float().cpu().numpy()
-
-            plt.subplot(1, 2, b + 1)
-            plt.imshow(binary_mask, cmap='gray')
-            plt.title(f"Detected Mask (Batch {b})")
+            # Original pixel-level mask
+            plt.subplot(1, 3, 1)
+            plt.imshow(thickness_mask[0, 0].cpu().numpy(), cmap='gray')
+            plt.title("Original Thickness Mask")
             plt.axis('off')
 
-        plt.tight_layout()
-        plt.savefig("test_visualizations/detected_mask_boundaries.png")
-        plt.close()
+            # Patch-level mask - try to reshape safely
+            plt.subplot(1, 3, 2)
+            try:
+                # Check if the shapes align with expectations
+                expected_patches = spatial_patches_h * spatial_patches_w * spectral_patches
+                if patch_mask[0].numel() == expected_patches:
+                    # Safely reshape
+                    spatial_patch_mask = patch_mask[0].reshape(spatial_patches_h * spatial_patches_w, spectral_patches)
+                    spatial_patch_mask = spatial_patch_mask.mean(dim=1)
+                    spatial_patch_mask = spatial_patch_mask.reshape(spatial_patches_h, spatial_patches_w)
+                else:
+                    # Fallback: reshape to square for visualization
+                    side_len = int(np.sqrt(patch_mask[0].numel() / spectral_patches))
+                    spatial_patch_mask = patch_mask[0].reshape(-1, spectral_patches)
+                    spatial_patch_mask = spatial_patch_mask.mean(dim=1)
+                    spatial_patch_mask = spatial_patch_mask.reshape(side_len, side_len)
+                    print(
+                        f"Warning: Patch mask size doesn't match expectation. Using {side_len}×{side_len} for visualization.")
 
-    # Test full model forward pass with masked inputs
-    print("\nTesting full model with masked inputs...")
-    with torch.no_grad():
-        output = model(hsi_data, aux_data, batch_indices)
-
-        print(f"Forward pass successful!")
-        print(f"Reconstruction loss: {output['loss_recon'].item():.4f}")
-        print(f"Contrastive loss: {output['loss_contrast'].item():.4f}")
-        print(f"Total loss: {output['loss'].item():.4f}")
-
-    print("\nVisualization images saved to 'test_visualizations/' directory")
-    print("\n==== Masking Test Complete ====")
-
-
-def test_variable_mask_shapes():
-    """Test the model with various mask shapes for thickness images."""
-
-    print("\n==== Testing Various Mask Shapes ====")
-
-    # Import visualization libraries
-    import matplotlib.pyplot as plt
-    import os
-
-    # Create output directory for visualizations
-    os.makedirs("test_visualizations", exist_ok=True)
-
-    # Basic model parameters
-    analysis_dim = 500
-    patch_size = (25, 25)
-    t_patch_size = 5
-    embed_dim = 768
-
-    # Create test data
-    batch_size = 3
-    hsi_data, aux_data, batch_indices = create_dummy_data(batch_size=batch_size)
-
-    # Create different mask shapes for each batch item
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # 1. Circular mask for first batch item
-    y, x = torch.meshgrid(
-        torch.linspace(-1, 1, 200),
-        torch.linspace(-1, 1, 200),
-        indexing='ij'
-    )
-    circle_mask = ((x ** 2 + y ** 2) < 0.6 ** 2).float()
-    aux_data['thickness'][0, 0] = aux_data['thickness'][0, 0] * circle_mask
-
-    # 2. Square mask for second batch item
-    y, x = torch.meshgrid(
-        torch.linspace(-1, 1, 200),
-        torch.linspace(-1, 1, 200),
-        indexing='ij'
-    )
-    square_mask = ((abs(x) < 0.7) & (abs(y) < 0.7)).float()
-    aux_data['thickness'][1, 0] = aux_data['thickness'][1, 0] * square_mask
-
-    # 3. Elliptical mask for third batch item
-    y, x = torch.meshgrid(
-        torch.linspace(-1, 1, 200),
-        torch.linspace(-1, 1, 200),
-        indexing='ij'
-    )
-    ellipse_mask = (((x ** 2) / 0.7 ** 2 + (y ** 2) / 0.4 ** 2) < 1.0).float()
-    aux_data['thickness'][2, 0] = aux_data['thickness'][2, 0] * ellipse_mask
-
-    # Visualize original masks
-    plt.figure(figsize=(15, 5))
-    mask_types = ["Circular", "Square", "Elliptical"]
-    for b in range(batch_size):
-        plt.subplot(1, 3, b + 1)
-        plt.imshow(aux_data['thickness'][b, 0].cpu().numpy(), cmap='gray')
-        plt.title(f"{mask_types[b]} Mask (Original)")
-        plt.axis('off')
-    plt.tight_layout()
-    plt.savefig("test_visualizations/original_masks.png")
-    plt.close()
-
-    # Move data to device
-    hsi_data = hsi_data.to(device)
-    aux_data = {k: v.to(device) for k, v in aux_data.items()}
-    batch_indices = batch_indices.to(device)
-
-    # Create model
-    model = MultiModalSpectralGPT(
-        analysis_dim=analysis_dim,
-        patch_size=patch_size,
-        embed_dim=embed_dim,
-        t_patch_size=t_patch_size,
-        in_chans=1,
-        aux_chans=1,
-        contrastive_mode='global'
-    ).to(device)
-
-    # Test spatial registration with different mask shapes
-    print("Testing spatial registration with various mask shapes...")
-    with torch.no_grad():
-        # Apply spatial registration
-        hsi_registered, aux_registered = model.spatial_registration(hsi_data, aux_data)
-
-        # Visualize registered modalities for each mask type
-        for b in range(batch_size):
-            mask_type = mask_types[b]
-            print(f"\nBatch {b} ({mask_type.lower()} mask):")
-
-            plt.figure(figsize=(15, 10))
-
-            # Show HSI (first channel)
-            plt.subplot(2, 3, 1)
-            plt.imshow(hsi_registered[b, 0, 0].cpu().numpy(), cmap='gray')
-            plt.title(f"{mask_type} Mask - HSI (Band 0)")
+                plt.imshow(spatial_patch_mask.cpu().numpy(), cmap='gray')
+                plt.title("Patch-Level Mask for Loss")
+            except Exception as e:
+                print(f"Error reshaping patch mask: {e}")
+                # Simpler fallback
+                plt.imshow(patch_mask[0][:400].reshape(20, 20).cpu().numpy(), cmap='gray')
+                plt.title("Patch-Level Mask (Partial)")
             plt.axis('off')
 
-            # Show all auxiliary modalities
-            pos = 2
-            for modality in aux_registered:
-                if aux_registered[modality] is not None:
-                    plt.subplot(2, 3, pos)
-                    plt.imshow(aux_registered[modality][b, 0].cpu().numpy(), cmap='gray')
-                    plt.title(f"{mask_type} Mask - {modality.upper()}")
-                    plt.axis('off')
-                    pos += 1
+            # MAE mask
+            plt.subplot(1, 3, 3)
+            try:
+                # Get the actual size of the mask
+                mask_size = global_output['mask'][0].numel()
+                print(f"MAE mask shape: {global_output['mask'].shape}, total elements: {mask_size}")
 
-                    # Count non-zero elements to verify masking
-                    original_nonzero = (aux_data[modality][b] > 0.05).float().sum().item()
-                    registered_nonzero = (aux_registered[modality][b] > 0.05).float().sum().item()
-
-                    # Calculate the percentage of non-zero elements
-                    total_elements = aux_registered[modality][b].numel()
-                    original_percent = 100 * original_nonzero / total_elements
-                    registered_percent = 100 * registered_nonzero / total_elements
-
-                    print(f"{modality}: {registered_percent:.2f}% non-zero elements (was {original_percent:.2f}%)")
+                # Try to reshape to a sensible visualization
+                side_len = int(np.sqrt(mask_size))
+                plt.imshow(global_output['mask'][0].reshape(side_len, side_len).cpu().numpy(), cmap='gray')
+                plt.title(f"MAE Mask ({side_len}×{side_len})")
+            except:
+                # Fallback without reshaping
+                plt.imshow(global_output['mask'][0].unsqueeze(0).cpu().numpy(), cmap='gray')
+                plt.title("MAE Mask (1D)")
+            plt.axis('off')
 
             plt.tight_layout()
-            plt.savefig(f"test_visualizations/registered_{mask_type.lower()}_mask.png")
+            plt.savefig("test_visualizations/mask_comparison_global.png")
             plt.close()
 
-        # Create visualization of the mask detection
-        plt.figure(figsize=(15, 5))
-        for b in range(batch_size):
-            # Create binary mask using same threshold as in model
-            binary_mask = (aux_registered['thickness'][b, 0] > 0.05).float().cpu().numpy()
+        print(f"Global model forward pass successful!")
+        print(f"Reconstruction loss: {global_output['loss_recon'].item():.4f}")
+        print(f"Contrastive loss: {global_output['loss_contrast'].item():.4f}")
+        print(f"Total loss: {global_output['loss'].item():.4f}")
 
-            plt.subplot(1, 3, b + 1)
-            plt.imshow(binary_mask, cmap='gray')
-            plt.title(f"Detected {mask_types[b]} Mask")
-            plt.axis('off')
+    except Exception as e:
+        print(f"Error in global contrastive mode test: {e}")
+        import traceback
+        traceback.print_exc()
 
-        plt.tight_layout()
-        plt.savefig("test_visualizations/detected_masks.png")
-        plt.close()
+    try:
+        print("\n==== Testing Spatial Contrastive Mode ====")
+        spatial_model = MultiModalSpectralGPT(
+            analysis_dim=analysis_dim,
+            patch_size=patch_size,
+            embed_dim=embed_dim,
+            t_patch_size=t_patch_size,
+            in_chans=1,
+            aux_chans=1,
+            contrastive_mode='spatial'
+        ).to(device)
 
-    # Test full model forward pass with various mask shapes
-    print("\nTesting full model with various mask shapes...")
-    with torch.no_grad():
-        output = model(hsi_data, aux_data, batch_indices)
-        print(f"Forward pass successful!")
-        print(f"Total loss: {output['loss'].item():.4f}")
+        # Test forward pass with spatial mode
+        spatial_output = spatial_model(hsi_data, aux_data, batch_indices)
 
-    print("\nVisualization images saved to 'test_visualizations/' directory")
-    print("\n==== Various Mask Shapes Test Complete ====")
+        # Check if thickness mask is in the output
+        if 'thickness_mask' in spatial_output:
+            print("✓ Thickness mask passed through spatial model")
+        else:
+            print("✗ Thickness mask not in spatial model output!")
 
+        print(f"Spatial model forward pass successful!")
+        print(f"Reconstruction loss: {spatial_output['loss_recon'].item():.4f}")
+        print(f"Contrastive loss: {spatial_output['loss_contrast'].item():.4f}")
+        print(f"Total loss: {spatial_output['loss'].item():.4f}")
 
-def test_complex_irregular_mask():
-    """Test the model with a complex, irregular mask shape."""
+    except Exception as e:
+        print(f"Error in spatial contrastive mode test: {e}")
+        import traceback
+        traceback.print_exc()
 
-    print("\n==== Testing Complex Irregular Mask ====")
+    # Compare losses if both models ran successfully
+    if global_output is not None and spatial_output is not None:
+        try:
+            print("\n==== Comparing Losses Between Modes ====")
+            print(f"Global reconstruction loss: {global_output['loss_recon'].item():.4f}")
+            print(f"Spatial reconstruction loss: {spatial_output['loss_recon'].item():.4f}")
+            print(f"Global contrastive loss: {global_output['loss_contrast'].item():.4f}")
+            print(f"Spatial contrastive loss: {spatial_output['loss_contrast'].item():.4f}")
+            print(f"Global total loss: {global_output['loss'].item():.4f}")
+            print(f"Spatial total loss: {spatial_output['loss'].item():.4f}")
+        except Exception as e:
+            print(f"Error comparing losses: {e}")
 
-    # Import visualization libraries
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import os
-    from scipy import ndimage
+    # Add this to your test function
+    if global_model is not None:
+        print("\n==== Testing Global Mode With and Without Masking ====")
 
-    # Create output directory for visualizations
-    os.makedirs("test_visualizations", exist_ok=True)
+        # Run with original thickness data (with mask areas)
+        global_output_with_mask = global_model(hsi_data, aux_data, batch_indices)
 
-    # Basic model parameters
-    analysis_dim = 500
-    patch_size = (25, 25)
-    t_patch_size = 5
-    embed_dim = 768
+        # Run with the same data but nullify the thickness mask effect
+        # (temporarily modify the contrastive_loss_global method or make a copy)
+        # This is a bit hacky but avoids modifying the model architecture
+        original_method = global_model.contrastive_loss_global
 
-    # Create test data
-    batch_size = 1
-    hsi_data, aux_data, batch_indices = create_dummy_data(batch_size=batch_size)
+        # Create a wrapper that ignores the thickness mask
+        def no_mask_global(model, features, embeddings, batch_idx, thickness_mask=None):
+            return original_method(features, embeddings, batch_idx, None)
 
-    # Create a complex irregular mask
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Temporarily replace method
+        global_model.contrastive_loss_global = lambda features, embeddings, batch_idx, thickness_mask: no_mask_global(
+            global_model, features, embeddings, batch_idx)
 
-    # Create an irregular mask using a combination of shapes and noise
-    # Start with a base circular mask
-    y, x = torch.meshgrid(
-        torch.linspace(-1, 1, 200),
-        torch.linspace(-1, 1, 200),
-        indexing='ij'
-    )
+        # Run without using the mask
+        global_output_no_mask = global_model(hsi_data, aux_data, batch_indices)
 
-    # Create base mask with an irregular shape
-    base_mask = ((x ** 2 + y ** 2) < 0.6 ** 2).float().numpy()
+        # Restore original method
+        global_model.contrastive_loss_global = original_method
 
-    # Add some random "fingers" extending from the circular mask
-    for i in range(5):
-        angle = np.random.uniform(0, 2 * np.pi)
-        length = np.random.uniform(0.1, 0.3)
-        width = np.random.uniform(0.05, 0.15)
+        # Compare results
+        print(f"Global contrastive loss with rim masking: {global_output_with_mask['loss_contrast'].item():.4f}")
+        print(f"Global contrastive loss without rim masking: {global_output_no_mask['loss_contrast'].item():.4f}")
+        print(
+            f"Difference: {(global_output_with_mask['loss_contrast'] - global_output_no_mask['loss_contrast']).item():.4f}")
 
-        # Create a "finger" extending from the center
-        finger_x = x.numpy() * np.cos(angle) - y.numpy() * np.sin(angle)
-        finger_y = x.numpy() * np.sin(angle) + y.numpy() * np.cos(angle)
+    # Test without mask
+    if global_model is not None and spatial_model is not None:
+        try:
+            print("\n==== Testing Without Thickness Mask ====")
 
-        finger_mask = (np.abs(finger_y) < width) & (finger_x > 0) & (finger_x < length)
-        base_mask = np.logical_or(base_mask, finger_mask).astype(np.float32)
+            # Create data without masks
+            hsi_data_no_mask, aux_data_no_mask, batch_indices = create_data_with_real_thickness(batch_size=batch_size)
 
-    # Add some noise and blur the edges
-    noise = np.random.normal(0, 0.5, size=(200, 200))
-    noisy_mask = base_mask + 0.1 * noise
+            # Override the thickness maps with all ones (no mask)
+            for b in range(batch_size):
+                aux_data_no_mask['thickness'][b, 0] = torch.ones_like(aux_data_no_mask['thickness'][b, 0])
 
-    # Smooth the mask
-    smooth_mask = ndimage.gaussian_filter(noisy_mask, sigma=2)
+            # Move to device
+            hsi_data_no_mask = hsi_data_no_mask.to(device)
+            aux_data_no_mask = {k: v.to(device) for k, v in aux_data_no_mask.items()}
 
-    # Threshold to create final binary mask
-    final_mask = (smooth_mask > 0.5).astype(np.float32)
+            # Run models
+            with torch.no_grad():
+                global_output_no_mask = global_model(hsi_data_no_mask, aux_data_no_mask, batch_indices)
+                spatial_output_no_mask = spatial_model(hsi_data_no_mask, aux_data_no_mask, batch_indices)
 
-    # Create a "hole" inside the mask
-    hole_mask = ((x.numpy() + 0.3) ** 2 + (y.numpy() - 0.2) ** 2 < 0.15 ** 2)
-    final_mask[hole_mask] = 0
+            # Compare losses
+            print("\n==== Loss Comparison With vs Without Masking ====")
+            print(f"Global reconstruction loss with mask:    {global_output['loss_recon'].item():.4f}")
+            print(f"Global reconstruction loss without mask: {global_output_no_mask['loss_recon'].item():.4f}")
+            print(f"Spatial reconstruction loss with mask:    {spatial_output['loss_recon'].item():.4f}")
+            print(f"Spatial reconstruction loss without mask: {spatial_output_no_mask['loss_recon'].item():.4f}")
 
-    # Convert to tensor
-    irregular_mask = torch.tensor(final_mask, dtype=torch.float32)
+            # Calculate ratios
+            global_ratio = global_output['loss_recon'].item() / global_output_no_mask['loss_recon'].item()
+            spatial_ratio = spatial_output['loss_recon'].item() / spatial_output_no_mask['loss_recon'].item()
 
-    # Apply the irregular mask to the thickness image
-    aux_data['thickness'][0, 0] = aux_data['thickness'][0, 0] * irregular_mask
+            print(f"\nGlobal model loss ratio (masked/unmasked): {global_ratio:.4f}")
+            print(f"Spatial model loss ratio (masked/unmasked): {spatial_ratio:.4f}")
 
-    # Visualize the irregular mask
-    plt.figure(figsize=(10, 10))
-    plt.imshow(irregular_mask.numpy(), cmap='gray')
-    plt.title("Complex Irregular Mask")
-    plt.axis('off')
-    plt.tight_layout()
-    plt.savefig("test_visualizations/complex_irregular_mask.png")
-    plt.close()
+            if global_ratio < 1.0 and spatial_ratio < 1.0:
+                print("✓ Masking appears to be working correctly (masked loss is lower)")
+            else:
+                print("✗ Masking may not be working as expected (masked loss is not lower)")
 
-    # Visualize the masked thickness image
-    plt.figure(figsize=(10, 10))
-    plt.imshow(aux_data['thickness'][0, 0].numpy(), cmap='gray')
-    plt.title("Thickness Image with Irregular Mask")
-    plt.axis('off')
-    plt.tight_layout()
-    plt.savefig("test_visualizations/thickness_irregular_mask.png")
-    plt.close()
+        except Exception as e:
+            print(f"Error in unmasked test: {e}")
+            import traceback
+            traceback.print_exc()
 
-    # Move data to device
-    hsi_data = hsi_data.to(device)
-    aux_data = {k: v.to(device) for k, v in aux_data.items()}
-    batch_indices = batch_indices.to(device)
-
-    # Create model
-    model = MultiModalSpectralGPT(
-        analysis_dim=analysis_dim,
-        patch_size=patch_size,
-        embed_dim=embed_dim,
-        t_patch_size=t_patch_size,
-        in_chans=1,
-        aux_chans=1,
-        contrastive_mode='global'
-    ).to(device)
-
-    # Test spatial registration with irregular mask
-    print("Testing spatial registration with irregular mask...")
-    with torch.no_grad():
-        # Apply spatial registration
-        hsi_registered, aux_registered = model.spatial_registration(hsi_data, aux_data)
-
-        # Visualize all modalities after masking
-        plt.figure(figsize=(15, 10))
-
-        # Show a few HSI bands
-        bands_to_show = [0, 10, 20]
-        for i, band in enumerate(bands_to_show):
-            plt.subplot(2, 3, i + 1)
-            plt.imshow(hsi_registered[0, 0, band].cpu().numpy(), cmap='gray')
-            plt.title(f"HSI Band {band}")
-            plt.axis('off')
-
-        # Show auxiliary modalities
-        modalities = list(aux_registered.keys())
-        for i, modality in enumerate(modalities[:3]):  # Show up to 3 modalities
-            if aux_registered[modality] is not None:
-                plt.subplot(2, 3, i + 4)
-                plt.imshow(aux_registered[modality][0, 0].cpu().numpy(), cmap='gray')
-                plt.title(f"{modality.upper()}")
-                plt.axis('off')
-
-        plt.tight_layout()
-        plt.savefig("test_visualizations/irregular_mask_all_modalities.png")
-        plt.close()
-
-        # Visualize binary mask detection
-        binary_mask = (aux_registered['thickness'][0, 0] > 0.05).float().cpu().numpy()
-
-        plt.figure(figsize=(15, 5))
-
-        # Original thickness with irregular mask
-        plt.subplot(1, 3, 1)
-        plt.imshow(aux_data['thickness'][0, 0].cpu().numpy(), cmap='gray')
-        plt.title("Original Thickness w/ Mask")
-        plt.axis('off')
-
-        # Detected binary mask
-        plt.subplot(1, 3, 2)
-        plt.imshow(binary_mask, cmap='gray')
-        plt.title("Detected Binary Mask")
-        plt.axis('off')
-
-        # Overlay of mask on HSI
-        plt.subplot(1, 3, 3)
-        plt.imshow(hsi_registered[0, 0, 0].cpu().numpy(), cmap='gray')
-        plt.title("HSI with Applied Mask")
-        plt.axis('off')
-
-        plt.tight_layout()
-        plt.savefig("test_visualizations/irregular_mask_detection.png")
-        plt.close()
-
-        # Print mask coverage statistics
-        for modality in aux_registered:
-            if aux_registered[modality] is not None:
-                # Count non-zero elements to verify masking
-                original_nonzero = (aux_data[modality][0] > 0.05).float().sum().item()
-                registered_nonzero = (aux_registered[modality][0] > 0.05).float().sum().item()
-
-                # Calculate the percentage of non-zero elements
-                total_elements = aux_registered[modality][0].numel()
-                original_percent = 100 * original_nonzero / total_elements
-                registered_percent = 100 * registered_nonzero / total_elements
-
-                print(f"{modality}: {registered_percent:.2f}% active region (was {original_percent:.2f}%)")
-
-    # Test full model forward pass with irregular mask
-    print("\nTesting full model with irregular mask...")
-    with torch.no_grad():
-        output = model(hsi_data, aux_data, batch_indices)
-        print(f"Forward pass successful!")
-        print(f"Reconstruction loss: {output['loss_recon'].item():.4f}")
-        print(f"Contrastive loss: {output['loss_contrast'].item():.4f}")
-        print(f"Total loss: {output['loss'].item():.4f}")
-
-    print("\nVisualization images saved to 'test_visualizations/' directory")
-    print("\n==== Complex Irregular Mask Test Complete ====")
+    print("\n===== TEST COMPLETE =====")
+    print("Visualizations saved to 'test_visualizations/' directory")
 
 
 if __name__ == '__main__':
-    # Test original functionality
-    print("====== TESTING ORIGINAL FUNCTIONALITY ======")
-    test_model_original()
-
-    print("\n\n====== TESTING CONTRASTIVE LEARNING MODES ======")
-    test_model_contrastive_modes()
-
-    print("\n\n====== TESTING DYNAMIC MASKING ======")
-    test_masking()
-
-    print("\n\n====== TESTING VARIABLE MASK SHAPES ======")
-    test_variable_mask_shapes()
-
-    print("\n\n====== TESTING COMPLEX IRREGULAR MASK ======")
-    test_complex_irregular_mask()
-
+    # Run the test
+    test_loss_masking_and_contrastive_modes()

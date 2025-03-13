@@ -37,7 +37,7 @@ class SpatialRegistration(nn.Module):
             torch.Tensor: Binary mask (1 for valid regions, 0 for masked regions)
         """
         # Assuming black regions have pixel values near zero
-        threshold = 0.05
+        threshold = 0.005
 
         # Create binary mask (1 for valid pixels, 0 for masked/black pixels)
         if image.shape[1] > 1:
@@ -87,14 +87,7 @@ class SpatialRegistration(nn.Module):
         Preprocesses HSI image by:
         1. Selecting specific spectral bands
         2. Resizing spatial dimensions
-        3. Applying consistent masking from thickness modality to all modalities
-
-        Args:
-            hsi_img (torch.Tensor): HSI image tensor of shape [B, C, T, H, W]
-            aux_data (dict): Dictionary of auxiliary modalities
-
-        Returns:
-            tuple: (spatially_registered_hsi, spatially_registered_aux_data)
+        3. Creating mask from thickness modality but NOT applying it
         """
         # First, select specified spectral bands
         hsi_img = self.select_spectral_bands(hsi_img)
@@ -102,35 +95,28 @@ class SpatialRegistration(nn.Module):
         # Get updated dimensions after band selection
         B, C, T, H, W = hsi_img.shape
 
-        # Check if spatial dimensions already match the target dimension
+        # Resize HSI if needed
         if H == self.analysis_dim and W == self.analysis_dim:
-            # If already 500x500, no need to resize
             hsi_registered = hsi_img
         else:
-            # Reshape for resizing if spatial dimensions are not 500x500
-            # First reshape to [B*T, C, H, W] for batch-compatible resizing
             hsi_reshaped = hsi_img.view(B * T, C, H, W)
-
-            # Resize spatial dimensions
             hsi_resized = F.interpolate(
                 hsi_reshaped,
                 size=(self.analysis_dim, self.analysis_dim),
                 mode='bilinear',
                 align_corners=False
             )
-
-            # Reshape back to [B, C, T, analysis_dim, analysis_dim]
             hsi_registered = hsi_resized.view(B, C, T, self.analysis_dim, self.analysis_dim)
 
-        # Process auxiliary modalities (resize first)
+        # Process auxiliary modalities (resize only)
         aux_registered = {}
+        thickness_mask = None
+
         for modality, data in aux_data.items():
             if data is not None:
-                # Check if auxiliary data already has the target dimensions
                 if data.shape[2] == self.analysis_dim and data.shape[3] == self.analysis_dim:
                     aux_registered[modality] = data
                 else:
-                    # Resize to target dimension
                     aux_registered[modality] = F.interpolate(
                         data,
                         size=(self.analysis_dim, self.analysis_dim),
@@ -140,31 +126,11 @@ class SpatialRegistration(nn.Module):
             else:
                 aux_registered[modality] = None
 
-            # Detect mask from thickness image if available
-            thickness_mask = None
-            if 'thickness' in aux_registered and aux_registered['thickness'] is not None:
-                thickness_mask = self.detect_mask(aux_registered['thickness'])
+        # Create mask from thickness image without applying it
+        if 'thickness' in aux_registered and aux_registered['thickness'] is not None:
+            thickness_mask = self.detect_mask(aux_registered['thickness'])
 
-                # Apply mask to HSI (across all spectral bands)
-                for t in range(T):
-                    # Use torch.where instead of multiplication
-                    hsi_registered[:, :, t] = torch.where(
-                        thickness_mask > 0.03,  # Condition: where mask is above threshold
-                        hsi_registered[:, :, t],  # True: keep original values
-                        torch.zeros_like(hsi_registered[:, :, t])  # False: set to zero
-                    )
-
-                # Apply mask to all auxiliary modalities
-                for modality in aux_registered:
-                    if aux_registered[modality] is not None:
-                        # Use torch.where instead of multiplication
-                        aux_registered[modality] = torch.where(
-                            thickness_mask > 0.05,  # Condition: where mask is above threshold
-                            aux_registered[modality],  # True: keep original values
-                            torch.zeros_like(aux_registered[modality])  # False: set to zero
-                        )
-
-        return hsi_registered, aux_registered
+        return hsi_registered, aux_registered, thickness_mask
 
 
 class MultiModalSpectralGPT(nn.Module):
@@ -581,17 +547,9 @@ class MultiModalSpectralGPT(nn.Module):
 
         return aux_patch_embeddings
 
-    def contrastive_loss_spatial(self, hsi_features, aux_embeddings, batch_idx):
+    def contrastive_loss_spatial(self, hsi_features, aux_embeddings, batch_idx, thickness_mask=None):
         """
-        Calculate contrastive loss at the spatial patch level.
-
-        Args:
-            hsi_features (torch.Tensor): HSI token features [B, T*HW, D]
-            aux_embeddings (dict): Dictionary of auxiliary patch embeddings
-            batch_idx (torch.Tensor): Batch indices for cross-batch negatives
-
-        Returns:
-            torch.Tensor: Spatial contrastive loss
+        Calculate contrastive loss at the spatial patch level, excluding black rim areas.
         """
         device = hsi_features.device
         B = hsi_features.shape[0]
@@ -599,35 +557,76 @@ class MultiModalSpectralGPT(nn.Module):
         # Group HSI patches by spatial location
         hsi_spatial = self.group_hsi_patches_by_spatial_location(hsi_features)
 
-        # The grouped shape is [B, HW, T*D]
         # Project with spatial-specific head
         z_hsi = self.proj_head_spatial(hsi_spatial)  # [B, HW, T*D] -> [B, HW, D]
+
+        # Convert thickness mask to patch level if provided
+        patch_thickness_mask = None
+        if thickness_mask is not None:
+            patch_thickness_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)
+            # Reshape to match spatial structure
+            patch_thickness_mask = patch_thickness_mask.reshape(B, self.spatial_patches * self.spectral_patches)
+            # Group by spatial location (take average of all spectral patches at each location)
+            patch_thickness_mask = patch_thickness_mask.reshape(B, self.spatial_patches, self.spectral_patches)
+            patch_thickness_mask = patch_thickness_mask.mean(dim=2)  # [B, spatial_patches]
 
         # Calculate individual losses for available modalities
         individual_losses = []
 
         for modality, embeddings in aux_embeddings.items():
             if embeddings is not None:
-                # First project to embedding dim
+                # Project auxiliary embeddings
                 projected_aux = self.aux_spatial_proj(embeddings)
-
-                # Then use global projection head (works with embed_dim)
                 z_aux = self.proj_head_global(projected_aux)
 
-                # Calculate patch-wise similarity matrix
-                # For each sample in batch and each patch location
-                # Shape: [B*HW, B*HW]
-                z_hsi_flat = z_hsi.reshape(B * self.spatial_patches, -1)
-                z_aux_flat = z_aux.reshape(B * self.spatial_patches, -1)
+                # If using thickness mask, only use valid patches
+                if patch_thickness_mask is not None:
+                    # Collect valid patches across all batches
+                    valid_hsi_features = []
+                    valid_aux_features = []
+                    valid_batch_indices = []
 
-                sim_matrix = torch.matmul(z_hsi_flat, z_aux_flat.T) / self.temperature
+                    for b in range(B):
+                        # Get indices of valid patches (where mask > 0.5)
+                        valid_indices = torch.where(patch_thickness_mask[b] > 0.5)[0]
 
-                # Create labels: patches at same spatial location and same batch are positives
-                # We need labels of shape [B*HW] where the value indicates the positive match index
-                labels = torch.arange(B * self.spatial_patches, device=device)
+                        if len(valid_indices) == 0:
+                            continue  # Skip if no valid patches in this batch
 
-                # Calculate loss
-                loss = nn.CrossEntropyLoss()(sim_matrix, labels)
+                        # Extract valid features
+                        valid_hsi_features.append(z_hsi[b, valid_indices])
+                        valid_aux_features.append(z_aux[b, valid_indices])
+
+                        # Keep track of which batch each patch came from
+                        valid_batch_indices.extend([b] * len(valid_indices))
+
+                    # Skip modality if no valid patches
+                    if len(valid_hsi_features) == 0:
+                        continue
+
+                    # Stack features from all batches
+                    valid_hsi = torch.cat(valid_hsi_features, dim=0)
+                    valid_aux = torch.cat(valid_aux_features, dim=0)
+                    valid_batch_tensor = torch.tensor(valid_batch_indices, device=device)
+
+                    # Calculate similarity matrix for valid patches only
+                    sim_matrix = torch.matmul(valid_hsi, valid_aux.T) / self.temperature
+
+                    # For each patch, the matching patch is at the same index
+                    # (since we've concatenated them in the same order)
+                    labels = torch.arange(valid_hsi.shape[0], device=device)
+
+                    # Calculate loss on valid patches only
+                    loss = nn.CrossEntropyLoss()(sim_matrix, labels)
+                else:
+                    # Original calculation when no thickness mask
+                    z_hsi_flat = z_hsi.reshape(B * self.spatial_patches, -1)
+                    z_aux_flat = z_aux.reshape(B * self.spatial_patches, -1)
+
+                    sim_matrix = torch.matmul(z_hsi_flat, z_aux_flat.T) / self.temperature
+                    labels = torch.arange(B * self.spatial_patches, device=device)
+                    loss = nn.CrossEntropyLoss()(sim_matrix, labels)
+
                 individual_losses.append(loss)
 
         # If no modalities available, return zero loss
@@ -641,14 +640,33 @@ class MultiModalSpectralGPT(nn.Module):
 
         return scaled_loss
 
-    def contrastive_loss_global(self, hsi_features, aux_embeddings, batch_idx):
-        """Calculate contrastive loss with global representations (original method)."""
+    def contrastive_loss_global(self, hsi_features, aux_embeddings, batch_idx, thickness_mask=None):
+        """Calculate contrastive loss with global representations excluding black rim areas."""
         device = hsi_features.device
+        B = hsi_features.shape[0]
 
-        # Get global HSI representation (mean across all patches)
-        global_hsi = hsi_features.mean(dim=1)
+        # Apply masking if thickness mask is provided
+        if thickness_mask is not None:
+            # Convert pixel-level mask to patch-level mask
+            patch_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)
 
-        # Project features to contrastive space
+            # Apply mask to features (multiply by mask and then average)
+            # Expand mask to match feature dimensions
+            expanded_mask = patch_mask.unsqueeze(-1)  # [B, num_patches, 1]
+
+            # Apply mask
+            masked_features = hsi_features * expanded_mask
+
+            # Sum valid mask values for proper normalization
+            mask_sum = patch_mask.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6
+
+            # Get weighted average (sum of masked features / sum of mask)
+            global_hsi = (masked_features.sum(dim=1) / mask_sum.squeeze(-1))
+        else:
+            # Original approach if no mask available
+            global_hsi = hsi_features.mean(dim=1)
+
+        # Project HSI features to contrastive space
         z_hsi = self.proj_head_global(global_hsi)
 
         # Calculate individual losses for available modalities
@@ -667,17 +685,13 @@ class MultiModalSpectralGPT(nn.Module):
 
                 individual_losses.append(loss)
 
-        # If no modalities available, return zero loss
+        # Handle case with no modalities
         if not individual_losses:
             return torch.tensor(0.0, device=device)
 
-        # Average the available losses
+        # Average and scale losses
         avg_loss = torch.stack(individual_losses).mean()
-
-        # Scale to expected total (to maintain consistent magnitude)
-        # This ensures total loss doesn't decrease when modalities are missing
-        num_available_modalities = len(individual_losses)
-        scaling_factor = self.num_expected_modalities / num_available_modalities
+        scaling_factor = self.num_expected_modalities / len(individual_losses)
         scaled_loss = avg_loss * scaling_factor
 
         return scaled_loss
@@ -701,10 +715,103 @@ class MultiModalSpectralGPT(nn.Module):
                 aux_embeddings[modality] = self.aux_norm(aux_embeddings[modality])
         return aux_embeddings
 
+    def forward_loss_with_thickness_mask(self, imgs, pred, mask, thickness_mask=None):
+        """
+        Compute reconstruction loss in embedding space, excluding black rim areas.
+
+        Args:
+            imgs (torch.Tensor): Input images
+            pred (torch.Tensor): Predicted patch embeddings
+            mask (torch.Tensor): MAE mask (1 is masked, 0 is kept)
+            thickness_mask (torch.Tensor, optional): Mask from thickness map (1 is valid, 0 is black rim)
+        """
+        # Get target embeddings [B, T, HW, D]
+        target = self.patch_embed(imgs)
+
+        # Reshape target from [B, T, HW, D] to [B, T*HW, D]
+        B, T, HW, D = target.shape
+        target = target.reshape(B, T * HW, D)
+
+        # Compute MSE loss
+        loss_recon = (pred - target) ** 2
+        loss_recon = loss_recon.mean(dim=-1)  # Average across feature dimension
+
+        # Apply the MAE mask (we only compute loss on masked tokens)
+        masked_loss = loss_recon * mask
+
+        if thickness_mask is not None:
+            # Convert pixel-level thickness mask to patch-level mask
+            patch_thickness_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)
+
+            # Apply the thickness mask to the loss
+            # We only want to compute loss on valid regions
+            masked_loss = masked_loss * patch_thickness_mask
+
+            # Normalize by the number of patches that are both masked by MAE and in valid regions
+            combined_mask = mask * patch_thickness_mask
+            valid_token_count = combined_mask.sum() + 1e-6
+
+            return masked_loss.sum() / valid_token_count
+        else:
+            # If no thickness mask is provided, use the original calculation
+            return masked_loss.sum() / (mask.sum() + 1e-6)
+
+    def create_patch_mask_from_pixel_mask(self, pixel_mask):
+        """
+        Converts a pixel-level mask to patch-level mask for token-based processing.
+
+        Args:
+            pixel_mask (torch.Tensor): Pixel-level mask of shape [B, 1, H, W]
+
+        Returns:
+            torch.Tensor: Patch-level mask of shape [B, num_patches]
+        """
+        B = pixel_mask.shape[0]
+        device = pixel_mask.device
+
+        # Calculate the spatial dimensions after patching
+        spatial_patches_h = self.analysis_dim // self.patch_size[0]
+        spatial_patches_w = self.analysis_dim // self.patch_size[1]
+
+        # Use average pooling to convert pixel-level mask to patch-level
+        # This approach determines if a patch is mostly valid pixels
+        patch_masks = []
+
+        for b in range(B):
+            # Get the current batch's mask
+            current_mask = pixel_mask[b, 0].unsqueeze(0)  # Shape: [1, H, W]
+
+            # Use average pooling to get one value per patch
+            pooled_mask = F.avg_pool2d(
+                current_mask,
+                kernel_size=(self.patch_size[0], self.patch_size[1]),
+                stride=(self.patch_size[0], self.patch_size[1])
+            )  # Shape: [1, spatial_patches_h, spatial_patches_w]
+
+            # Flatten spatial dimensions
+            pooled_mask_flat = pooled_mask.view(1, -1)  # Shape: [1, spatial_patches_h * spatial_patches_w]
+
+            # Expand across temporal dimension
+            # Each spatial location has spectral_patches tokens
+            expanded_mask = pooled_mask_flat.unsqueeze(2).expand(
+                1, self.spatial_patches, self.spectral_patches
+            ).reshape(1, -1)  # Shape: [1, spatial_patches * spectral_patches]
+
+            patch_masks.append(expanded_mask)
+
+        # Concatenate all batch masks
+        patch_mask = torch.cat(patch_masks, dim=0)  # Shape: [B, num_patches]
+
+        # Apply threshold - a patch is valid if at least 30% of pixels are valid
+        patch_mask = (patch_mask > 0.3).float()
+
+        return patch_mask
+
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
         """Forward pass through the full model with configurable contrastive loss mode."""
         # Apply spatial registration to ensure all modalities have the same dimensions
-        hsi_img, aux_data = self.spatial_registration(hsi_img, aux_data)
+        # Now also returns a mask derived from thickness map
+        hsi_img, aux_data, thickness_mask = self.spatial_registration(hsi_img, aux_data)
 
         # Dynamically set up patch embedding based on preprocessed image
         self._setup_patch_embedding(hsi_img)
@@ -712,11 +819,10 @@ class MultiModalSpectralGPT(nn.Module):
         # Create unmasked embeddings for contrastive learning
         unmasked_features = None
         if aux_data is not None and batch_idx is not None:
-            # Get the unmasked patch embeddings for contrastive learning
-            unmasked_features = self.patch_embed(hsi_img)  # Shape: [B, T, HW, D]
+            unmasked_features = self.patch_embed(hsi_img)
             B, T, HW, D = unmasked_features.shape
-            unmasked_features = unmasked_features.reshape(B, T * HW, D)  # Shape: [B, T*HW, D]
-            unmasked_features = unmasked_features + self.pos_embed  # Add positional embeddings
+            unmasked_features = unmasked_features.reshape(B, T * HW, D)
+            unmasked_features = unmasked_features + self.pos_embed
 
         # Move auxiliary data to correct device
         device = hsi_img.device
@@ -724,14 +830,18 @@ class MultiModalSpectralGPT(nn.Module):
             aux_data = {k: v.to(device) if v is not None else None
                         for k, v in aux_data.items()}
 
+        # Move thickness mask to device if it exists
+        if thickness_mask is not None:
+            thickness_mask = thickness_mask.to(device)
+
         # Encode with masking for reconstruction
         latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
 
         # Decode and reconstruct
         pred = self.forward_decoder(latent, ids_restore)
 
-        # Calculate reconstruction loss
-        loss_recon = self.forward_loss(hsi_img, pred, mask)
+        # Calculate reconstruction loss using new method that considers thickness mask
+        loss_recon = self.forward_loss_with_thickness_mask(hsi_img, pred, mask, thickness_mask)
 
         # Calculate contrastive loss if auxiliary data present
         loss_contrast = torch.tensor(0.0, device=device)
@@ -742,14 +852,15 @@ class MultiModalSpectralGPT(nn.Module):
 
             # Only compute contrastive loss if at least one modality is available
             if num_available > 0:
-                # For global mode, use the original approach
                 if self.contrastive_mode == 'global':
                     aux_embeddings = self.encode_auxiliary(aux_data)
-                    loss_contrast = self.contrastive_loss_global(unmasked_features, aux_embeddings, batch_idx)
+                    # Pass thickness_mask to global contrastive loss
+                    loss_contrast = self.contrastive_loss_global(unmasked_features, aux_embeddings, batch_idx,
+                                                                 thickness_mask)
                 else:
-                    # For spatial mode, work with unmasked features
                     aux_patch_embeddings = self.encode_auxiliary_patches(aux_data)
-                    loss_contrast = self.contrastive_loss_spatial(unmasked_features, aux_patch_embeddings, batch_idx)
+                    loss_contrast = self.contrastive_loss_spatial(unmasked_features, aux_patch_embeddings, batch_idx,
+                                                                  thickness_mask)
 
         # Calculate total loss
         loss = loss_recon + loss_contrast
@@ -761,5 +872,6 @@ class MultiModalSpectralGPT(nn.Module):
             'num_modalities': torch.tensor(num_available, device=device),
             'pred': pred,
             'mask': mask,
+            'thickness_mask': thickness_mask,  # Include thickness mask in output
             'contrastive_mode': self.contrastive_mode
         }
