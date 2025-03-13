@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
+
 def visualize_patient_data(patient_data, save_dir='visualizations', show=True):
     """
     Visualize the data for a single patient and save the visualization to a file.
@@ -16,8 +17,8 @@ def visualize_patient_data(patient_data, save_dir='visualizations', show=True):
     # Create output directory if it doesn't exist
     os.makedirs(save_dir, exist_ok=True)
 
-    # Create figure with subplots
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    # Create figure with 5 subplots (added one for thickness mask)
+    fig, axes = plt.subplots(1, 5, figsize=(25, 5))
     fig.suptitle(f"Patient: {patient_id}", fontsize=16)
 
     # Plot HSI data (middle band)
@@ -44,11 +45,10 @@ def visualize_patient_data(patient_data, save_dir='visualizations', show=True):
         axes[0].set_title("HSI Data Error")
     axes[0].axis('off')
 
-    # Plot auxiliary images if available
+    # Plot auxiliary images (AF and IR)
     aux_titles = {
         'af': 'Auto Fluorescence (AF)',
-        'ir': 'Infrared (IR)',
-        'thickness': 'Thickness Map'
+        'ir': 'Infrared (IR)'
     }
 
     i = 1
@@ -82,7 +82,38 @@ def visualize_patient_data(patient_data, save_dir='visualizations', show=True):
         axes[i].axis('off')
         i += 1
 
-    # Plot thickness mask if available
+    # Plot thickness map (from aux_data)
+    key = 'thickness'
+    title = 'Thickness Map'
+    if aux_data[key] is not None:
+        try:
+            # Get the thickness data
+            aux_data_tensor = aux_data[key][0] if aux_data[key].shape[0] == 1 else aux_data[key]
+
+            # Handle different possible shapes
+            if len(aux_data_tensor.shape) == 3 and aux_data_tensor.shape[0] == 1:  # [1, H, W]
+                aux_img = aux_data_tensor[0].numpy()
+            elif len(aux_data_tensor.shape) == 3:  # [C, H, W]
+                aux_img = aux_data_tensor[0].numpy()
+            elif len(aux_data_tensor.shape) == 2:  # [H, W]
+                aux_img = aux_data_tensor.numpy()
+            else:
+                aux_img = aux_data_tensor.squeeze().numpy()
+
+            axes[3].imshow(aux_img, cmap='gray')
+            axes[3].set_title(title)
+        except Exception as e:
+            print(f"Error displaying {key} data: {e}")
+            axes[3].text(0.5, 0.5, f"Error displaying {title}",
+                         ha='center', va='center', transform=axes[3].transAxes)
+            axes[3].set_title(f"{title} Error")
+    else:
+        axes[3].text(0.5, 0.5, f"No {title} available",
+                     ha='center', va='center', transform=axes[3].transAxes)
+        axes[3].set_title(f"Missing: {title}")
+    axes[3].axis('off')
+
+    # Plot thickness mask
     if thickness_mask is not None:
         try:
             # Get the thickness mask
@@ -92,14 +123,18 @@ def visualize_patient_data(patient_data, save_dir='visualizations', show=True):
                 mask_img = thickness_mask[0].numpy()
 
             # Display the mask
-            axes[3].imshow(mask_img, cmap='gray')
-            axes[3].set_title("Thickness Mask")
+            axes[4].imshow(mask_img, cmap='gray')
+            axes[4].set_title("Thickness Mask")
         except Exception as e:
             print(f"Error displaying thickness mask: {e}")
-            axes[3].text(0.5, 0.5, "Error displaying thickness mask",
-                         ha='center', va='center', transform=axes[3].transAxes)
-            axes[3].set_title("Thickness Mask Error")
-        axes[3].axis('off')
+            axes[4].text(0.5, 0.5, "Error displaying thickness mask",
+                         ha='center', va='center', transform=axes[4].transAxes)
+            axes[4].set_title("Thickness Mask Error")
+    else:
+        axes[4].text(0.5, 0.5, "No Thickness Mask available",
+                     ha='center', va='center', transform=axes[4].transAxes)
+        axes[4].set_title("Missing: Thickness Mask")
+    axes[4].axis('off')
 
     plt.tight_layout()
     plt.subplots_adjust(top=0.85)
@@ -145,3 +180,4 @@ def visualize_batch(batch, save_dir='visualizations/batch', show=False):
         # Visualize this patient's data
         patient_save_dir = os.path.join(save_dir, f"patient_{i}")
         visualize_patient_data(patient_data, save_dir=patient_save_dir, show=show)
+
