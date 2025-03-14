@@ -210,6 +210,7 @@ class MultiModalSpectralGPT(nn.Module):
             temperature=0.07,  # Temperature for contrastive loss scaling
             mask_ratio=0.75,  # Proportion of tokens to mask in MAE
             contrastive_mode='global',  # Type of contrastive learning ('global' or 'spatial')
+            use_thickness_mask=True,  # Whether to use thickness mask for rim exclusion
             **kwargs
     ):
         super().__init__()
@@ -224,6 +225,7 @@ class MultiModalSpectralGPT(nn.Module):
         self.embed_dim = embed_dim
         self.t_patch_size = t_patch_size
         self.contrastive_mode = contrastive_mode  # Parameter for contrastive learning mode
+        self.use_thickness_mask = use_thickness_mask  # Whether to use thickness mask
 
         # Derived parameters for patch organization
         self.patches_per_dim = analysis_dim // patch_size[0]  # Number of patches in one spatial dimension
@@ -596,7 +598,10 @@ class MultiModalSpectralGPT(nn.Module):
 
     def contrastive_loss_spatial(self, hsi_features, aux_embeddings, batch_idx, thickness_mask=None):
         """
-        Calculate contrastive loss at the spatial patch level, excluding black rim areas.
+        Calculate contrastive loss at the spatial patch level, selectively applying thickness mask.
+
+        Only applies thickness mask when processing the 'thickness' modality if use_thickness_mask is True.
+        For other modalities (IR, AF), the thickness mask is not applied.
         """
         device = hsi_features.device
         B = hsi_features.shape[0]
@@ -626,8 +631,8 @@ class MultiModalSpectralGPT(nn.Module):
                 projected_aux = self.aux_spatial_proj(embeddings)
                 z_aux = self.proj_head_global(projected_aux)
 
-                # If using thickness mask, only use valid patches
-                if patch_thickness_mask is not None:
+                # Selectively apply mask only for thickness modality
+                if modality == 'thickness' and patch_thickness_mask is not None:
                     # Collect valid patches across all batches
                     valid_hsi_features = []
                     valid_aux_features = []
@@ -666,7 +671,7 @@ class MultiModalSpectralGPT(nn.Module):
                     # Calculate loss on valid patches only
                     loss = nn.CrossEntropyLoss()(sim_matrix, labels)
                 else:
-                    # Original calculation when no thickness mask
+                    # For non-thickness modalities, use all patches without masking
                     z_hsi_flat = z_hsi.reshape(B * self.spatial_patches, -1)
                     z_aux_flat = z_aux.reshape(B * self.spatial_patches, -1)
 
@@ -688,7 +693,11 @@ class MultiModalSpectralGPT(nn.Module):
         return scaled_loss
 
     def contrastive_loss_global(self, hsi_features, aux_embeddings, batch_idx, thickness_mask=None):
-        """Calculate contrastive loss with global representations excluding black rim areas."""
+        """Calculate contrastive loss with global representations, selectively applying thickness mask.
+
+        Only applies thickness mask when processing the 'thickness' modality if use_thickness_mask is True.
+        For other modalities (IR, AF), the thickness mask is not applied.
+        """
         device = hsi_features.device
         B = hsi_features.shape[0]
 
@@ -700,7 +709,11 @@ class MultiModalSpectralGPT(nn.Module):
         # This replaces the absolute indices with relative ones
         relative_batch_idx = torch.arange(B, device=device)
 
-        # Apply masking if thickness mask is provided
+        # Get global HSI representation (unmasked for all modalities except thickness)
+        global_hsi_unmasked = hsi_features.mean(dim=1)
+
+        # Calculate global HSI representation with mask (only for thickness modality)
+        global_hsi_masked = None
         if thickness_mask is not None:
             # Convert pixel-level mask to patch-level mask
             patch_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)
@@ -716,13 +729,7 @@ class MultiModalSpectralGPT(nn.Module):
             mask_sum = patch_mask.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6
 
             # Get weighted average (sum of masked features / sum of mask)
-            global_hsi = (masked_features.sum(dim=1) / mask_sum.squeeze(-1))
-        else:
-            # Original approach if no mask available
-            global_hsi = hsi_features.mean(dim=1)
-
-        # Project HSI features to contrastive space
-        z_hsi = self.proj_head_global(global_hsi)
+            global_hsi_masked = (masked_features.sum(dim=1) / mask_sum.squeeze(-1))
 
         # Calculate individual losses for available modalities
         individual_losses = []
@@ -732,6 +739,12 @@ class MultiModalSpectralGPT(nn.Module):
                 # Project embeddings
                 embeddings = self.modality_proj(embeddings)
                 z_aux = self.proj_head_global(embeddings)
+
+                # Selectively use masked HSI features only for thickness modality
+                if modality == 'thickness' and global_hsi_masked is not None:
+                    z_hsi = self.proj_head_global(global_hsi_masked)
+                else:
+                    z_hsi = self.proj_head_global(global_hsi_unmasked)
 
                 # Calculate similarity and loss
                 sim_matrix = torch.matmul(z_hsi, z_aux.T) / self.temperature
@@ -772,7 +785,7 @@ class MultiModalSpectralGPT(nn.Module):
 
     def forward_loss_with_thickness_mask(self, imgs, pred, mask, thickness_mask=None):
         """
-        Compute reconstruction loss in embedding space, excluding black rim areas.
+        Compute reconstruction loss in embedding space, optionally excluding black rim areas.
 
         Args:
             imgs (torch.Tensor): Input images
@@ -868,6 +881,10 @@ class MultiModalSpectralGPT(nn.Module):
         # Now also returns a mask derived from thickness map
         hsi_img, aux_data, thickness_mask = self.spatial_registration(hsi_img, aux_data)
 
+        # If thickness mask should not be used, set it to None
+        if not self.use_thickness_mask:
+            thickness_mask = None
+
         # Dynamically set up patch embedding based on preprocessed image
         self._setup_patch_embedding(hsi_img)
 
@@ -895,9 +912,8 @@ class MultiModalSpectralGPT(nn.Module):
         # Decode and reconstruct
         pred = self.forward_decoder(latent, ids_restore)
 
-        # Calculate reconstruction loss using new method that considers thickness mask
-        # Calculate reconstruction loss without considering thickness mask
-        loss_recon = self.forward_loss(hsi_img, pred, mask)  # Use original forward_loss method without thickness mask
+        # Calculate reconstruction loss using thickness mask if enabled
+        loss_recon = self.forward_loss_with_thickness_mask(hsi_img, pred, mask, thickness_mask)
 
         # Calculate contrastive loss if auxiliary data present
         loss_contrast = torch.tensor(0.0, device=device)
