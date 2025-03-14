@@ -26,10 +26,6 @@ import matplotlib.cm as cm
 plt.switch_backend('agg')
 
 
-
-
-
-
 def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2, include_aux=True):
     """
     Placeholder visualization function that does not generate any images.

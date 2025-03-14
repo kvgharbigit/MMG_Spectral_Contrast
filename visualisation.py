@@ -212,7 +212,7 @@ if __name__ == "__main__":
         print(f"Loading data from: {data_dir}")
 
         # Create dataset and dataloader
-        batch_size = 2
+        batch_size = 4
         dataloader = create_patient_dataloader(
             data_dir,
             batch_size=batch_size,
