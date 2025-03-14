@@ -1,12 +1,14 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb
 
 
 def visualize_patient_data(patient_data, save_dir='visualizations', show=True):
     """
     Visualize the data for a single patient and save the visualization to a file.
     Includes auxiliary modalities and thickness mask if available.
+    Uses HSI to RGB conversion for hyperspectral images.
     """
     hsi = patient_data['hsi']
     aux_data = patient_data['aux_data']
@@ -33,28 +35,50 @@ def visualize_patient_data(patient_data, save_dir='visualizations', show=True):
 
     plot_idx = 0
 
-    # Plot HSI data (middle band)
+    # Plot HSI data converted to RGB
     try:
-        # Determine the shape and select a middle band
+        # Convert HSI to RGB
         if len(hsi.shape) == 5:  # [B, C, T, H, W]
-            mid_wavelength = hsi.shape[2] // 2
-            hsi_slice = hsi[0, 0, mid_wavelength].cpu().numpy()
+            rgb_img = simple_hsi_to_rgb(hsi)
+            rgb_img = rgb_img[0, 0].cpu().numpy()  # Get first batch, first channel
+            rgb_img = np.transpose(rgb_img, (1, 2, 0))  # Change from [3, H, W] to [H, W, 3]
         elif len(hsi.shape) == 4:  # [B, T, H, W] or [C, T, H, W]
-            mid_wavelength = hsi.shape[1] // 2
-            hsi_slice = hsi[0, mid_wavelength].cpu().numpy()
+            rgb_img = simple_hsi_to_rgb(hsi)
+            rgb_img = rgb_img[0].cpu().numpy()  # Get first batch/channel
+            rgb_img = np.transpose(rgb_img, (1, 2, 0))  # Change from [3, H, W] to [H, W, 3]
         elif len(hsi.shape) == 3:  # [T, H, W]
-            mid_wavelength = hsi.shape[0] // 2
-            hsi_slice = hsi[mid_wavelength].cpu().numpy()
+            rgb_img = simple_hsi_to_rgb(hsi)
+            rgb_img = rgb_img.cpu().numpy()
+            rgb_img = np.transpose(rgb_img, (1, 2, 0))  # Change from [3, H, W] to [H, W, 3]
         else:
-            hsi_slice = np.zeros((100, 100))
+            raise ValueError(f"Unexpected HSI shape: {hsi.shape}")
 
-        axes[plot_idx].imshow(hsi_slice, cmap='viridis')
-        axes[plot_idx].set_title(f"HSI (Wavelength {mid_wavelength})")
+        axes[plot_idx].imshow(rgb_img)
+        axes[plot_idx].set_title("HSI (RGB Visualization)")
     except Exception as e:
-        print(f"Error displaying HSI data: {e}")
-        axes[plot_idx].text(0.5, 0.5, "Error displaying HSI data",
-                            ha='center', va='center', transform=axes[plot_idx].transAxes)
-        axes[plot_idx].set_title("HSI Data Error")
+        print(f"Error creating RGB visualization: {e}. Falling back to middle band.")
+        try:
+            # Determine the shape and select a middle band as fallback
+            if len(hsi.shape) == 5:  # [B, C, T, H, W]
+                mid_wavelength = hsi.shape[2] // 2
+                hsi_slice = hsi[0, 0, mid_wavelength].cpu().numpy()
+            elif len(hsi.shape) == 4:  # [B, T, H, W] or [C, T, H, W]
+                mid_wavelength = hsi.shape[1] // 2
+                hsi_slice = hsi[0, mid_wavelength].cpu().numpy()
+            elif len(hsi.shape) == 3:  # [T, H, W]
+                mid_wavelength = hsi.shape[0] // 2
+                hsi_slice = hsi[mid_wavelength].cpu().numpy()
+            else:
+                hsi_slice = np.zeros((100, 100))
+
+            axes[plot_idx].imshow(hsi_slice, cmap='viridis')
+            axes[plot_idx].set_title(f"HSI (Wavelength {mid_wavelength}) - RGB conversion failed")
+        except Exception as e2:
+            print(f"Error displaying HSI data: {e2}")
+            axes[plot_idx].text(0.5, 0.5, "Error displaying HSI data",
+                                ha='center', va='center', transform=axes[plot_idx].transAxes)
+            axes[plot_idx].set_title("HSI Data Error")
+
     axes[plot_idx].axis('off')
     plot_idx += 1
 
