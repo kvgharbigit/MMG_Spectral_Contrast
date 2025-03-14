@@ -84,21 +84,30 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
             raise ValueError(
                 "Model does not have a pixel_decoder. A trained pixel decoder is required for visualization.")
 
-    # Create a figure for visualization
+    # Determine number of columns based on what to include
     n_cols = 4  # Original, Mask, Masked, Reconstructed
+
     if include_aux:
         # Count available auxiliary modalities
         n_aux = sum(1 for v in aux_data.values() if v is not None)
         if n_aux > 0:
             n_cols += n_aux
 
-    # Set up the figure
-    fig, axes = plt.subplots(batch_size, n_cols, figsize=(4 * n_cols, 4 * batch_size))
+    # Create a larger figure to prevent overlapping
+    # Increase the figure size to give more space between columns
+    fig_width = 5 * n_cols  # 5 inches per column
+    fig_height = 5 * batch_size  # 5 inches per row
+
+    # Set up the figure with more space
+    fig, axes = plt.subplots(batch_size, n_cols, figsize=(fig_width, fig_height))
     fig.suptitle(f"Epoch {epoch} - HSI Reconstruction", fontsize=16)
 
     # If only one sample, make axes 2D
     if batch_size == 1:
         axes = axes.reshape(1, -1)
+
+    # Add more space between subplots
+    plt.subplots_adjust(wspace=0.3, hspace=0.3)
 
     # For each sample in the batch
     for i in range(batch_size):
@@ -136,7 +145,7 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
             orig_rgb_np = np.clip(orig_rgb_np, 0, 1)
 
             axes[i, col_idx].imshow(orig_rgb_np)
-            axes[i, col_idx].set_title(f"Original HSI")
+            axes[i, col_idx].set_title("Original HSI", fontsize=12)
             axes[i, col_idx].axis('off')
         except Exception as e:
             print(f"Error creating original RGB visualization: {e}")
@@ -176,10 +185,13 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
                 spatial_mask_2d = patch_mask.reshape(side_len, side_len)
 
             # Plot the mask
-            axes[i, col_idx].imshow(spatial_mask_2d, cmap='hot', interpolation='nearest')
-            axes[i, col_idx].set_title(f"MAE Mask ({mask[i].sum().item():.0f} masked tokens)")
+            mask_img = axes[i, col_idx].imshow(spatial_mask_2d, cmap='hot', interpolation='nearest')
+            axes[i, col_idx].set_title(f"MAE Mask ({mask[i].sum().item():.0f} masked tokens)", fontsize=12)
             axes[i, col_idx].axis('off')
-            col_idx += 1
+
+            # Add a colorbar for the mask
+            plt.colorbar(mask_img, ax=axes[i, col_idx], fraction=0.046, pad=0.04)
+
         except Exception as e:
             print(f"Error visualizing mask: {e}")
             import traceback
@@ -187,7 +199,7 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
             axes[i, col_idx].text(0.5, 0.5, "Error visualizing mask",
                                   ha='center', va='center', transform=axes[i, col_idx].transAxes)
             axes[i, col_idx].axis('off')
-            col_idx += 1
+        col_idx += 1
 
         # 3. Create and plot masked version that better shows spectral masking effects
         try:
@@ -295,7 +307,7 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
 
             # Plot the enhanced masked version
             axes[i, col_idx].imshow(enhanced_masked_rgb)
-            axes[i, col_idx].set_title(f"Masked HSI (red = masked)")
+            axes[i, col_idx].set_title("Masked HSI (red = masked)", fontsize=12)
             axes[i, col_idx].axis('off')
         except Exception as e:
             print(f"Error creating masked HSI visualization: {e}")
@@ -367,7 +379,7 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
             recon_rgb_np = np.clip(recon_rgb_np, 0, 1)
 
             axes[i, col_idx].imshow(recon_rgb_np)
-            axes[i, col_idx].set_title(f"Reconstructed HSI")
+            axes[i, col_idx].set_title("Reconstructed HSI", fontsize=12)
             axes[i, col_idx].axis('off')
         except Exception as e:
             print(f"Error creating reconstructed HSI visualization: {e}")
@@ -387,7 +399,7 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
 
                         # Display the auxiliary data
                         axes[i, col_idx].imshow(aux_img, cmap='gray')
-                        axes[i, col_idx].set_title(f"{modality.upper()}")
+                        axes[i, col_idx].set_title(f"{modality.upper()}", fontsize=12)
                         axes[i, col_idx].axis('off')
                     except Exception as e:
                         print(f"Error displaying {modality} data: {e}")
@@ -403,7 +415,7 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
 
     # Adjust layout
     plt.tight_layout()
-    plt.subplots_adjust(top=0.9, left=0.05)
+    plt.subplots_adjust(top=0.95, left=0.05, wspace=0.3, hspace=0.3)
 
     # Save the figure
     save_path = os.path.join(viz_dir, f"reconstruction_epoch_{epoch}.png")
@@ -413,28 +425,32 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
     # Create a higher quality visualization for just one sample
     if batch_size > 0:
         try:
-            # Create a detailed visualization for the first sample
-            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+            # Create a detailed visualization for the first sample with more spacing
+            fig, axes = plt.subplots(1, 4, figsize=(24, 6))
             fig.suptitle(f"Epoch {epoch} - Detailed Reconstruction (ID: {patient_ids[0]})", fontsize=16)
+
+            # Add more space between subplots
+            plt.subplots_adjust(wspace=0.3)
 
             # Original HSI
             axes[0].imshow(orig_rgb_np)
-            axes[0].set_title("Original HSI")
+            axes[0].set_title("Original HSI", fontsize=14)
             axes[0].axis('off')
 
             # MAE Mask
-            axes[1].imshow(spatial_mask_2d, cmap='hot', interpolation='nearest')
-            axes[1].set_title(f"MAE Mask ({mask[0].sum().item():.0f} tokens)")
+            mask_img = axes[1].imshow(spatial_mask_2d, cmap='hot', interpolation='nearest')
+            axes[1].set_title(f"MAE Mask ({mask[0].sum().item():.0f} tokens)", fontsize=14)
             axes[1].axis('off')
+            plt.colorbar(mask_img, ax=axes[1], fraction=0.046, pad=0.04)
 
             # Masked HSI with enhanced visualization
             axes[2].imshow(enhanced_masked_rgb)
-            axes[2].set_title("Masked HSI (red = masked)")
+            axes[2].set_title("Masked HSI (red = masked)", fontsize=14)
             axes[2].axis('off')
 
             # Reconstructed HSI
             axes[3].imshow(recon_rgb_np)
-            axes[3].set_title("Reconstructed HSI")
+            axes[3].set_title("Reconstructed HSI", fontsize=14)
             axes[3].axis('off')
 
             # Save high-quality version
