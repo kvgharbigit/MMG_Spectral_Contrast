@@ -288,6 +288,14 @@ class MultiModalSpectralGPT(nn.Module):
         # Decoder prediction head (predicts in embedding space)
         self.decoder_pred = nn.Linear(decoder_embed_dim, embed_dim)
 
+        # Optional pixel decoder for better HSI reconstruction
+        self.pixel_decoder = self._create_pixel_decoder(
+            decoder_embed_dim=decoder_embed_dim,
+            patch_size=patch_size,
+            t_patch_size=t_patch_size,
+            in_chans=in_chans
+        )
+
         # Contrastive learning components
         self.temperature = temperature
 
@@ -874,6 +882,109 @@ class MultiModalSpectralGPT(nn.Module):
         patch_mask = (patch_mask > 0.3).float()
 
         return patch_mask
+
+    def _create_pixel_decoder(self, decoder_embed_dim, patch_size, t_patch_size, in_chans):
+        """
+        Create a pixel decoder module to reconstruct HSI from embeddings.
+
+        Args:
+            decoder_embed_dim: Embedding dimension of the decoder
+            patch_size: Spatial patch size
+            t_patch_size: Temporal/spectral patch size
+            in_chans: Number of input channels
+
+        Returns:
+            nn.Module: Pixel decoder module
+        """
+        patch_size = to_2tuple(patch_size)
+
+        # Calculate patch volume
+        patch_volume = in_chans * t_patch_size * patch_size[0] * patch_size[1]
+
+        # A slightly more sophisticated decoder with intermediate layer
+        pixel_decoder = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, patch_volume)
+        )
+
+        print(f"Created pixel decoder: input={self.embed_dim}, hidden={self.embed_dim}, output={patch_volume}")
+        print(f"Patch dimensions: {in_chans}×{t_patch_size}×{patch_size[0]}×{patch_size[1]}")
+
+        return pixel_decoder
+
+    def reconstruct_pixels(self, tokens, B, C, T, H, W):
+        """
+        Reconstruct pixel values from tokens using the pixel decoder.
+
+        Args:
+            tokens: Tokens of shape [B, num_patches, embed_dim]
+            B: Batch size
+            C: Number of channels
+            T: Number of spectral bands
+            H: Height of output
+            W: Width of output
+
+        Returns:
+            Reconstructed pixel values of shape [B, C, T, H, W]
+        """
+        # Get patch dimensions
+        patch_h, patch_w = self.patch_size
+        t_patch_size = self.t_patch_size
+
+        # Calculate grid dimensions
+        num_patches_h = H // patch_h
+        num_patches_w = W // patch_w
+        num_patches_t = T // t_patch_size
+
+        print(f"Reconstructing pixels with tokens shape: {tokens.shape}")
+        print(f"Output shape will be: [{B}, {C}, {T}, {H}, {W}]")
+
+        # Process tokens through the pixel decoder
+        tokens_flat = tokens.reshape(-1, tokens.shape[-1])
+        pixels_flat = self.pixel_decoder(tokens_flat)
+
+        # Calculate total patches and patch volume
+        total_patches = num_patches_h * num_patches_w * num_patches_t
+        patch_volume = C * t_patch_size * patch_h * patch_w
+
+        # This reshape is problematic - need to go from flat to 3D grid
+        # Create output tensor
+        output = torch.zeros((B, C, T, H, W), device=tokens.device)
+
+        # Reshape to B, total_patches, patch_volume
+        pixels = pixels_flat.reshape(B, -1, patch_volume)
+
+        # Now reshape patch_volume to its components
+        pixels = pixels.reshape(B, -1, C, t_patch_size, patch_h, patch_w)
+
+        # Place each patch in the correct position
+        patch_idx = 0
+        for t_idx in range(num_patches_t):
+            t_start = t_idx * t_patch_size
+            t_end = min(t_start + t_patch_size, T)
+            t_size = t_end - t_start
+
+            for h_idx in range(num_patches_h):
+                h_start = h_idx * patch_h
+                h_end = min(h_start + patch_h, H)
+                h_size = h_end - h_start
+
+                for w_idx in range(num_patches_w):
+                    w_start = w_idx * patch_w
+                    w_end = min(w_start + patch_w, W)
+                    w_size = w_end - w_start
+
+                    if patch_idx < pixels.shape[1]:
+                        # Extract this patch
+                        patch = pixels[:, patch_idx, :, :t_size, :h_size, :w_size]
+
+                        # Place in output tensor
+                        output[:, :, t_start:t_end, h_start:h_end, w_start:w_end] = patch
+
+                    patch_idx += 1
+
+        return output
 
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
         """Forward pass through the full model with configurable contrastive loss mode."""
