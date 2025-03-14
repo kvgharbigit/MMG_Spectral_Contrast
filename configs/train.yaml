@@ -3,7 +3,8 @@
 # Hydra configuration
 hydra:
   run:
-    dir: outputs/${now:%Y-%m-%d}/${experiment_name}/${now:%H-%M-%S}
+    dir: Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/MMG_Spectral_Output/${now:%Y-%m-%d}/${experiment_name}/${now:%H-%M-%S}
+    #outputs/${now:%Y-%m-%d}/${experiment_name}/${now:%H-%M-%S}
   sweep:
     dir: multirun/${now:%Y-%m-%d}/${experiment_name}/${now:%H-%M-%S}
     subdir: ${hydra.job.num}

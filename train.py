@@ -4,6 +4,7 @@ import time
 import glob
 import torch
 import numpy as np
+import math
 import pandas as pd
 import mlflow
 import hydra
@@ -27,6 +28,33 @@ import matplotlib.cm as cm
 # Configure matplotlib for non-GUI environments
 plt.switch_backend('agg')
 
+
+def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr):
+    """
+    Creates a learning rate schedule with linear warmup and cosine decay.
+
+    Args:
+        optimizer: The optimizer to use
+        warmup_steps: Number of warmup steps
+        total_steps: Total number of training steps
+        min_lr: Minimum learning rate at the end of training
+        base_lr: Base learning rate after warmup
+
+    Returns:
+        LambdaLR scheduler
+    """
+
+    def lr_lambda(current_step):
+        # Linear warmup phase
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        # Cosine decay phase
+        else:
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(min_lr / base_lr, cosine_decay)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2, include_aux=True):
     """
@@ -690,55 +718,70 @@ def check_early_stopping(val_losses, patience, min_delta=0.0):
     return (best_loss - recent_best) < min_delta
 
 
-def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
+def train_epoch(model, dataloader, optimizer, device, scheduler=None,
+                scheduler_step_frequency=None, contrastive_mode=None):
     """
     Train the model for one epoch.
-    
+
     Args:
         model: The model to train
         dataloader: DataLoader for training data
         optimizer: Optimizer for training
         device: Device to train on
+        scheduler: Learning rate scheduler
+        scheduler_step_frequency: When to step the scheduler ('batch' or 'epoch')
         contrastive_mode: Contrastive mode to use (if None, use model's default)
-        
+
     Returns:
         List of outputs from each batch
     """
     model.train()
     outputs = []
-    
+
     # Set contrastive mode if specified
     if contrastive_mode is not None:
         model.contrastive_mode = contrastive_mode
-    
+
     # Create progress bar
     pbar = tqdm(dataloader, desc="Training")
-    
+
     for batch in pbar:
         # Move data to device
         hsi = batch['hsi'].to(device)
         aux_data = {k: v.to(device) if v is not None else None for k, v in batch['aux_data'].items()}
         batch_idx = batch['batch_idx'].to(device)
-        
+
         # Forward pass
         optimizer.zero_grad()
         output = model(hsi, aux_data, batch_idx)
         loss = output['loss']
-        
+
         # Backward pass and optimization
         loss.backward()
+
+        # Add gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
-        
+
+        # Update scheduler if it's batch-based
+        if scheduler is not None and scheduler_step_frequency == "batch":
+            scheduler.step()
+
+        # Get current learning rate for display
+        current_lr = optimizer.param_groups[0]['lr']
+
         # Update progress bar
         pbar.set_postfix({
             'loss': loss.item(),
             'recon_loss': output['loss_recon'].item(),
-            'contrast_loss': output['loss_contrast'].item()
+            'contrast_loss': output['loss_contrast'].item(),
+            'lr': current_lr
         })
-        
+
         # Store outputs
         outputs.append(output)
-    
+
     return outputs
 
 
@@ -966,13 +1009,32 @@ def main(cfg: DictConfig):
     )
 
     # Create learning rate scheduler
+    scheduler_step_frequency = "epoch"  # Default
     if cfg.scheduler.use_scheduler:
         if cfg.scheduler.type == "cosine":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=cfg.training.epochs,
-                eta_min=cfg.scheduler.min_lr
-            )
+            # Check if warmup is enabled through config
+            if hasattr(cfg.scheduler, 'warmup_ratio') and cfg.scheduler.warmup_ratio > 0:
+                # Calculate warmup steps
+                warmup_ratio = cfg.scheduler.warmup_ratio
+                warmup_steps = int(warmup_ratio * cfg.training.epochs * len(train_loader))
+                total_steps = cfg.training.epochs * len(train_loader)
+
+                # Create warmup-cosine scheduler
+                scheduler = get_warmup_cosine_schedule(
+                    optimizer,
+                    warmup_steps=warmup_steps,
+                    total_steps=total_steps,
+                    min_lr=cfg.scheduler.min_lr,
+                    base_lr=cfg.optimizer.lr
+                )
+                scheduler_step_frequency = "batch"
+            else:
+                # Standard cosine scheduler without warmup
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=cfg.training.epochs,
+                    eta_min=cfg.scheduler.min_lr
+                )
         elif cfg.scheduler.type == "step":
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer,
@@ -991,6 +1053,7 @@ def main(cfg: DictConfig):
             raise ValueError(f"Unknown scheduler type: {cfg.scheduler.type}")
     else:
         scheduler = None
+        scheduler_step_frequency = None
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -1013,13 +1076,16 @@ def main(cfg: DictConfig):
     # Training loop
     print(f"Starting training for {cfg.training.epochs} epochs")
 
+    # In your main training loop
     for epoch in range(start_epoch, cfg.training.epochs):
-        print(f"\nEpoch {epoch+1}/{cfg.training.epochs}")
+        print(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
         epoch_start_time = time.time()
 
         # Training phase
         train_outputs = train_epoch(
             model, train_loader, optimizer, device,
+            scheduler=scheduler,
+            scheduler_step_frequency=scheduler_step_frequency,
             contrastive_mode=cfg.model.contrastive_mode
         )
         train_metrics = calculate_metrics(train_outputs)
@@ -1031,12 +1097,14 @@ def main(cfg: DictConfig):
         )
         val_metrics = calculate_metrics(val_outputs)
 
-        # Update learning rate scheduler
-        if scheduler is not None:
-            if cfg.scheduler.type == "reduce_on_plateau":
+        # Update learning rate scheduler - only for epoch-based schedulers
+        if scheduler is not None and scheduler_step_frequency == "epoch":
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(val_metrics['loss'])
             else:
                 scheduler.step()
+
+
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
