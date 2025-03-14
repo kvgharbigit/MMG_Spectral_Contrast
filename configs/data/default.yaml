@@ -1,9 +1,10 @@
 # @package _global_.data
 
 # Data paths
-parent_dir: "dummydata"  # Used when auto_split is true
+parent_dir: "Z:\Projects\Ophthalmic neuroscience\Projects\Kayvan\data_500\Alzheimer"  # Used when auto_split is true
 train_dir: "dummydata/train"  # Used when auto_split is false
 val_dir: "dummydata/val"  # Used when auto_split is false
+#dummydata
 
 # Data splitting
 use_auto_split: true

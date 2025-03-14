@@ -25,13 +25,13 @@ experiment_name: spectralgpt_mae_contrastive
 
 # Training settings
 training:
-  epochs: 2
+  epochs: 100
   batch_size: 2
   resume_from_checkpoint: false
   checkpoint_path: null
   early_stopping:
     enabled: true
-    patience: 10
+    patience: 40
     min_delta: 0.001
 
 # Logging settings
@@ -43,6 +43,6 @@ logging:
 
 # Visualization settings
 visualization:
-  viz_frequency: 1
+  viz_frequency: 2
   num_samples: 2
   include_aux: true
