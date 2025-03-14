@@ -1,6 +1,8 @@
 import os
 import torch
 from torch.utils.data import Dataset, DataLoader
+import random
+import torchvision.transforms.functional as TF
 
 # Import helpers from utility modules
 from data_utils import (
@@ -16,7 +18,7 @@ class PatientDataset(Dataset):
     Performs preprocessing during data loading to ensure consistent dimensions.
     """
 
-    def __init__(self, parent_dir, analysis_dim=500, target_bands=30, transform=None):
+    def __init__(self, parent_dir, analysis_dim=500, target_bands=30, transform=None, augment=False):
         """
         Initialize the dataset with spatial registration parameters.
 
@@ -24,25 +26,34 @@ class PatientDataset(Dataset):
             parent_dir (str): Path to the parent directory containing patient files
             analysis_dim (int): Target spatial dimension for all modalities
             target_bands (int): Target number of spectral bands for HSI
-            transform (callable, optional): Optional transform to be applied after spatial registration
+            transform (callable, optional): Optional external transform to be applied
+            augment (bool): Whether to apply data augmentation during training
         """
         self.parent_dir = parent_dir
-        self.transform = transform
+        self.external_transform = transform
         self.analysis_dim = analysis_dim
         self.target_bands = target_bands
+        self.augment = augment
+
+        # Create augmentation transform if enabled
+        if self.augment:
+            self.transform = MultiModalTransforms(prob=0.5)
+        else:
+            self.transform = None
 
         # Find all patient directories
         self.patient_dirs = find_patient_dirs(parent_dir)
         print(f"Found {len(self.patient_dirs)} patient directories")
         print(f"Data will be registered to {analysis_dim}x{analysis_dim} spatial dimensions")
         print(f"Target number of spectral bands: {target_bands}")
+        print(f"Data augmentation: {'Enabled' if self.augment else 'Disabled'}")
 
     def __len__(self):
         """Return the number of patients in the dataset."""
         return len(self.patient_dirs)
 
     def __getitem__(self, idx):
-        """Get data for a single patient with spatial registration applied."""
+        """Get data for a single patient with spatial registration and optional augmentations applied."""
         patient_dir = self.patient_dirs[idx]
 
         # Load HSI data
@@ -60,9 +71,15 @@ class PatientDataset(Dataset):
             hsi_data, aux_data, self.analysis_dim, self.target_bands
         )
 
-        # Apply transforms if specified
+        # Apply data augmentation if enabled
         if self.transform:
-            hsi_registered, aux_registered = self.transform(hsi_registered, aux_registered)
+            hsi_registered, aux_registered, thickness_mask = self.transform(
+                hsi_registered, aux_registered, thickness_mask
+            )
+
+        # Apply external transforms if specified
+        if self.external_transform:
+            hsi_registered, aux_registered = self.external_transform(hsi_registered, aux_registered)
 
         # Create batch index for contrastive learning
         batch_idx = torch.tensor(idx, dtype=torch.long)
@@ -177,11 +194,18 @@ def custom_collate_fn(batch):
     return result
 
 
-def create_patient_dataloader(parent_dir, analysis_dim=500, target_bands=30, batch_size=4, num_workers=4, shuffle=True):
+def create_patient_dataloader(parent_dir, analysis_dim=500, target_bands=30,
+                              batch_size=4, num_workers=4, shuffle=True, augment=False):
     """
     Create a DataLoader for the PatientDataset with integrated spatial registration.
     """
-    dataset = PatientDataset(parent_dir, analysis_dim, target_bands)
+    dataset = PatientDataset(
+        parent_dir,
+        analysis_dim,
+        target_bands,
+        augment=augment
+    )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -192,6 +216,157 @@ def create_patient_dataloader(parent_dir, analysis_dim=500, target_bands=30, bat
         collate_fn=custom_collate_fn
     )
 
+
+class MultiModalTransforms:
+    """
+    Custom transformations for multi-modal hyperspectral and auxiliary data.
+    Ensures the same spatial transformations are applied to all modalities.
+    """
+
+    def __init__(self, prob=0.5, rotation_degrees=10, scale_range=(0.9, 1.1)):
+        """
+        Initialize transformation parameters.
+
+        Args:
+            prob (float): Probability of applying each transformation
+            rotation_degrees (int): Maximum rotation in degrees
+            scale_range (tuple): Range for random scaling (min, max)
+        """
+        self.prob = prob
+        self.rotation_degrees = rotation_degrees
+        self.scale_range = scale_range
+
+    def __call__(self, hsi_data, aux_data, thickness_mask=None):
+        """
+        Apply the same random transformations to HSI and all auxiliary modalities.
+
+        Args:
+            hsi_data (torch.Tensor): HSI data of shape [B, C, T, H, W]
+            aux_data (dict): Dictionary of auxiliary modalities
+            thickness_mask (torch.Tensor, optional): Thickness mask
+
+        Returns:
+            tuple: Transformed HSI data, auxiliary data, and thickness mask
+        """
+        # Get spatial dimensions
+        B, C, T, H, W = hsi_data.shape
+
+        # Apply the same transformation to all modalities for each batch item
+        for b in range(B):
+            # Decide which transformations to apply
+            do_flip = random.random() < self.prob
+            do_rotate = random.random() < self.prob
+            do_scale = random.random() < self.prob
+
+            # Random flip (horizontal)
+            if do_flip:
+                # Flip HSI - need to handle the spectral dimension
+                for t in range(T):
+                    hsi_data[b, 0, t] = TF.hflip(hsi_data[b, 0, t])
+
+                # Flip auxiliary modalities
+                for modality in aux_data:
+                    if aux_data[modality] is not None:
+                        aux_data[modality][b, 0] = TF.hflip(aux_data[modality][b, 0])
+
+                # Flip thickness mask if provided
+                if thickness_mask is not None:
+                    thickness_mask[b, 0] = TF.hflip(thickness_mask[b, 0])
+
+            # Random rotation
+            if do_rotate:
+                angle = random.uniform(-self.rotation_degrees, self.rotation_degrees)
+
+                # Rotate HSI
+                for t in range(T):
+                    hsi_data[b, 0, t] = TF.rotate(
+                        hsi_data[b, 0, t],
+                        angle,
+                        interpolation=TF.InterpolationMode.BILINEAR,
+                        fill=0
+                    )
+
+                # Rotate auxiliary modalities
+                for modality in aux_data:
+                    if aux_data[modality] is not None:
+                        aux_data[modality][b, 0] = TF.rotate(
+                            aux_data[modality][b, 0],
+                            angle,
+                            interpolation=TF.InterpolationMode.BILINEAR,
+                            fill=0
+                        )
+
+                # Rotate thickness mask if provided
+                if thickness_mask is not None:
+                    thickness_mask[b, 0] = TF.rotate(
+                        thickness_mask[b, 0],
+                        angle,
+                        interpolation=TF.InterpolationMode.NEAREST,
+                        fill=0
+                    )
+
+            # Random scaling (with center crop/pad to maintain dimensions)
+            if do_scale:
+                scale_factor = random.uniform(self.scale_range[0], self.scale_range[1])
+
+                # Calculate new dimensions
+                new_h = int(H * scale_factor)
+                new_w = int(W * scale_factor)
+
+                # Scale HSI
+                for t in range(T):
+                    # Resize
+                    scaled = TF.resize(
+                        hsi_data[b, 0, t],
+                        [new_h, new_w],
+                        interpolation=TF.InterpolationMode.BILINEAR
+                    )
+
+                    # Center crop or pad to get back to original size
+                    hsi_data[b, 0, t] = self._center_crop_or_pad(scaled, (H, W))
+
+                # Scale auxiliary modalities
+                for modality in aux_data:
+                    if aux_data[modality] is not None:
+                        # Resize
+                        scaled = TF.resize(
+                            aux_data[modality][b, 0],
+                            [new_h, new_w],
+                            interpolation=TF.InterpolationMode.BILINEAR
+                        )
+
+                        # Center crop or pad
+                        aux_data[modality][b, 0] = self._center_crop_or_pad(scaled, (H, W))
+
+                # Scale thickness mask if provided
+                if thickness_mask is not None:
+                    # Resize
+                    scaled = TF.resize(
+                        thickness_mask[b, 0],
+                        [new_h, new_w],
+                        interpolation=TF.InterpolationMode.NEAREST
+                    )
+
+                    # Center crop or pad
+                    thickness_mask[b, 0] = self._center_crop_or_pad(scaled, (H, W))
+
+        return hsi_data, aux_data, thickness_mask
+
+    def _center_crop_or_pad(self, img, target_size):
+        """Center crop or pad an image to the target size."""
+        h, w = img.shape
+        th, tw = target_size
+
+        # If both dimensions are larger, do center crop
+        if h >= th and w >= tw:
+            return TF.center_crop(img, target_size)
+
+        # Otherwise, create padding
+        padding_h = max(0, th - h)
+        padding_w = max(0, tw - w)
+        padding = [padding_w // 2, padding_h // 2, padding_w - padding_w // 2, padding_h - padding_h // 2]
+
+        return TF.pad(img, padding, fill=0)
 
 if __name__ == "__main__":
     import sys
