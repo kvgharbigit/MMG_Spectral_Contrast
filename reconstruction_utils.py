@@ -5,9 +5,10 @@ Handles proper token unmasking and mapping from embedding space back to image sp
 
 import torch
 import numpy as np
+import torch.nn.functional as F
 
-import torch
-import numpy as np
+
+
 
 
 def reconstruct_hsi_from_mae(model, hsi_original, predictions, mask):
@@ -95,119 +96,48 @@ def reconstruct_hsi_from_mae(model, hsi_original, predictions, mask):
     return reconstructed
 
 
-def get_unmasked_indices(mask):
+def convert_hsi_to_rgb(hsi_data, wavelength_range=(450, 905)):
     """
-    Get indices of unmasked tokens.
+    More robust HSI to RGB conversion with no modifications.
+    This is just a placeholder duplicate of the function in reconstruction_utils.
     """
-    return torch.nonzero(mask < 0.5).squeeze()
+    # Ensure numpy array with float32
+    if torch.is_tensor(hsi_data):
+        hsi_data = hsi_data.detach().cpu().numpy()
 
+    hsi_data = hsi_data.astype(np.float32)
 
-def get_masked_indices(mask):
-    """
-    Get indices of masked tokens.
-    """
-    return torch.nonzero(mask > 0.5).squeeze()
+    # Robust normalization
+    def robust_normalize(img):
+        p2, p98 = np.percentile(img, (2, 98))
+        img_norm = np.interp(img, (p2, p98), (0, 1))
+        return img_norm
 
+    # Rest of existing conversion logic remains the same
+    min_wl, max_wl = wavelength_range
+    wavelengths = np.linspace(min_wl, max_wl, hsi_data.shape[0])
 
-def model_free_unpatchify(tokens, B, C, T, H, W, t_patch_size, patch_h, patch_w):
-    """
-    Convert tokens back to image space without requiring model-specific unpatchify function.
-    
-    Args:
-        tokens: Tokens of shape [B, T, HW, D]
-        B, C, T, H, W: Original dimensions
-        t_patch_size, patch_h, patch_w: Patch dimensions
-        
-    Returns:
-        Image-space representation [B, C, T, H, W]
-    """
-    # Determine grid dimensions
-    num_patches_h = H // patch_h
-    num_patches_w = W // patch_w
-    num_patches_t = T // t_patch_size
-    
-    # Calculate patch size in embedding dimension
-    # We're assuming a simple case where embed_dim is proportional to patch volume
-    D = tokens.shape[-1]
-    
-    # First reshape to separate spatial dimensions [B, T, H, W, D]
-    reshaped = tokens.reshape(B, num_patches_t, num_patches_h, num_patches_w, D)
-    
-    # Implement a basic "unpooling" operation to expand each token back to a patch
-    # For simplicity, we'll distribute the embedding dimension values across the patch
-    # We'll split D into t_patch_size * patch_h * patch_w * C parts
+    r_idx = np.argmin(np.abs(wavelengths - 650))
+    g_idx = np.argmin(np.abs(wavelengths - 550))
+    b_idx = np.argmin(np.abs(wavelengths - 450))
 
-    # Calculate if we need to adjust D based on the target patch volume
-    patch_volume = t_patch_size * patch_h * patch_w * C
-    
-    # Create a simple unpooling by distributing embedding values and reshaping
-    try:
-        # First, reshape to prepare for unpooling
-        pixel_values = reshaped.permute(0, 4, 1, 2, 3)  # [B, D, T, H, W]
-        
-        # Use FoldUnfold or similar technique to unpool
-        # As a simple approach, we'll use interpolation
-        pixel_values = torch.nn.functional.interpolate(
-            pixel_values, 
-            size=(T, H, W), 
-            mode='trilinear',
-            align_corners=False
-        )
-        
-        # If embedding dimension doesn't match the expected output channels
-        if pixel_values.shape[1] != C:
-            # Project to the correct number of channels using 1x1x1 convolution metaphor
-            # (implemented as a linear projection across the channel dimension)
-            pixel_values = pixel_values.permute(0, 2, 3, 4, 1)  # [B, T, H, W, D]
-            # Simple linear projection to target channels
-            # Create a weight matrix for projection
-            device = tokens.device
-            channel_projection = torch.nn.Linear(pixel_values.shape[-1], C, device=device)
-            # Apply projection
-            pixel_values = channel_projection(pixel_values)  # [B, T, H, W, C]
-            # Permute back to expected output format
-            pixel_values = pixel_values.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
-    except Exception as e:
-        # Fallback implementation if the above fails
-        print(f"Using fallback unpatchify due to error: {e}")
-        
-        # Reshape tokens to match the original patches
-        tokens_reshaped = reshaped.permute(0, 1, 2, 3, 4).reshape(
-            B, num_patches_t, num_patches_h, num_patches_w, -1
-        )
-        
-        # Create output tensor
-        pixel_values = torch.zeros((B, C, T, H, W), device=tokens.device, dtype=tokens.dtype)
-        
-        # Unfold tokens back to patches using simple reshaping and placement
-        for t in range(num_patches_t):
-            for h in range(num_patches_h):
-                for w in range(num_patches_w):
-                    # Extract the token for this position
-                    token = tokens_reshaped[:, t, h, w, :]
-                    
-                    # Convert token to patch (simplified approach)
-                    # Distribute token values across a patch of zeros
-                    patch = token.reshape(B, C, t_patch_size, patch_h, patch_w)
-                    
-                    # Place patch in the output tensor
-                    t_start = t * t_patch_size
-                    h_start = h * patch_h
-                    w_start = w * patch_w
-                    pixel_values[:, :, t_start:t_start+t_patch_size, 
-                                h_start:h_start+patch_h, 
-                                w_start:w_start+patch_w] = patch
-    
-    return pixel_values
+    rgb_img = np.zeros((hsi_data.shape[1], hsi_data.shape[2], 3))
+
+    # Apply per-channel robust normalization
+    rgb_img[:, :, 0] = robust_normalize(hsi_data[r_idx])
+    rgb_img[:, :, 1] = robust_normalize(hsi_data[g_idx])
+    rgb_img[:, :, 2] = robust_normalize(hsi_data[b_idx])
+
+    return rgb_img
 
 
 def get_unmasked_indices(mask):
     """
     Get indices of unmasked tokens.
-    
+
     Args:
         mask: Binary mask where 1 indicates masked tokens, 0 indicates kept tokens
-        
+
     Returns:
         Indices of unmasked (kept) tokens
     """
@@ -217,10 +147,10 @@ def get_unmasked_indices(mask):
 def get_masked_indices(mask):
     """
     Get indices of masked tokens.
-    
+
     Args:
         mask: Binary mask where 1 indicates masked tokens, 0 indicates kept tokens
-        
+
     Returns:
         Indices of masked tokens
     """

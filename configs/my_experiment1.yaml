@@ -1,0 +1,28 @@
+# @package _global_
+
+# Inherit from base config
+defaults:
+  - train
+  - model: spectral_gpt
+  - _self_
+
+# Override specific settings
+experiment_name: my_custom_experiment
+
+# Data settings
+data:
+  parent_dir: "/path/to/my/data"
+  use_auto_split: true
+  auto_split_ratio: 0.15
+
+# Model settings
+model:
+  contrastive_mode: spatial
+  mask_ratio: 0.80
+
+# Training settings
+training:
+  epochs: 150
+  batch_size: 8
+  early_stopping:
+    patience: 15

@@ -16,6 +16,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from MultiModalSpectralGPT import MultiModalSpectralGPT
 from dataset import create_patient_dataloader
+# IMPORTANT: Import the reconstruction function
+from reconstruction_utils import reconstruct_hsi_from_mae
 
 
 def convert_hsi_to_rgb(hsi_data, wavelength_range=(450, 905)):
@@ -133,70 +135,54 @@ def test_reconstruction_hybrid():
     print(f"Prediction shape: {pred.shape}")
     print(f"Mask shape: {mask.shape}")
 
-    # Reconstruction
+    # Reconstruction using the new function
     print("Reconstructing HSI from predictions...")
-    B, C, T, H, W = hsi.shape
     try:
-        reconstructed = model.reconstruct_pixels(pred, B, C, T, H, W)
+        # Use the new reconstruction function from reconstruction_utils
+        reconstructed = reconstruct_hsi_from_mae(
+            model,
+            hsi,           # Original HSI data
+            pred,          # Predictions from model
+            mask           # Mask from model output
+        )
         reconstruction_success = True
         print(f"Reconstruction shape: {reconstructed.shape}")
     except Exception as e:
-        print(f"Error in reconstruct_pixels: {e}")
+        print(f"Error in reconstruct_hsi_from_mae: {e}")
         import traceback
         traceback.print_exc()
-        reconstructed = torch.randn_like(hsi)
+        reconstructed = hsi  # Fallback to original
         reconstruction_success = False
+
+    # Create a hybrid image - original for unmasked, reconstruction for masked
+    hybrid = hsi.clone()
 
     # Get patch dimensions
     patch_h, patch_w = model.patch_size
     t_patch_size = model.t_patch_size
 
     # Calculate grid dimensions
+    B, C, T, H, W = hsi.shape
     num_patches_h = H // patch_h
     num_patches_w = W // patch_w
     num_patches_t = T // t_patch_size
-    total_patches = num_patches_h * num_patches_w * num_patches_t
 
-    print(f"Patch grid: {num_patches_t}×{num_patches_h}×{num_patches_w} = {total_patches} patches")
-    print(f"Mask has {mask.sum().item()} masked patches out of {mask.shape[1]} total")
+    # Reshape mask for easier indexing
+    mask_3d = mask.reshape(B, num_patches_t, num_patches_h, num_patches_w)
 
-    # Reshape mask for easier indexing if possible
-    try:
-        if mask.shape[1] == total_patches:
-            # Perfect match, reshape directly
-            mask_3d = mask.reshape(B, num_patches_t, num_patches_h, num_patches_w)
-            print("Successfully reshaped mask to 3D grid")
-        else:
-            # Mismatch, need a different approach
-            print(f"WARNING: Mask shape mismatch: {mask.shape[1]} vs {total_patches}")
-            # Create a sequential mask (some approximation)
-            mask_3d = torch.zeros(B, num_patches_t, num_patches_h, num_patches_w, device=device)
-            # Fill as many indices as we have
-            seq_indices = torch.argsort(torch.rand_like(mask))
-            mask_flat = mask.reshape(-1)
-            for i in range(min(len(seq_indices), total_patches)):
-                idx = seq_indices[i]
-                if idx < total_patches:
-                    t_idx = (idx // (num_patches_h * num_patches_w)) % num_patches_t
-                    h_idx = (idx // num_patches_w) % num_patches_h
-                    w_idx = idx % num_patches_w
-
-                    if i < len(mask_flat):
-                        mask_3d[0, t_idx, h_idx, w_idx] = mask_flat[i]
-    except Exception as e:
-        print(f"Error reshaping mask: {e}, using fallback approach")
-        # Fallback: create a random mask pattern for visualization
-        # This won't match the actual masking but will show the concept
-        mask_3d = torch.bernoulli(torch.ones(B, num_patches_t, num_patches_h, num_patches_w, device=device) * 0.75)
-
-    # Create a hybrid image - original for unmasked, reconstruction for masked
-    hybrid = hsi.clone()
-
-    # Also create a masked version showing only unmasked patches
+    # Create a masked visualization showing only unmasked patches
     masked_vis = hsi.clone()
 
-    # Loop through patches
-    print("Creating hybrid and masked visualizations...")
+    # Visualize
+    print("Creating visualizations...")
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+
+    # Original
+    axes[0, 0].imshow(convert_hsi_to_rgb(hsi))
+    axes[0, 0].set_title("Original HSI")
+    axes[0, 0].axis('off')
+
+    # Loop through patches to create hybrid and masked visualizations
     for t in range(0, T, t_patch_size):
         t_idx = t // t_patch_size
         if t_idx >= mask_3d.shape[1]:
@@ -225,15 +211,6 @@ def test_reconstruction_hybrid():
                     # For masked visualization: set masked patches to zero (black)
                     masked_vis[0, :, t:t_end, h:h_end, w:w_end] = 0.0
 
-    # Visualize
-    print("Creating visualizations...")
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-
-    # Original
-    axes[0, 0].imshow(convert_hsi_to_rgb(hsi))
-    axes[0, 0].set_title("Original HSI")
-    axes[0, 0].axis('off')
-
     # Masked (with black for masked regions)
     axes[0, 1].imshow(convert_hsi_to_rgb(masked_vis))
     axes[0, 1].set_title("Masked HSI (black = masked)")
@@ -254,7 +231,7 @@ def test_reconstruction_hybrid():
     plt.savefig(hybrid_path, dpi=300)
     print(f"Hybrid visualization saved to {hybrid_path}")
 
-    # Also create a visualization of the mask pattern
+    # Create a visualization of the mask pattern
     plt.figure(figsize=(8, 8))
     # Average across spectral dimension for clarity
     mask_spatial = mask_3d.mean(dim=1).squeeze().cpu().numpy()
@@ -264,21 +241,6 @@ def test_reconstruction_hybrid():
     mask_path = os.path.join(output_dir, "mask_pattern.png")
     plt.savefig(mask_path, dpi=300)
     print(f"Mask visualization saved to {mask_path}")
-
-    # Create a simple comparison showing just original vs reconstruction
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    axes[0].imshow(convert_hsi_to_rgb(hsi))
-    axes[0].set_title("Original HSI")
-    axes[0].axis('off')
-
-    axes[1].imshow(convert_hsi_to_rgb(reconstructed))
-    axes[1].set_title("Reconstructed HSI")
-    axes[1].axis('off')
-
-    plt.tight_layout()
-    simple_path = os.path.join(output_dir, "simple_comparison.png")
-    plt.savefig(simple_path, dpi=300)
-    print(f"Simple comparison saved to {simple_path}")
 
     return hybrid_path
 

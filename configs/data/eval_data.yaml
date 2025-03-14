@@ -1,0 +1,11 @@
+# @package _global_.data
+
+# Path to test data
+test_dir: "dummydata/test"
+
+# DataLoader parameters
+num_workers: 4
+drop_last: false
+
+# Augmentation parameters
+use_augmentation: false  # Enable/disable data augmentation
