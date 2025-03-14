@@ -210,7 +210,7 @@ class MultiModalSpectralGPT(nn.Module):
             temperature=0.07,  # Temperature for contrastive loss scaling
             mask_ratio=0.75,  # Proportion of tokens to mask in MAE
             contrastive_mode='global',  # Type of contrastive learning ('global' or 'spatial')
-            use_thickness_mask=True,  # Whether to use thickness mask for rim exclusion
+            use_thickness_mask=False,  # Whether to use thickness mask for rim exclusion
             **kwargs
     ):
         super().__init__()

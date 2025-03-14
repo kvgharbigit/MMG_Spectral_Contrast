@@ -2,6 +2,8 @@ import os
 import torch
 from torch.utils.data import Dataset, DataLoader
 import random
+from scipy.ndimage import rotate as scipy_rotate
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
 # Import helpers from utility modules
@@ -239,14 +241,6 @@ class MultiModalTransforms:
     def __call__(self, hsi_data, aux_data, thickness_mask=None):
         """
         Apply the same random transformations to HSI and all auxiliary modalities.
-
-        Args:
-            hsi_data (torch.Tensor): HSI data of shape [B, C, T, H, W]
-            aux_data (dict): Dictionary of auxiliary modalities
-            thickness_mask (torch.Tensor, optional): Thickness mask
-
-        Returns:
-            tuple: Transformed HSI data, auxiliary data, and thickness mask
         """
         # Get spatial dimensions
         B, C, T, H, W = hsi_data.shape
@@ -262,50 +256,42 @@ class MultiModalTransforms:
             if do_flip:
                 # Flip HSI - need to handle the spectral dimension
                 for t in range(T):
-                    hsi_data[b, 0, t] = TF.hflip(hsi_data[b, 0, t])
+                    # Use torch.flip instead of TF.hflip for tensor
+                    hsi_data[b, 0, t] = torch.flip(hsi_data[b, 0, t], dims=[1])
 
                 # Flip auxiliary modalities
                 for modality in aux_data:
                     if aux_data[modality] is not None:
-                        aux_data[modality][b, 0] = TF.hflip(aux_data[modality][b, 0])
+                        aux_data[modality][b, 0] = torch.flip(aux_data[modality][b, 0], dims=[1])
 
                 # Flip thickness mask if provided
                 if thickness_mask is not None:
-                    thickness_mask[b, 0] = TF.hflip(thickness_mask[b, 0])
+                    thickness_mask[b, 0] = torch.flip(thickness_mask[b, 0], dims=[1])
 
-            # Random rotation
+            # Random rotation - using NumPy-based rotation instead of TF.rotate
             if do_rotate:
                 angle = random.uniform(-self.rotation_degrees, self.rotation_degrees)
 
-                # Rotate HSI
+                # Rotate HSI using custom rotation function
                 for t in range(T):
-                    hsi_data[b, 0, t] = TF.rotate(
-                        hsi_data[b, 0, t],
-                        angle,
-                        interpolation=TF.InterpolationMode.BILINEAR,
-                        fill=0
-                    )
+                    img_tensor = hsi_data[b, 0, t]  # Shape: [H, W]
+                    rotated = self.custom_rotate(img_tensor, angle)
+                    hsi_data[b, 0, t] = rotated
 
                 # Rotate auxiliary modalities
                 for modality in aux_data:
                     if aux_data[modality] is not None:
-                        aux_data[modality][b, 0] = TF.rotate(
-                            aux_data[modality][b, 0],
-                            angle,
-                            interpolation=TF.InterpolationMode.BILINEAR,
-                            fill=0
-                        )
+                        img_tensor = aux_data[modality][b, 0]  # Shape: [H, W]
+                        rotated = self.custom_rotate(img_tensor, angle)
+                        aux_data[modality][b, 0] = rotated
 
                 # Rotate thickness mask if provided
                 if thickness_mask is not None:
-                    thickness_mask[b, 0] = TF.rotate(
-                        thickness_mask[b, 0],
-                        angle,
-                        interpolation=TF.InterpolationMode.NEAREST,
-                        fill=0
-                    )
+                    img_tensor = thickness_mask[b, 0]  # Shape: [H, W]
+                    rotated = self.custom_rotate(img_tensor, angle, is_mask=True)
+                    thickness_mask[b, 0] = rotated
 
-            # Random scaling (with center crop/pad to maintain dimensions)
+            # Similarly for scaling - implement with proper reshaping
             if do_scale:
                 scale_factor = random.uniform(self.scale_range[0], self.scale_range[1])
 
@@ -313,60 +299,118 @@ class MultiModalTransforms:
                 new_h = int(H * scale_factor)
                 new_w = int(W * scale_factor)
 
-                # Scale HSI
+                # Scale HSI using custom scaling function
                 for t in range(T):
-                    # Resize
-                    scaled = TF.resize(
-                        hsi_data[b, 0, t],
-                        [new_h, new_w],
-                        interpolation=TF.InterpolationMode.BILINEAR
-                    )
-
-                    # Center crop or pad to get back to original size
-                    hsi_data[b, 0, t] = self._center_crop_or_pad(scaled, (H, W))
+                    img_tensor = hsi_data[b, 0, t]  # Shape: [H, W]
+                    scaled = self.custom_scale(img_tensor, new_h, new_w, (H, W))
+                    hsi_data[b, 0, t] = scaled
 
                 # Scale auxiliary modalities
                 for modality in aux_data:
                     if aux_data[modality] is not None:
-                        # Resize
-                        scaled = TF.resize(
-                            aux_data[modality][b, 0],
-                            [new_h, new_w],
-                            interpolation=TF.InterpolationMode.BILINEAR
-                        )
-
-                        # Center crop or pad
-                        aux_data[modality][b, 0] = self._center_crop_or_pad(scaled, (H, W))
+                        img_tensor = aux_data[modality][b, 0]  # Shape: [H, W]
+                        scaled = self.custom_scale(img_tensor, new_h, new_w, (H, W))
+                        aux_data[modality][b, 0] = scaled
 
                 # Scale thickness mask if provided
                 if thickness_mask is not None:
-                    # Resize
-                    scaled = TF.resize(
-                        thickness_mask[b, 0],
-                        [new_h, new_w],
-                        interpolation=TF.InterpolationMode.NEAREST
-                    )
-
-                    # Center crop or pad
-                    thickness_mask[b, 0] = self._center_crop_or_pad(scaled, (H, W))
+                    img_tensor = thickness_mask[b, 0]  # Shape: [H, W]
+                    scaled = self.custom_scale(img_tensor, new_h, new_w, (H, W), is_mask=True)
+                    thickness_mask[b, 0] = scaled
 
         return hsi_data, aux_data, thickness_mask
 
-    def _center_crop_or_pad(self, img, target_size):
-        """Center crop or pad an image to the target size."""
+    def custom_rotate(self, img_tensor, angle, is_mask=False):
+        """Custom rotation function that works with 2D tensors"""
+        # Convert tensor to numpy
+        img_np = img_tensor.detach().cpu().numpy()
+
+        # Use scipy's rotate which works well with 2D arrays
+        # For masks, use nearest neighbor interpolation to preserve binary values
+        interpolation_order = 0 if is_mask else 1
+        rotated_np = scipy_rotate(
+            img_np,
+            angle,
+            reshape=False,
+            order=interpolation_order,
+            mode='constant',
+            cval=0.0
+        )
+
+        # Convert back to tensor
+        rotated_tensor = torch.from_numpy(rotated_np).to(img_tensor.device).to(img_tensor.dtype)
+
+        return rotated_tensor
+
+    def custom_scale(self, img_tensor, new_h, new_w, target_size, is_mask=False):
+        """Custom scaling function that works with 2D tensors"""
+        # Convert to numpy for easier handling
+        img_np = img_tensor.detach().cpu().numpy()
+        H, W = target_size
+
+        # For non-square images, maintain aspect ratio
+        if new_h / new_w != H / W:
+            aspect_ratio = H / W
+            if new_h / new_w > aspect_ratio:
+                # Too tall, adjust height
+                new_h = int(new_w * aspect_ratio)
+            else:
+                # Too wide, adjust width
+                new_w = int(new_h / aspect_ratio)
+
+        # Resize using PyTorch's F.interpolate
+        # First add batch and channel dimensions
+        img_tensor_reshaped = img_tensor.unsqueeze(0).unsqueeze(0)  # [H, W] -> [1, 1, H, W]
+
+        # Different interpolation mode for masks
+        mode = 'nearest' if is_mask else 'bilinear'
+        scaled_tensor = F.interpolate(
+            img_tensor_reshaped,
+            size=(new_h, new_w),
+            mode=mode,
+            align_corners=False if mode == 'bilinear' else None
+        )
+
+        # Remove batch and channel dimensions
+        scaled_tensor = scaled_tensor.squeeze(0).squeeze(0)  # [1, 1, new_h, new_w] -> [new_h, new_w]
+
+        # Center crop or pad to get back to original size
+        final_tensor = self._center_crop_or_pad_2d(scaled_tensor, (H, W))
+
+        return final_tensor
+
+    def _center_crop_or_pad_2d(self, img, target_size):
+        """Center crop or pad a 2D tensor to the target size."""
         h, w = img.shape
         th, tw = target_size
 
-        # If both dimensions are larger, do center crop
+        # If image is larger than target in both dimensions, center crop
         if h >= th and w >= tw:
-            return TF.center_crop(img, target_size)
+            # Calculate starting positions for cropping
+            h_start = (h - th) // 2
+            w_start = (w - tw) // 2
+            return img[h_start:h_start + th, w_start:w_start + tw]
 
-        # Otherwise, create padding
-        padding_h = max(0, th - h)
-        padding_w = max(0, tw - w)
-        padding = [padding_w // 2, padding_h // 2, padding_w - padding_w // 2, padding_h - padding_h // 2]
+        # Otherwise, create new tensor and pad
+        result = torch.zeros(th, tw, dtype=img.dtype, device=img.device)
 
-        return TF.pad(img, padding, fill=0)
+        # Calculate where to place the image
+        h_start = max(0, (th - h) // 2)
+        w_start = max(0, (tw - w) // 2)
+
+        # Calculate which part of the image to use
+        h_img_start = max(0, (h - th) // 2)
+        w_img_start = max(0, (w - tw) // 2)
+
+        # Calculate how much of the image to use
+        h_to_use = min(h - h_img_start, th - h_start)
+        w_to_use = min(w - w_img_start, tw - w_start)
+
+        # Place the image within the result tensor
+        result[h_start:h_start + h_to_use, w_start:w_start + w_to_use] = img[h_img_start:h_img_start + h_to_use,
+                                                                         w_img_start:w_img_start + w_to_use]
+
+        return result
 
 if __name__ == "__main__":
     import sys
