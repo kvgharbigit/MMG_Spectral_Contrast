@@ -493,38 +493,38 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
     print(f"Reconstructions visualized and saved to {save_path}")
     return save_path
 
-def calculate_metrics(outputs):
-    """
-    Calculate aggregate metrics from a list of model outputs.
-    
-    Args:
-        outputs: List of dictionaries containing model outputs
-        
-    Returns:
-        Dictionary of aggregated metrics
-    """
+
+def calculate_metrics(outputs, optimizer=None):
+    """Calculate aggregate metrics from a list of model outputs."""
     metrics = {
         'loss': 0.0,
         'loss_recon': 0.0,
         'loss_contrast': 0.0,
         'num_modalities': 0.0,
     }
-    
+
+    # Add current learning rate if optimizer is provided
+    if optimizer is not None:
+        for param_group in optimizer.param_groups:
+            metrics['learning_rate'] = param_group['lr']
+            break  # Just take the first group's learning rate
+
     batch_count = len(outputs)
     if batch_count == 0:
         return metrics
-    
+
     # Sum the metrics across all batches
     for output in outputs:
         metrics['loss'] += output['loss'].item()
         metrics['loss_recon'] += output['loss_recon'].item()
         metrics['loss_contrast'] += output['loss_contrast'].item()
         metrics['num_modalities'] += output['num_modalities'].item()
-    
-    # Calculate the average for each metric
+
+    # Calculate the average for each metric (except learning_rate)
     for key in metrics:
-        metrics[key] /= batch_count
-    
+        if key != 'learning_rate':
+            metrics[key] /= batch_count
+
     return metrics
 
 
@@ -617,37 +617,34 @@ def save_metrics_to_csv(metrics_dict, output_dir, epoch, split='train'):
 
 
 def save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, total_time):
-    """
-    Save a summary of the epoch's metrics to a text file.
-    
-    Args:
-        train_metrics: Dictionary of training metrics
-        val_metrics: Dictionary of validation metrics
-        epoch: Current epoch number
-        output_dir: Directory to save the summary
-        total_time: Total time taken for the epoch
-    """
+    """Save a summary of the epoch's metrics to a text file."""
     # Create summaries directory if it doesn't exist
     summaries_dir = os.path.join(output_dir, 'summaries')
     os.makedirs(summaries_dir, exist_ok=True)
-    
+
     # Define file path
     summary_path = os.path.join(summaries_dir, f"epoch_{epoch}_summary.txt")
-    
+
     with open(summary_path, 'w') as f:
         f.write(f"Epoch {epoch} Summary\n")
         f.write("=" * 50 + "\n\n")
-        
+
+        # Print learning rate prominently if available
+        if 'learning_rate' in train_metrics:
+            f.write(f"Learning Rate: {train_metrics['learning_rate']:.8f}\n\n")
+
         f.write("Training Metrics:\n")
         for key, value in train_metrics.items():
-            f.write(f"  {key}: {value:.6f}\n")
-        
+            if key != 'learning_rate':  # Skip learning_rate as it's already shown above
+                f.write(f"  {key}: {value:.6f}\n")
+
         f.write("\nValidation Metrics:\n")
         for key, value in val_metrics.items():
-            f.write(f"  {key}: {value:.6f}\n")
-        
+            if key != 'learning_rate':
+                f.write(f"  {key}: {value:.6f}\n")
+
         f.write(f"\nTime taken: {total_time:.2f} seconds\n")
-        
+
         # Calculate improvements from previous epoch if available
         improvement_path = os.path.join(summaries_dir, "best_metrics.txt")
         if os.path.exists(improvement_path):
@@ -657,23 +654,17 @@ def save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, total_time
                     best_loss = float(lines[3].split(": ")[1].strip())
                     improvement = best_loss - val_metrics['loss']
                     f.write(f"\nImprovement in validation loss: {improvement:.6f}")
-        
+
     # Update best metrics if this is the best epoch so far
-    update_best_metrics(val_metrics, epoch, summaries_dir)
+    update_best_metrics(val_metrics, epoch, summaries_dir,
+                        current_lr=train_metrics.get('learning_rate', None))
 
 
-def update_best_metrics(val_metrics, epoch, summaries_dir):
-    """
-    Update the best metrics file if the current epoch has better validation loss.
-    
-    Args:
-        val_metrics: Dictionary of validation metrics
-        epoch: Current epoch number
-        summaries_dir: Directory containing the summaries
-    """
+def update_best_metrics(val_metrics, epoch, summaries_dir, current_lr=None):
+    """Update the best metrics file if the current epoch has better validation loss."""
     best_path = os.path.join(summaries_dir, "best_metrics.txt")
     current_val_loss = val_metrics['loss']
-    
+
     # Check if best metrics file exists
     if os.path.exists(best_path):
         with open(best_path, 'r') as f:
@@ -681,18 +672,21 @@ def update_best_metrics(val_metrics, epoch, summaries_dir):
             if len(lines) >= 4:  # Ensure we have enough lines to read
                 best_epoch = int(lines[1].split(": ")[1].strip())
                 best_loss = float(lines[3].split(": ")[1].strip())
-                
+
                 # Only update if current loss is better (lower)
                 if current_val_loss >= best_loss:
                     return
-    
+
     # Write new best metrics
     with open(best_path, 'w') as f:
         f.write("Best Metrics\n")
         f.write(f"Epoch: {epoch}\n")
+        if current_lr is not None:
+            f.write(f"Learning Rate: {current_lr:.8f}\n")
         f.write("Validation Metrics:\n")
         for key, value in val_metrics.items():
-            f.write(f"  {key}: {value:.6f}\n")
+            if key != 'learning_rate':
+                f.write(f"  {key}: {value:.6f}\n")
 
 
 def check_early_stopping(val_losses, patience, min_delta=0.0):
@@ -718,23 +712,8 @@ def check_early_stopping(val_losses, patience, min_delta=0.0):
     return (best_loss - recent_best) < min_delta
 
 
-def train_epoch(model, dataloader, optimizer, device, scheduler=None,
-                scheduler_step_frequency=None, contrastive_mode=None):
-    """
-    Train the model for one epoch.
-
-    Args:
-        model: The model to train
-        dataloader: DataLoader for training data
-        optimizer: Optimizer for training
-        device: Device to train on
-        scheduler: Learning rate scheduler
-        scheduler_step_frequency: When to step the scheduler ('batch' or 'epoch')
-        contrastive_mode: Contrastive mode to use (if None, use model's default)
-
-    Returns:
-        List of outputs from each batch
-    """
+def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
+    """Train the model for one epoch."""
     model.train()
     outputs = []
 
@@ -758,17 +737,9 @@ def train_epoch(model, dataloader, optimizer, device, scheduler=None,
 
         # Backward pass and optimization
         loss.backward()
-
-        # Add gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
         optimizer.step()
 
-        # Update scheduler if it's batch-based
-        if scheduler is not None and scheduler_step_frequency == "batch":
-            scheduler.step()
-
-        # Get current learning rate for display
+        # Get current learning rate for progress bar
         current_lr = optimizer.param_groups[0]['lr']
 
         # Update progress bar
@@ -834,7 +805,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
 def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False):
     """
     Save model checkpoint.
-    
+
     Args:
         model: The model to save
         optimizer: The optimizer to save
@@ -846,7 +817,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
     # Create checkpoints directory if it doesn't exist
     checkpoints_dir = os.path.join(output_dir, 'checkpoints')
     os.makedirs(checkpoints_dir, exist_ok=True)
-    
+
     # Prepare checkpoint data
     checkpoint = {
         'epoch': epoch,
@@ -854,15 +825,12 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
         'optimizer_state_dict': optimizer.state_dict(),
         'val_loss': val_loss,
     }
-    
-    # Save checkpoint
-    checkpoint_path = os.path.join(checkpoints_dir, f"checkpoint_epoch_{epoch}.pth")
-    torch.save(checkpoint, checkpoint_path)
-    
-    # If this is the best model, save a copy
+
+    # Only save the checkpoint if it's the best so far
     if is_best:
         best_path = os.path.join(checkpoints_dir, "best_model.pth")
         torch.save(checkpoint, best_path)
+        print(f"Saved new best model with validation loss: {val_loss:.6f}")
 
 
 @hydra.main(config_path="configs", config_name="train")
@@ -1084,18 +1052,22 @@ def main(cfg: DictConfig):
         # Training phase
         train_outputs = train_epoch(
             model, train_loader, optimizer, device,
-            scheduler=scheduler,
-            scheduler_step_frequency=scheduler_step_frequency,
             contrastive_mode=cfg.model.contrastive_mode
         )
-        train_metrics = calculate_metrics(train_outputs)
+        train_metrics = calculate_metrics(train_outputs, optimizer)  # Now passing optimizer
 
         # Validation phase
         val_outputs = validate_epoch(
             model, val_loader, device,
             contrastive_mode=cfg.model.contrastive_mode
         )
-        val_metrics = calculate_metrics(val_outputs)
+        val_metrics = calculate_metrics(val_outputs, optimizer)  # Also pass optimizer here
+
+        # Update the print statement to include learning rate
+        print(f"Train Loss: {train_metrics['loss']:.6f}, "
+              f"Val Loss: {val_metrics['loss']:.6f}, "
+              f"LR: {train_metrics.get('learning_rate', 0):.8f}, "  # Add LR to console output
+              f"Time: {epoch_time:.2f}s")
 
         # Update learning rate scheduler - only for epoch-based schedulers
         if scheduler is not None and scheduler_step_frequency == "epoch":
@@ -1147,12 +1119,14 @@ def main(cfg: DictConfig):
                 traceback.print_exc()
 
         # Save checkpoint
+        # Save checkpoint
         is_best = val_metrics['loss'] < best_val_loss
         if is_best:
             best_val_loss = val_metrics['loss']
             print(f"New best validation loss: {best_val_loss:.6f}")
 
-        save_checkpoint(model, optimizer, epoch, val_metrics['loss'], output_dir, is_best)
+        # Only pass is_best=True when it's actually the best model
+        save_checkpoint(model, optimizer, epoch, val_metrics['loss'], output_dir, is_best=is_best)
 
         # Check for early stopping
         if cfg.training.early_stopping.enabled:
