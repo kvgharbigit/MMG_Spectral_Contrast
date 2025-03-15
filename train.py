@@ -21,6 +21,7 @@ from pathlib import Path
 from MultiModalSpectralGPT import MultiModalSpectralGPT
 from dataset import PatientDataset, custom_collate_fn, create_patient_dataloader
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb  # These are already imported elsewhere
+from dataset import MultiModalTransforms
 
 from visualisation import visualize_batch
 import matplotlib.cm as cm
@@ -957,6 +958,15 @@ def main(cfg: DictConfig):
             collate_fn=custom_collate_fn,
             drop_last=cfg.data.drop_last,
         )
+
+        # Add augmentation transform to the train_dataset
+        if cfg.data.use_augmentation:
+            train_dataset.dataset.transform = MultiModalTransforms(
+                prob=cfg.data.augmentation.prob,
+                rotation_degrees=cfg.data.augmentation.rotation_degrees,
+                scale_range=cfg.data.augmentation.scale_range
+            )
+
 
         val_loader = DataLoader(
             val_dataset,
