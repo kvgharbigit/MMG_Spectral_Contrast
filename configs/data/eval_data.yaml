@@ -8,4 +8,4 @@ num_workers: 4
 drop_last: false
 
 # Augmentation parameters
-use_augmentation: false  # Enable/disable data augmentation
+use_augmentation: true  # Enable/disable data augmentation

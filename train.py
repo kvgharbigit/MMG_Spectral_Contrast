@@ -236,9 +236,12 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
             mask_idx = torch.where(mask[i] > 0.5)[0]
             masked_tokens[0, mask_idx] = 0.0
 
-            # Reconstruct the masked HSI using pixel decoder
-            # First, reshape tokens to calculate the output shape
+            # Reshape to [B*L, D] format expected by the pixel decoder
             B, L, D = masked_tokens.shape
+            masked_tokens_flat = masked_tokens.reshape(-1, D)
+
+            # Use the model's pixel decoder to get patch pixels
+            pixels_flat = model.pixel_decoder(masked_tokens_flat)
 
             # Extract necessary dimensions
             C = 1  # Channels (HSI usually has 1 channel)
@@ -246,15 +249,13 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
             H = model.patches_per_dim * model.patch_size[0]  # Height
             W = model.patches_per_dim * model.patch_size[1]  # Width
 
-            # Use the model's pixel decoder to get patch pixels
-            pixels_flat = model.pixel_decoder(masked_tokens.reshape(-1, D))
-
             # Calculate patch dimensions
             patch_h, patch_w = model.patch_size
             t_patch_size = model.t_patch_size
             num_patches_h = H // patch_h
             num_patches_w = W // patch_w
             num_patches_t = T // t_patch_size
+            patch_volume = C * t_patch_size * patch_h * patch_w
 
             # Reshape to B, L, C, t_patch_size, patch_h, patch_w
             pixels = pixels_flat.reshape(B, L, C, t_patch_size, patch_h, patch_w)
@@ -350,10 +351,28 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
             # Reconstruct HSI from model prediction
             recon_tokens = pred[i].unsqueeze(0)  # Add batch dimension [1, L, D]
 
-            # Use the model's pixel decoder for reconstruction
-            pixels_flat = model.pixel_decoder(recon_tokens.reshape(-1, D))
+            # Reshape for pixel decoder
+            B, L, D = recon_tokens.shape
+            recon_tokens_flat = recon_tokens.reshape(-1, D)
 
-            # Reshape to B, L, C, t_patch_size, patch_h, patch_w
+            # Use the model's pixel decoder for reconstruction
+            pixels_flat = model.pixel_decoder(recon_tokens_flat)
+
+            # Extract necessary dimensions
+            C = 1  # Channels (HSI usually has 1 channel)
+            T = model.spectral_patches * model.t_patch_size  # Total spectral bands
+            H = model.patches_per_dim * model.patch_size[0]  # Height
+            W = model.patches_per_dim * model.patch_size[1]  # Width
+
+            # Calculate patch dimensions
+            patch_h, patch_w = model.patch_size
+            t_patch_size = model.t_patch_size
+            num_patches_h = H // patch_h
+            num_patches_w = W // patch_w
+            num_patches_t = T // t_patch_size
+            patch_volume = C * t_patch_size * patch_h * patch_w
+
+            # Reshape to B, L, patch_components
             pixels = pixels_flat.reshape(B, L, C, t_patch_size, patch_h, patch_w)
 
             # Initialize output tensor
@@ -378,6 +397,8 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
                             w_start:w_start + patch_w] = patch
 
                         patch_idx += 1
+
+
 
             # Debug: print shape before RGB conversion
             print(f"Reconstructed HSI shape before RGB conversion: {recon_hsi.shape}")
@@ -1063,11 +1084,7 @@ def main(cfg: DictConfig):
         )
         val_metrics = calculate_metrics(val_outputs, optimizer)  # Also pass optimizer here
 
-        # Update the print statement to include learning rate
-        print(f"Train Loss: {train_metrics['loss']:.6f}, "
-              f"Val Loss: {val_metrics['loss']:.6f}, "
-              f"LR: {train_metrics.get('learning_rate', 0):.8f}, "  # Add LR to console output
-              f"Time: {epoch_time:.2f}s")
+
 
         # Update learning rate scheduler - only for epoch-based schedulers
         if scheduler is not None and scheduler_step_frequency == "epoch":
@@ -1081,9 +1098,10 @@ def main(cfg: DictConfig):
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
 
-        # Log metrics
+        # Update the print statement to include learning rate
         print(f"Train Loss: {train_metrics['loss']:.6f}, "
               f"Val Loss: {val_metrics['loss']:.6f}, "
+              f"LR: {train_metrics.get('learning_rate', 0):.8f}, "  # Add LR to console output
               f"Time: {epoch_time:.2f}s")
 
         # Log to TensorBoard and MLflow
