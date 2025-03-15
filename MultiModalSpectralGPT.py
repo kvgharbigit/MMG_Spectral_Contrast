@@ -411,6 +411,7 @@ class MultiModalSpectralGPT(nn.Module):
         """
         # Get dimensions of preprocessed HSI image
         _, _, T, H, W = hsi_img.shape
+        device = hsi_img.device  # Get device from input tensor
 
         # Dynamically create patch embedding
         self.patch_embed = PatchEmbed(
@@ -420,13 +421,13 @@ class MultiModalSpectralGPT(nn.Module):
             embed_dim=self.embed_dim,
             frames=T,  # Use actual number of frames/bands
             t_patch_size=self.t_patch_size
-        )
+        ).to(device)  # Move to the same device as input
 
         # Dynamically calculate and set number of patches
         self.num_patches = self.patch_embed.num_patches
 
         # Create learnable position embeddings for each patch
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.embed_dim, device=device))
 
         # Re-initialize position embeddings
         torch.nn.init.normal_(self.pos_embed, std=0.02)

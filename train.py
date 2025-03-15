@@ -985,6 +985,9 @@ def main(cfg: DictConfig):
     # Move model to device
     model = model.to(device)
 
+    for param in model.parameters():
+        param.data = param.data.to(device)
+
     # Print model summary
     print(f"Model initialized: {model.__class__.__name__}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")

@@ -22,7 +22,7 @@ mask_ratio: 0.05
 contrastive_mode: global
 
 # Whether to use thickness mask for excluding black rim regions
-use_thickness_mask: true
+use_thickness_mask: false
 
 # Loss weights
 loss_weights:
