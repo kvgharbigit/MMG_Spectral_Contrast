@@ -26,8 +26,8 @@ experiment_name: spectralgpt_mae_contrastive
 
 # Training settings
 training:
-  epochs: 40
-  batch_size: 2
+  epochs: 80
+  batch_size: 4
   resume_from_checkpoint: false
   checkpoint_path: null
   early_stopping:

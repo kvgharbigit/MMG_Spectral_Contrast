@@ -637,6 +637,52 @@ def save_metrics_to_csv(metrics_dict, output_dir, epoch, split='train'):
     metrics_df.to_csv(csv_path, index=False)
 
 
+def update_best_metrics(val_metrics, epoch, summaries_dir, current_lr=None):
+    """
+    Update the best metrics file if the current epoch has better validation loss.
+    Robust version that handles various file reading scenarios.
+    """
+    best_path = os.path.join(summaries_dir, "best_metrics.txt")
+    current_val_loss = val_metrics['loss']
+
+    # Default best loss to current loss if no previous best exists
+    best_loss = current_val_loss
+    best_epoch = epoch
+
+    # Check if best metrics file exists and can be read
+    try:
+        if os.path.exists(best_path):
+            with open(best_path, 'r') as f:
+                lines = f.readlines()
+
+                # Look for a line with 'loss:' in it
+                for line in lines:
+                    if 'loss:' in line.lower():
+                        try:
+                            best_loss = float(line.split(':')[1].strip())
+                            break
+                        except (ValueError, IndexError):
+                            pass
+    except (IOError, OSError) as e:
+        print(f"Error reading best metrics file: {e}")
+        best_loss = current_val_loss
+
+    # Only update if current loss is better (lower)
+    if current_val_loss < best_loss:
+        try:
+            with open(best_path, 'w') as f:
+                f.write("Best Metrics\n")
+                f.write(f"Epoch: {epoch}\n")
+                if current_lr is not None:
+                    f.write(f"Learning Rate: {current_lr:.8f}\n")
+                f.write("Validation Metrics:\n")
+                for key, value in val_metrics.items():
+                    if key != 'learning_rate':
+                        f.write(f"  {key}: {value:.6f}\n")
+        except (IOError, OSError) as e:
+            print(f"Error writing best metrics file: {e}")
+
+
 def save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, total_time):
     """Save a summary of the epoch's metrics to a text file."""
     # Create summaries directory if it doesn't exist
@@ -645,69 +691,56 @@ def save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, total_time
 
     # Define file path
     summary_path = os.path.join(summaries_dir, f"epoch_{epoch}_summary.txt")
-
-    with open(summary_path, 'w') as f:
-        f.write(f"Epoch {epoch} Summary\n")
-        f.write("=" * 50 + "\n\n")
-
-        # Print learning rate prominently if available
-        if 'learning_rate' in train_metrics:
-            f.write(f"Learning Rate: {train_metrics['learning_rate']:.8f}\n\n")
-
-        f.write("Training Metrics:\n")
-        for key, value in train_metrics.items():
-            if key != 'learning_rate':  # Skip learning_rate as it's already shown above
-                f.write(f"  {key}: {value:.6f}\n")
-
-        f.write("\nValidation Metrics:\n")
-        for key, value in val_metrics.items():
-            if key != 'learning_rate':
-                f.write(f"  {key}: {value:.6f}\n")
-
-        f.write(f"\nTime taken: {total_time:.2f} seconds\n")
-
-        # Calculate improvements from previous epoch if available
-        improvement_path = os.path.join(summaries_dir, "best_metrics.txt")
-        if os.path.exists(improvement_path):
-            with open(improvement_path, 'r') as best_file:
-                lines = best_file.readlines()
-                if len(lines) >= 4:  # Ensure we have enough lines to read
-                    best_loss = float(lines[3].split(": ")[1].strip())
-                    improvement = best_loss - val_metrics['loss']
-                    f.write(f"\nImprovement in validation loss: {improvement:.6f}")
-
-    # Update best metrics if this is the best epoch so far
-    update_best_metrics(val_metrics, epoch, summaries_dir,
-                        current_lr=train_metrics.get('learning_rate', None))
-
-
-def update_best_metrics(val_metrics, epoch, summaries_dir, current_lr=None):
-    """Update the best metrics file if the current epoch has better validation loss."""
     best_path = os.path.join(summaries_dir, "best_metrics.txt")
-    current_val_loss = val_metrics['loss']
 
-    # Check if best metrics file exists
-    if os.path.exists(best_path):
-        with open(best_path, 'r') as f:
-            lines = f.readlines()
-            if len(lines) >= 4:  # Ensure we have enough lines to read
-                best_epoch = int(lines[1].split(": ")[1].strip())
-                best_loss = float(lines[3].split(": ")[1].strip())
+    try:
+        with open(summary_path, 'w') as f:
+            f.write(f"Epoch {epoch} Summary\n")
+            f.write("=" * 50 + "\n\n")
 
-                # Only update if current loss is better (lower)
-                if current_val_loss >= best_loss:
-                    return
+            # Print learning rate prominently if available
+            if 'learning_rate' in train_metrics:
+                f.write(f"Learning Rate: {train_metrics['learning_rate']:.8f}\n\n")
 
-    # Write new best metrics
-    with open(best_path, 'w') as f:
-        f.write("Best Metrics\n")
-        f.write(f"Epoch: {epoch}\n")
-        if current_lr is not None:
-            f.write(f"Learning Rate: {current_lr:.8f}\n")
-        f.write("Validation Metrics:\n")
-        for key, value in val_metrics.items():
-            if key != 'learning_rate':
-                f.write(f"  {key}: {value:.6f}\n")
+            f.write("Training Metrics:\n")
+            for key, value in train_metrics.items():
+                if key != 'learning_rate':  # Skip learning_rate as it's already shown above
+                    f.write(f"  {key}: {value:.6f}\n")
+
+            f.write("\nValidation Metrics:\n")
+            for key, value in val_metrics.items():
+                if key != 'learning_rate':
+                    f.write(f"  {key}: {value:.6f}\n")
+
+            f.write(f"\nTime taken: {total_time:.2f} seconds\n")
+
+            # Calculate improvements from previous best metrics
+            try:
+                if os.path.exists(best_path):
+                    with open(best_path, 'r') as best_file:
+                        best_lines = best_file.readlines()
+
+                        # Look for a line with loss
+                        for line in best_lines:
+                            if 'loss:' in line.lower():
+                                try:
+                                    best_loss = float(line.split(':')[1].strip())
+                                    improvement = best_loss - val_metrics['loss']
+                                    f.write(f"\nImprovement in validation loss: {improvement:.6f}")
+                                    break
+                                except (ValueError, IndexError):
+                                    pass
+            except (IOError, OSError) as e:
+                print(f"Error reading best metrics for improvement: {e}")
+
+        # Update best metrics if this is the best epoch so far
+        update_best_metrics(val_metrics, epoch, summaries_dir,
+                            current_lr=train_metrics.get('learning_rate', None))
+
+    except Exception as e:
+        print(f"Error in save_epoch_summary: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def check_early_stopping(val_losses, patience, min_delta=0.0):
