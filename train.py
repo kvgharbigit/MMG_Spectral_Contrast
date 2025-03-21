@@ -38,9 +38,19 @@ import os
 # Optional: only necessary if you want to lock to GPU 0
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
+# Add a global flag to track memory reservation status
+_MEMORY_RESERVED = False
+
 # Reserve GPU memory by allocating a large dummy tensor
 def reserve_gpu_memory(device_id=0, target_gb=10):
     """Allocates memory to effectively reserve the GPU."""
+    global _MEMORY_RESERVED
+
+    # If memory is already reserved, skip allocation
+    if _MEMORY_RESERVED:
+        print("GPU memory already reserved. Skipping.")
+        return
+
     device = torch.device(f"cuda:{device_id}")
     tensor_list = []
 
@@ -50,15 +60,18 @@ def reserve_gpu_memory(device_id=0, target_gb=10):
         while True:
             tensor = torch.empty((chunk_size_mb * 1024 * 1024 // 4,), dtype=torch.float32, device=device)
             tensor_list.append(tensor)
-            allocated = torch.cuda.memory_allocated(device_id) / 1024**3
+            allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3
             print(f"[GPU {device_id}] Reserved ~{allocated:.2f} GB")
             if allocated >= target_gb:
                 break
+
+        # Set the flag to indicate memory has been reserved
+        _MEMORY_RESERVED = True
+        print("Memory reservation complete.")
     except RuntimeError as e:
         print(f"[!] Stopped allocating: {e}")
 
-# Run it
-reserve_gpu_memory(device_id=0, target_gb=10.5)
+
 
 
 def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr):
@@ -942,6 +955,9 @@ def main(cfg: DictConfig):
     # Set device
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    # Run it
+    reserve_gpu_memory(device_id=0, target_gb=10.5)
 
     # Create output directory
     output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
