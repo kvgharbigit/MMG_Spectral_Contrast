@@ -32,31 +32,33 @@ import matplotlib.cm as cm
 plt.switch_backend('agg')
 
 
-# Set GPU memory fraction to use (adjust the value as needed)
-def limit_gpu_memory(memory_fraction=0.9):
-    """
-    Limit the amount of GPU memory that can be used by the current process.
+import torch
+import os
 
-    Args:
-        memory_fraction: Fraction of total GPU memory to use (0 to 1)
-    """
-    if torch.cuda.is_available():
-        # Get the total memory of the first GPU
-        total_memory = torch.cuda.get_device_properties(0).total_memory
+# Optional: only necessary if you want to lock to GPU 0
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-        # Calculate the memory limit in bytes
-        memory_limit = int(total_memory * memory_fraction)
+# Reserve GPU memory by allocating a large dummy tensor
+def reserve_gpu_memory(device_id=0, target_gb=10):
+    """Allocates memory to effectively reserve the GPU."""
+    device = torch.device(f"cuda:{device_id}")
+    tensor_list = []
 
-        # Set the memory limit
-        torch.cuda.set_per_process_memory_fraction(memory_fraction)
+    try:
+        # Try allocating chunks to fill up the GPU
+        chunk_size_mb = 512
+        while True:
+            tensor = torch.empty((chunk_size_mb * 1024 * 1024 // 4,), dtype=torch.float32, device=device)
+            tensor_list.append(tensor)
+            allocated = torch.cuda.memory_allocated(device_id) / 1024**3
+            print(f"[GPU {device_id}] Reserved ~{allocated:.2f} GB")
+            if allocated >= target_gb:
+                break
+    except RuntimeError as e:
+        print(f"[!] Stopped allocating: {e}")
 
-        print(f"GPU memory limited to {memory_fraction:.2f} of total ({memory_limit / 1e9:.2f} GB)")
-    else:
-        print("No GPU available, memory limiting not applied")
-
-
-# Call the function at the start of your script
-limit_gpu_memory(0.8)  # Use 90% of available GPU memory
+# Run it
+reserve_gpu_memory(device_id=0, target_gb=10.5)
 
 
 def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr):
