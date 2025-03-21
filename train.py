@@ -1,4 +1,5 @@
 import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import sys
 import time
 import glob
@@ -16,6 +17,7 @@ from tqdm import tqdm
 import hydra.utils
 from datetime import datetime
 from pathlib import Path
+
 
 # Import custom modules
 from MultiModalSpectralGPT import MultiModalSpectralGPT
@@ -679,7 +681,7 @@ def update_best_metrics(val_metrics, epoch, summaries_dir, current_lr=None):
                 f.write("Validation Metrics:\n")
                 for key, value in val_metrics.items():
                     if key != 'learning_rate':
-                        f.write(f"  {key}: {value:.6f}\n")
+                        f.write(f"  {key}: {value:.10f}\n")
         except (IOError, OSError) as e:
             print(f"Error writing best metrics file: {e}")
 
@@ -706,12 +708,12 @@ def save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, total_time
             f.write("Training Metrics:\n")
             for key, value in train_metrics.items():
                 if key != 'learning_rate':  # Skip learning_rate as it's already shown above
-                    f.write(f"  {key}: {value:.6f}\n")
+                    f.write(f"  {key}: {value:.10f}\n")
 
             f.write("\nValidation Metrics:\n")
             for key, value in val_metrics.items():
                 if key != 'learning_rate':
-                    f.write(f"  {key}: {value:.6f}\n")
+                    f.write(f"  {key}: {value:.10f}\n")
 
             f.write(f"\nTime taken: {total_time:.2f} seconds\n")
 
@@ -727,7 +729,7 @@ def save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, total_time
                                 try:
                                     best_loss = float(line.split(':')[1].strip())
                                     improvement = best_loss - val_metrics['loss']
-                                    f.write(f"\nImprovement in validation loss: {improvement:.6f}")
+                                    f.write(f"\nImprovement in validation loss: {improvement:.10f}")
                                     break
                                 except (ValueError, IndexError):
                                     pass
@@ -797,12 +799,12 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         # Get current learning rate for progress bar
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Update progress bar
+        # Update progress bar with more decimal places
         pbar.set_postfix({
-            'loss': loss.item(),
-            'recon_loss': output['loss_recon'].item(),
-            'contrast_loss': output['loss_contrast'].item(),
-            'lr': current_lr
+            'loss': f"{loss.item():.10f}",
+            'recon_loss': f"{output['loss_recon'].item():.10f}",
+            'contrast_loss': f"{output['loss_contrast'].item():.10f}",
+            'lr': f"{current_lr}\n"  # Add a newline character after the learning rate
         })
 
         # Store outputs
@@ -814,48 +816,47 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
 def validate_epoch(model, dataloader, device, contrastive_mode=None):
     """
     Validate the model on the validation set.
-    
+
     Args:
         model: The model to validate
         dataloader: DataLoader for validation data
         device: Device to validate on
         contrastive_mode: Contrastive mode to use (if None, use model's default)
-        
+
     Returns:
         List of outputs from each batch
     """
     model.eval()
     outputs = []
-    
+
     # Set contrastive mode if specified
     if contrastive_mode is not None:
         model.contrastive_mode = contrastive_mode
-    
+
     # Create progress bar
     pbar = tqdm(dataloader, desc="Validation")
-    
+
     with torch.no_grad():
         for batch in pbar:
             # Move data to device
             hsi = batch['hsi'].to(device)
             aux_data = {k: v.to(device) if v is not None else None for k, v in batch['aux_data'].items()}
             batch_idx = batch['batch_idx'].to(device)
-            
+
             # Forward pass
             output = model(hsi, aux_data, batch_idx)
-            
-            # Update progress bar
+
+            # Update progress bar with more decimal places
             pbar.set_postfix({
-                'loss': output['loss'].item(),
-                'recon_loss': output['loss_recon'].item(),
-                'contrast_loss': output['loss_contrast'].item()
+                'loss': f"{output['loss'].item():.10f}",
+                'recon_loss': f"{output['loss_recon'].item():.10f}",
+                'contrast_loss': f"{output['loss_contrast'].item():.10f}"
             })
-            
+
             # Store outputs
             outputs.append(output)
-    
-    return outputs
 
+    return outputs
 
 def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False):
     """
@@ -885,10 +886,9 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
     if is_best:
         best_path = os.path.join(checkpoints_dir, "best_model.pth")
         torch.save(checkpoint, best_path)
-        print(f"Saved new best model with validation loss: {val_loss:.6f}")
+        print(f"Saved new best model with validation loss: {val_loss:.10f}")
 
-
-@hydra.main(config_path="configs", config_name="train")
+@hydra.main(config_path="configs", config_name="train",version_base="1.1")
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
 
@@ -1145,9 +1145,9 @@ def main(cfg: DictConfig):
         epoch_time = time.time() - epoch_start_time
 
         # Update the print statement to include learning rate
-        print(f"Train Loss: {train_metrics['loss']:.6f}, "
-              f"Val Loss: {val_metrics['loss']:.6f}, "
-              f"LR: {train_metrics.get('learning_rate', 0):.8f}, "  # Add LR to console output
+        print(f"Train Loss: {train_metrics['loss']:.10f}, "
+              f"Val Loss: {val_metrics['loss']:.10f}, "
+              f"LR: {train_metrics.get('learning_rate', 0):.8f}, "
               f"Time: {epoch_time:.2f}s")
 
         # Log to TensorBoard and MLflow
