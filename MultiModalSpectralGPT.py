@@ -23,6 +23,8 @@ class SpatialRegistration(nn.Module):
             target_bands (int): The target number of spectral bands.
         """
         super().__init__()
+
+
         self.analysis_dim = analysis_dim
         self.target_bands = target_bands
         self.selected_indices = None  # To track selected indices for use in other methods
@@ -319,10 +321,21 @@ class MultiModalSpectralGPT(nn.Module):
         # Project auxiliary patch embeddings to fixed embedding dim
         self.aux_spatial_proj = nn.Linear(aux_embed_dim, embed_dim)
 
-        # Patch embedding will be dynamically set in forward method
-        self.patch_embed = None
-        self.pos_embed = None
-        self.num_patches = None
+        # Create patch embedding during initialization
+        self.patch_embed = PatchEmbed(
+            img_size=analysis_dim,
+            patch_size=patch_size,
+            in_chans=in_chans,
+            embed_dim=embed_dim,
+            frames=num_frames,
+            t_patch_size=t_patch_size
+        )
+
+        # Set number of patches
+        self.num_patches = self.patch_embed.num_patches
+
+        # Initialize positional embedding
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
 
         # Initialize weights
         self.initialize_weights()
@@ -404,45 +417,37 @@ class MultiModalSpectralGPT(nn.Module):
 
     def _setup_patch_embedding(self, hsi_img):
         """
-        Dynamically set up patch embedding based on preprocessed HSI image.
-
-        Args:
-            hsi_img (torch.Tensor): Preprocessed HSI image tensor
+        Ensure patch embedding is configured properly for the current input.
+        Now just moves the embedding to the right device.
         """
-        # Get dimensions of preprocessed HSI image
-        _, _, T, H, W = hsi_img.shape
-        device = hsi_img.device  # Get device from input tensor
+        # Get device from input tensor
+        device = hsi_img.device
 
-        # Dynamically create patch embedding
-        self.patch_embed = PatchEmbed(
-            img_size=H,  # Use actual height after preprocessing
-            patch_size=self.patch_size,
-            in_chans=1,  # Assuming single channel after preprocessing
-            embed_dim=self.embed_dim,
-            frames=T,  # Use actual number of frames/bands
-            t_patch_size=self.t_patch_size
-        ).to(device)  # Move to the same device as input
-
-        # Dynamically calculate and set number of patches
-        self.num_patches = self.patch_embed.num_patches
-
-        # Create learnable position embeddings for each patch
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.embed_dim, device=device))
-
-        # Re-initialize position embeddings
-        torch.nn.init.normal_(self.pos_embed, std=0.02)
+        # Move patch embedding to the same device as input
+        if self.patch_embed.proj.weight.device != device:
+            self.patch_embed = self.patch_embed.to(device)
+            self.pos_embed = self.pos_embed.to(device)
 
     def initialize_weights(self):
         """Initialize model weights."""
-        # Note: Actual positional embedding initialization is deferred to forward pass
+        # Initialize position embeddings
+        torch.nn.init.normal_(self.pos_embed, std=0.02)
+
         # Initialize mask token
         torch.nn.init.normal_(self.mask_token, std=0.02)
 
     def random_masking(self, x, mask_ratio):
         """Perform per-sample random masking by per-sample shuffling."""
         N, L, D = x.shape
+
+        # Add this safety check
+        if mask_ratio > 0.99:
+            mask_ratio = 0.99
+
         len_keep = int(L * (1 - mask_ratio))
         len_keep = max(1, len_keep)  # Keep at least one token
+
+
 
         # Generate random noise and use it to shuffle indices
         noise = torch.rand(N, L, device=x.device)

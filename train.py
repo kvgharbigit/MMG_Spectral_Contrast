@@ -32,6 +32,33 @@ import matplotlib.cm as cm
 plt.switch_backend('agg')
 
 
+# Set GPU memory fraction to use (adjust the value as needed)
+def limit_gpu_memory(memory_fraction=0.9):
+    """
+    Limit the amount of GPU memory that can be used by the current process.
+
+    Args:
+        memory_fraction: Fraction of total GPU memory to use (0 to 1)
+    """
+    if torch.cuda.is_available():
+        # Get the total memory of the first GPU
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+
+        # Calculate the memory limit in bytes
+        memory_limit = int(total_memory * memory_fraction)
+
+        # Set the memory limit
+        torch.cuda.set_per_process_memory_fraction(memory_fraction)
+
+        print(f"GPU memory limited to {memory_fraction:.2f} of total ({memory_limit / 1e9:.2f} GB)")
+    else:
+        print("No GPU available, memory limiting not applied")
+
+
+# Call the function at the start of your script
+limit_gpu_memory(0.8)  # Use 90% of available GPU memory
+
+
 def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr):
     """
     Creates a learning rate schedule with linear warmup and cosine decay.
