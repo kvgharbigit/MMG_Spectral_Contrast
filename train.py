@@ -25,7 +25,7 @@ from dataset import PatientDataset, custom_collate_fn, create_patient_dataloader
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb  # These are already imported elsewhere
 from dataset import MultiModalTransforms
 
-from visualisation import visualize_batch
+from visualisation import visualize_batch, visualize_reconstruction_quality
 import matplotlib.cm as cm
 
 # Configure matplotlib for non-GUI environments
@@ -1213,14 +1213,42 @@ def main(cfg: DictConfig):
         if epoch % cfg.visualization.viz_frequency == 0:
             print("Visualizing reconstructions...")
             try:
+                # Get a validation batch
+                val_batch = next(iter(val_loader))
+
+                # Get model output with reconstructed image
+                with torch.no_grad():
+                    val_output = model(val_batch['hsi'].to(device),
+                                       {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                                        for k, v in val_batch['aux_data'].items()},
+                                       val_batch['batch_idx'].to(device))
+
+                # Save path for the quality visualization
+                viz_path = os.path.join(output_dir, 'visualizations', f'quality_viz_epoch_{epoch}.png')
+                os.makedirs(os.path.dirname(viz_path), exist_ok=True)
+
+                # Use the new visualization function
+                fig = visualize_reconstruction_quality(
+                    original=val_batch['hsi'].to(device),
+                    reconstruction=val_output['reconstructed_img'],
+                    mask=val_output['mask'],
+                    thickness_mask=val_output['thickness_mask'],
+                    save_path=viz_path
+                )
+                plt.close(fig)
+
+                # Also keep existing visualization
                 recon_path = visualize_reconstruction(
                     model,
-                    next(iter(val_loader)),  # Use a validation batch
+                    val_batch,
                     epoch,
                     output_dir,
                     max_samples=cfg.visualization.num_samples,
                     include_aux=cfg.visualization.include_aux
                 )
+
+                # Log both visualizations
+                log_reconstruction(viz_path, epoch, writer, cfg.logging.use_mlflow)
                 log_reconstruction(recon_path, epoch, writer, cfg.logging.use_mlflow)
             except Exception as e:
                 print(f"Error in reconstruction visualization: {e}")

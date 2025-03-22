@@ -222,68 +222,183 @@ def visualize_augmentation(original_batch, augmented_batch, save_dir='visualizat
     print(f"All visualizations saved to {save_dir}")
 
 
+def visualize_reconstruction_quality(original, reconstruction, mask, thickness_mask=None, save_path=None):
+    """
+    Visualize the reconstruction quality with special focus on areas that contribute to the loss.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import torch
+    from hsi_to_rgb import simple_hsi_to_rgb
+
+    # Select first batch item for visualization
+    orig = original[0].detach().cpu()
+    recon = reconstruction[0].detach().cpu()
+
+    # Convert HSI to RGB for visualization
+    orig_rgb = simple_hsi_to_rgb(orig)
+    recon_rgb = simple_hsi_to_rgb(recon)
+
+    # Calculate error map
+    error = ((recon - orig) ** 2).mean(dim=(0, 1))  # Mean across channels and spectral dimension
+    error = error.numpy()
+
+    # Create a figure with subplots
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    # Handle different possible shapes of RGB tensor
+    # Print shape for debugging
+    print(f"Original RGB shape: {orig_rgb.shape}")
+
+    # Convert to numpy and properly reshape for matplotlib
+    if len(orig_rgb.shape) == 5:  # [B, C, 3, H, W]
+        orig_rgb_np = orig_rgb[0, 0].permute(1, 2, 0).cpu().numpy()
+        recon_rgb_np = recon_rgb[0, 0].permute(1, 2, 0).cpu().numpy()
+    elif len(orig_rgb.shape) == 4:  # [B, 3, H, W]
+        orig_rgb_np = orig_rgb[0].permute(1, 2, 0).cpu().numpy()
+        recon_rgb_np = recon_rgb[0].permute(1, 2, 0).cpu().numpy()
+    elif len(orig_rgb.shape) == 3 and orig_rgb.shape[0] == 3:  # [3, H, W]
+        orig_rgb_np = orig_rgb.permute(1, 2, 0).cpu().numpy()
+        recon_rgb_np = recon_rgb.permute(1, 2, 0).cpu().numpy()
+    else:  # Already in [H, W, 3] format or other
+        orig_rgb_np = orig_rgb.cpu().numpy()
+        recon_rgb_np = recon_rgb.cpu().numpy()
+
+    # Ensure we have a proper RGB image with values in [0, 1]
+    orig_rgb_np = np.clip(orig_rgb_np, 0, 1)
+    recon_rgb_np = np.clip(recon_rgb_np, 0, 1)
+
+    # Plot original RGB
+    axes[0, 0].imshow(orig_rgb_np)
+    axes[0, 0].set_title("Original HSI (RGB)")
+    axes[0, 0].axis('off')
+
+    # Plot reconstructed RGB
+    axes[0, 1].imshow(recon_rgb_np)
+    axes[0, 1].set_title("Reconstructed HSI (RGB)")
+    axes[0, 1].axis('off')
+
+    # Plot error map
+    error_img = axes[0, 2].imshow(error, cmap='hot')
+    axes[0, 2].set_title("Reconstruction Error")
+    axes[0, 2].axis('off')
+    fig.colorbar(error_img, ax=axes[0, 2])
+
+    # Convert patch mask to pixel mask for visualization
+    B, C, T, H, W = original.shape
+    patch_h, patch_w = H // int(np.sqrt(mask.shape[1] // (T // 5))), W // int(np.sqrt(mask.shape[1] // (T // 5)))
+    pixel_mask = torch.zeros((H, W), device='cpu')
+
+    mask_reshaped = mask[0].reshape(-1, H // patch_h, W // patch_w)
+
+    for t_idx in range(mask_reshaped.shape[0]):
+        for h_idx in range(mask_reshaped.shape[1]):
+            for w_idx in range(mask_reshaped.shape[2]):
+                h_start = h_idx * patch_h
+                w_start = w_idx * patch_w
+                if mask_reshaped[t_idx, h_idx, w_idx] > 0.5:
+                    pixel_mask[h_start:h_start + patch_h, w_start:w_start + patch_w] = 1.0
+
+    # Plot mask
+    axes[1, 0].imshow(pixel_mask.numpy(), cmap='gray')
+    axes[1, 0].set_title("MAE Mask (White = Masked)")
+    axes[1, 0].axis('off')
+
+    # Plot valid regions (thickness mask)
+    if thickness_mask is not None:
+        thick_mask = thickness_mask[0, 0].detach().cpu().numpy()
+        axes[1, 1].imshow(thick_mask, cmap='gray')
+        axes[1, 1].set_title("Valid Regions (White = Valid)")
+        axes[1, 1].axis('off')
+
+        # Plot combined mask (areas that contribute to loss)
+        combined = pixel_mask.numpy() * thick_mask
+        axes[1, 2].imshow(combined, cmap='gray')
+        axes[1, 2].set_title("Areas Contributing to Loss")
+        axes[1, 2].axis('off')
+    else:
+        axes[1, 1].axis('off')
+        axes[1, 2].axis('off')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+
+    return fig
+
+
 if __name__ == "__main__":
+    import os
     import sys
     import torch
-    from dataset import create_patient_dataloader, PatientDataset, MultiModalTransforms
+    import numpy as np
+    from dataset import PatientDataset, create_patient_dataloader
 
-    # Test code for augmentation visualization
+    # Get data directory from command line or use default
+    data_dir = sys.argv[1] if len(sys.argv) > 1 else "dummydata"
+    print(f"Loading data from: {data_dir}")
+
+    # Create dataloader to get a batch of real data
+    dataloader = create_patient_dataloader(
+        data_dir,
+        batch_size=1,  # Just load one sample for testing
+        analysis_dim=500,
+        target_bands=30
+    )
+
+    # Try to get a batch
     try:
-        print("Testing visualization with augmentation...")
-
-        # Get data directory from command line or use default
-        data_dir = sys.argv[1] if len(sys.argv) > 1 else "dummydata"
-        print(f"Loading data from: {data_dir}")
-
-        # Create dataset and dataloader
-        batch_size = 4
-        dataloader = create_patient_dataloader(
-            data_dir,
-            batch_size=batch_size,
-            augment=False  # No augmentation in the dataloader
-        )
-
-        # Get a batch
         batch = next(iter(dataloader))
+        print(f"Successfully loaded a batch with HSI shape: {batch['hsi'].shape}")
 
-        # Create a copy for augmentation
-        augmented_batch = {
-            'hsi': batch['hsi'].clone(),
-            'aux_data': {k: v.clone() if v is not None else None for k, v in batch['aux_data'].items()},
-            'batch_idx': batch['batch_idx'].clone(),
-            'patient_id': batch['patient_id']
-        }
+        # Create a simple "reconstructed" version for testing by adding noise
+        original = batch['hsi']
+        reconstructed = original + 0.05 * torch.randn_like(original)
+
+        # Create a mask similar to what the model would produce (1=masked, 0=visible)
+        # Using dimensions from your model: 20x20 spatial patches, 6 spectral chunks = 2400 patches
+        total_patches = 2400
+        mask = torch.zeros(1, total_patches)
+        mask_indices = torch.randperm(total_patches)[:int(0.75 * total_patches)]
+        mask[0, mask_indices] = 1.0
+
+        # Get or create thickness mask
         if 'thickness_mask' in batch and batch['thickness_mask'] is not None:
-            augmented_batch['thickness_mask'] = batch['thickness_mask'].clone()
+            thickness_mask = batch['thickness_mask']
+            print(f"Using real thickness mask with shape: {thickness_mask.shape}")
+        else:
+            # Create a circular mask
+            B, C, T, H, W = original.shape
+            thickness_mask = torch.zeros(B, 1, H, W)
+            y, x = torch.meshgrid(
+                torch.linspace(-1, 1, H),
+                torch.linspace(-1, 1, W),
+                indexing='ij'
+            )
+            thickness_mask[0, 0] = ((x ** 2 + y ** 2) < 0.7 ** 2).float()
+            print(f"Created synthetic thickness mask with shape: {thickness_mask.shape}")
 
-        # In visualisation.py around line 235-236, just before the transform call:
-        print("\n----- DEBUG: BEFORE AUGMENTATION -----")
-        print(f"HSI data shape: {augmented_batch['hsi'].shape}")
-        for k, v in augmented_batch['aux_data'].items():
-            if v is not None:
-                print(f"{k} data shape: {v.shape}")
-            else:
-                print(f"{k} data is None")
-        print(f"Thickness mask: {type(augmented_batch.get('thickness_mask'))}")
-        if augmented_batch.get('thickness_mask') is not None:
-            print(f"Thickness mask shape: {augmented_batch['thickness_mask'].shape}")
-        print("---------------------------------------\n")
+        # Make sure output directory exists
+        os.makedirs("debug_output", exist_ok=True)
 
+        # Test visualization function
+        print("Testing visualization function...")
+        print(f"Original HSI shape: {original.shape}")
 
-        # Apply augmentation
-        transform = MultiModalTransforms(prob=1.0)  # Force augmentation to occur
-        augmented_batch['hsi'], augmented_batch['aux_data'], augmented_batch['thickness_mask'] = transform(
-            augmented_batch['hsi'], augmented_batch['aux_data'],
-            augmented_batch.get('thickness_mask', None)
+        fig = visualize_reconstruction_quality(
+            original=original,
+            reconstruction=reconstructed,
+            mask=mask,
+            thickness_mask=thickness_mask,
+            save_path="debug_output/reconstruction_quality_test.png"
         )
 
-        # Visualize
-        visualize_augmentation(batch, augmented_batch)
-
-        print("Augmentation visualization complete!")
+        print(f"Visualization saved to debug_output/reconstruction_quality_test.png")
 
     except Exception as e:
+        print(f"Error during visualization test: {e}")
         import traceback
 
-        print(f"Error testing augmentation visualization: {e}")
         traceback.print_exc()
+

@@ -46,6 +46,6 @@ logging:
 
 # Visualization settings
 visualization:
-  viz_frequency: 2
+  viz_frequency: 1
   num_samples: 2
   include_aux: true
