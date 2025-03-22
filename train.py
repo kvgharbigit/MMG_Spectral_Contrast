@@ -101,7 +101,8 @@ def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, bas
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2, include_aux=True):
+
+def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2, include_aux=True, model_output=None):
     """
     Visualize the original and reconstructed HSI data for evaluation.
 
@@ -112,6 +113,7 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
         output_dir: Directory to save visualizations
         max_samples: Maximum number of samples to visualize
         include_aux: Whether to include auxiliary modalities in visualization
+        model_output: Pre-computed model output (optional, to avoid redundant forward pass)
 
     Returns:
         str: Path to the saved visualization file
@@ -146,16 +148,25 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
 
     # Get model prediction with no gradient tracking
     with torch.no_grad():
-        output = model(hsi, aux_data, batch_idx)
+        if model_output is not None:
+            # Use pre-computed output
+            output = model_output
+        else:
+            # Perform a forward pass if no pre-computed output is provided
+            output = model(hsi, aux_data, batch_idx)
 
         # Extract relevant outputs
         pred = output['pred']  # Predicted embeddings
         mask = output['mask']  # MAE mask (1 is masked, 0 is kept)
 
-        # Check if model has a pixel_decoder (needed for reconstruction)
-        if not hasattr(model, 'pixel_decoder'):
-            raise ValueError(
-                "Model does not have a pixel_decoder. A trained pixel decoder is required for visualization.")
+        # Check if reconstructed_img is in the output
+        if 'reconstructed_img' not in output:
+            print(
+                "Warning: reconstructed_img not found in model output. The model should return this in its forward method.")
+            # Check if model has a pixel_decoder (needed for fallback reconstruction)
+            if not hasattr(model, 'pixel_decoder'):
+                raise ValueError(
+                    "Model does not have a pixel_decoder. Cannot visualize reconstruction.")
 
     # Determine number of columns based on what to include
     n_cols = 4  # Original, Mask, Masked, Reconstructed
@@ -175,7 +186,7 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
     fig, axes = plt.subplots(batch_size, n_cols, figsize=(fig_width, fig_height))
     fig.suptitle(f"Epoch {epoch} - HSI Reconstruction", fontsize=16)
 
-    # If only one sample, make axes 2D
+    # If only one sample, make axes into a list for consistent indexing
     if batch_size == 1:
         axes = axes.reshape(1, -1)
 
@@ -391,59 +402,10 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
                                   ha='center', va='center', transform=axes[i, col_idx].transAxes)
         col_idx += 1
 
-        # 4. Reconstruct and plot the reconstructed HSI
+        # 4. Plot the reconstructed HSI directly from model output
         try:
-            # Reconstruct HSI from model prediction
-            recon_tokens = pred[i].unsqueeze(0)  # Add batch dimension [1, L, D]
-
-            # Reshape for pixel decoder
-            B, L, D = recon_tokens.shape
-            recon_tokens_flat = recon_tokens.reshape(-1, D)
-
-            # Use the model's pixel decoder for reconstruction
-            pixels_flat = model.pixel_decoder(recon_tokens_flat)
-
-            # Extract necessary dimensions
-            C = 1  # Channels (HSI usually has 1 channel)
-            T = model.spectral_patches * model.t_patch_size  # Total spectral bands
-            H = model.patches_per_dim * model.patch_size[0]  # Height
-            W = model.patches_per_dim * model.patch_size[1]  # Width
-
-            # Calculate patch dimensions
-            patch_h, patch_w = model.patch_size
-            t_patch_size = model.t_patch_size
-            num_patches_h = H // patch_h
-            num_patches_w = W // patch_w
-            num_patches_t = T // t_patch_size
-            patch_volume = C * t_patch_size * patch_h * patch_w
-
-            # Reshape to B, L, patch_components
-            pixels = pixels_flat.reshape(B, L, C, t_patch_size, patch_h, patch_w)
-
-            # Initialize output tensor
-            recon_hsi = torch.zeros((B, C, T, H, W), device=device)
-
-            # Place each patch in the correct position
-            patch_idx = 0
-            for t_idx in range(num_patches_t):
-                t_start = t_idx * t_patch_size
-                for h_idx in range(num_patches_h):
-                    h_start = h_idx * patch_h
-                    for w_idx in range(num_patches_w):
-                        w_start = w_idx * patch_w
-
-                        if patch_idx < pixels.shape[1]:
-                            # Get this patch
-                            patch = pixels[:, patch_idx]
-
-                            # Place in output tensor
-                            recon_hsi[:, :, t_start:t_start + t_patch_size,
-                            h_start:h_start + patch_h,
-                            w_start:w_start + patch_w] = patch
-
-                        patch_idx += 1
-
-
+            # Get the pre-computed reconstruction from model output
+            recon_hsi = output['reconstructed_img'][i].unsqueeze(0)  # Add batch dimension back
 
             # Debug: print shape before RGB conversion
             print(f"Reconstructed HSI shape before RGB conversion: {recon_hsi.shape}")
@@ -558,7 +520,6 @@ def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2
 
     print(f"Reconstructions visualized and saved to {save_path}")
     return save_path
-
 
 def calculate_metrics(outputs, optimizer=None):
     """Calculate aggregate metrics from a list of model outputs."""
@@ -1237,14 +1198,15 @@ def main(cfg: DictConfig):
                 )
                 plt.close(fig)
 
-                # Also keep existing visualization
+                # Also keep existing visualization but pass the pre-computed output
                 recon_path = visualize_reconstruction(
                     model,
                     val_batch,
                     epoch,
                     output_dir,
                     max_samples=cfg.visualization.num_samples,
-                    include_aux=cfg.visualization.include_aux
+                    include_aux=cfg.visualization.include_aux,
+                    model_output=val_output  # Pass the pre-computed output to avoid redundant forward pass
                 )
 
                 # Log both visualizations
