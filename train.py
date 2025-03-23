@@ -1,4 +1,7 @@
 import os
+
+from visualisation import visualize_embedding_space_loss
+
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import sys
 import time
@@ -25,7 +28,7 @@ from dataset import PatientDataset, custom_collate_fn, create_patient_dataloader
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb  # These are already imported elsewhere
 from dataset import MultiModalTransforms
 
-from visualisation import visualize_batch, visualize_reconstruction_quality
+
 import matplotlib.cm as cm
 
 # Configure matplotlib for non-GUI environments
@@ -102,424 +105,6 @@ def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, bas
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def visualize_reconstruction(model, test_batch, epoch, output_dir, max_samples=2, include_aux=True, model_output=None):
-    """
-    Visualize the original and reconstructed HSI data for evaluation.
-
-    Args:
-        model: The trained model
-        test_batch: A batch of test data
-        epoch: Current epoch number
-        output_dir: Directory to save visualizations
-        max_samples: Maximum number of samples to visualize
-        include_aux: Whether to include auxiliary modalities in visualization
-        model_output: Pre-computed model output (optional, to avoid redundant forward pass)
-
-    Returns:
-        str: Path to the saved visualization file
-    """
-    import os
-    import torch
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    # Create visualization directory if it doesn't exist
-    viz_dir = os.path.join(output_dir, 'visualizations')
-    os.makedirs(viz_dir, exist_ok=True)
-
-    # Ensure model is in evaluation mode
-    model.eval()
-
-    # Limit the number of samples to visualize
-    batch_size = min(max_samples, test_batch['hsi'].shape[0])
-
-    # Get device
-    device = next(model.parameters()).device
-
-    # Move data to device
-    hsi = test_batch['hsi'][:batch_size].to(device)
-    aux_data = {k: v[:batch_size].to(device) if v is not None else None
-                for k, v in test_batch['aux_data'].items()}
-    batch_idx = test_batch['batch_idx'][:batch_size].to(device)
-
-    # Save patient IDs for labeling
-    patient_ids = test_batch['patient_id'][:batch_size] if 'patient_id' in test_batch else [f"Sample_{i}" for i in
-                                                                                            range(batch_size)]
-
-    # Get model prediction with no gradient tracking
-    with torch.no_grad():
-        if model_output is not None:
-            # Use pre-computed output
-            output = model_output
-        else:
-            # Perform a forward pass if no pre-computed output is provided
-            output = model(hsi, aux_data, batch_idx)
-
-        # Extract relevant outputs
-        pred = output['pred']  # Predicted embeddings
-        mask = output['mask']  # MAE mask (1 is masked, 0 is kept)
-
-        # Check if reconstructed_img is in the output
-        if 'reconstructed_img' not in output:
-            print(
-                "Warning: reconstructed_img not found in model output. The model should return this in its forward method.")
-            # Check if model has a pixel_decoder (needed for fallback reconstruction)
-            if not hasattr(model, 'pixel_decoder'):
-                raise ValueError(
-                    "Model does not have a pixel_decoder. Cannot visualize reconstruction.")
-
-    # Determine number of columns based on what to include
-    n_cols = 4  # Original, Mask, Masked, Reconstructed
-
-    if include_aux:
-        # Count available auxiliary modalities
-        n_aux = sum(1 for v in aux_data.values() if v is not None)
-        if n_aux > 0:
-            n_cols += n_aux
-
-    # Create a larger figure to prevent overlapping
-    # Increase the figure size to give more space between columns
-    fig_width = 5 * n_cols  # 5 inches per column
-    fig_height = 5 * batch_size  # 5 inches per row
-
-    # Set up the figure with more space
-    fig, axes = plt.subplots(batch_size, n_cols, figsize=(fig_width, fig_height))
-    fig.suptitle(f"Epoch {epoch} - HSI Reconstruction", fontsize=16)
-
-    # If only one sample, make axes into a list for consistent indexing
-    if batch_size == 1:
-        axes = axes.reshape(1, -1)
-
-    # Add more space between subplots
-    plt.subplots_adjust(wspace=0.3, hspace=0.3)
-
-    # For each sample in the batch
-    for i in range(batch_size):
-        col_idx = 0
-
-        # 1. Plot original HSI as RGB
-        try:
-            # Get the original HSI and convert to RGB using existing function
-            orig_hsi = hsi[i].unsqueeze(0)  # Add batch dimension back
-
-            # Debug: print shape before conversion
-            print(f"Original HSI shape before RGB conversion: {orig_hsi.shape}")
-
-            orig_rgb = simple_hsi_to_rgb(orig_hsi)  # Use the imported function
-
-            # Debug: print shape after conversion
-            print(f"RGB shape after conversion: {orig_rgb.shape}")
-
-            # Convert to numpy and fully remove all batch dimensions
-            if len(orig_rgb.shape) == 5:  # If shape is [B, C, 3, H, W]
-                orig_rgb_np = orig_rgb[0, 0].cpu().numpy()  # Get [3, H, W]
-            elif len(orig_rgb.shape) == 4:  # If shape is [B, 3, H, W]
-                orig_rgb_np = orig_rgb[0].cpu().numpy()  # Get [3, H, W]
-            else:
-                orig_rgb_np = orig_rgb.cpu().numpy()  # Already correct shape
-
-            # Always transpose to [H, W, 3] if we have [3, H, W]
-            if len(orig_rgb_np.shape) == 3 and orig_rgb_np.shape[0] == 3:
-                orig_rgb_np = np.transpose(orig_rgb_np, (1, 2, 0))
-
-            # Debug: print final shape
-            print(f"Final RGB shape for plotting: {orig_rgb_np.shape}")
-
-            # Ensure valid range for display
-            orig_rgb_np = np.clip(orig_rgb_np, 0, 1)
-
-            axes[i, col_idx].imshow(orig_rgb_np)
-            axes[i, col_idx].set_title("Original HSI", fontsize=12)
-            axes[i, col_idx].axis('off')
-        except Exception as e:
-            print(f"Error creating original RGB visualization: {e}")
-            import traceback
-            traceback.print_exc()
-            axes[i, col_idx].text(0.5, 0.5, "Error visualizing HSI",
-                                  ha='center', va='center', transform=axes[i, col_idx].transAxes)
-        col_idx += 1
-
-        # 2. Visualize the MAE mask
-        try:
-            # Get the original patch tokens
-            orig_tokens = model.patch_embed(orig_hsi)
-            B, T, HW, D = orig_tokens.shape
-            orig_tokens = orig_tokens.reshape(B, T * HW, D)
-
-            # Create a spatial visualization of the mask
-            patch_mask = mask[i].clone().cpu().numpy()
-
-            # Reshape the mask to match the spatial structure of patches
-            patch_h, patch_w = model.patch_size
-            t_patch_size = model.t_patch_size
-            num_patches_h = model.patches_per_dim
-            num_patches_w = model.patches_per_dim
-            num_patches_t = model.spectral_patches
-
-            # Need to reshape the 1D mask into a 3D grid (T, H, W)
-            # First reshape to spectral patches × spatial patches
-            if len(patch_mask) == num_patches_t * num_patches_h * num_patches_w:
-                spatial_mask = patch_mask.reshape(num_patches_t, num_patches_h, num_patches_w)
-
-                # Average across spectral dimension for visualization
-                spatial_mask_2d = np.mean(spatial_mask, axis=0)
-            else:
-                # If mask shape doesn't match expected dimensions, just reshape to square
-                side_len = int(np.sqrt(len(patch_mask)))
-                spatial_mask_2d = patch_mask.reshape(side_len, side_len)
-
-            # Plot the mask
-            mask_img = axes[i, col_idx].imshow(spatial_mask_2d, cmap='hot', interpolation='nearest')
-            axes[i, col_idx].set_title(f"MAE Mask ({mask[i].sum().item():.0f} masked tokens)", fontsize=12)
-            axes[i, col_idx].axis('off')
-
-            # Add a colorbar for the mask
-            plt.colorbar(mask_img, ax=axes[i, col_idx], fraction=0.046, pad=0.04)
-
-        except Exception as e:
-            print(f"Error visualizing mask: {e}")
-            import traceback
-            traceback.print_exc()
-            axes[i, col_idx].text(0.5, 0.5, "Error visualizing mask",
-                                  ha='center', va='center', transform=axes[i, col_idx].transAxes)
-            axes[i, col_idx].axis('off')
-        col_idx += 1
-
-        # 3. Create and plot masked version that better shows spectral masking effects
-        try:
-            # Apply the mask from model output to the tokens (set masked tokens to zero)
-            masked_tokens = orig_tokens.clone()
-            mask_idx = torch.where(mask[i] > 0.5)[0]
-            masked_tokens[0, mask_idx] = 0.0
-
-            # Reshape to [B*L, D] format expected by the pixel decoder
-            B, L, D = masked_tokens.shape
-            masked_tokens_flat = masked_tokens.reshape(-1, D)
-
-            # Use the model's pixel decoder to get patch pixels
-            pixels_flat = model.pixel_decoder(masked_tokens_flat)
-
-            # Extract necessary dimensions
-            C = 1  # Channels (HSI usually has 1 channel)
-            T = model.spectral_patches * model.t_patch_size  # Total spectral bands
-            H = model.patches_per_dim * model.patch_size[0]  # Height
-            W = model.patches_per_dim * model.patch_size[1]  # Width
-
-            # Calculate patch dimensions
-            patch_h, patch_w = model.patch_size
-            t_patch_size = model.t_patch_size
-            num_patches_h = H // patch_h
-            num_patches_w = W // patch_w
-            num_patches_t = T // t_patch_size
-            patch_volume = C * t_patch_size * patch_h * patch_w
-
-            # Reshape to B, L, C, t_patch_size, patch_h, patch_w
-            pixels = pixels_flat.reshape(B, L, C, t_patch_size, patch_h, patch_w)
-
-            # Initialize output tensor
-            masked_hsi = torch.zeros((B, C, T, H, W), device=device)
-
-            # Create a mask density tensor to track which spatial locations have masked bands
-            mask_density = torch.zeros((H, W), device=device)
-
-            # Place each patch in the correct position
-            patch_idx = 0
-            for t_idx in range(num_patches_t):
-                t_start = t_idx * t_patch_size
-                for h_idx in range(num_patches_h):
-                    h_start = h_idx * patch_h
-                    for w_idx in range(num_patches_w):
-                        w_start = w_idx * patch_w
-
-                        if patch_idx < pixels.shape[1]:
-                            # Get this patch
-                            patch = pixels[:, patch_idx]
-
-                            # Place in output tensor
-                            masked_hsi[:, :, t_start:t_start + t_patch_size,
-                            h_start:h_start + patch_h,
-                            w_start:w_start + patch_w] = patch
-
-                            # Check if this patch was masked and update mask density
-                            if patch_idx in mask_idx:
-                                mask_density[h_start:h_start + patch_h, w_start:w_start + patch_w] += 1.0
-
-                        patch_idx += 1
-
-            # Normalize mask density by the number of spectral patches
-            mask_density = mask_density / num_patches_t
-
-            # Debug: print shape before RGB conversion
-            print(f"Masked HSI shape before RGB conversion: {masked_hsi.shape}")
-
-            # Convert to RGB for visualization using the imported function
-            masked_rgb = simple_hsi_to_rgb(masked_hsi)
-
-            # Debug: print shape after conversion
-            print(f"Masked RGB shape after conversion: {masked_rgb.shape}")
-
-            # Convert to numpy with proper handling of dimensions
-            if len(masked_rgb.shape) == 5:  # If shape is [B, C, 3, H, W]
-                masked_rgb_np = masked_rgb[0, 0].cpu().numpy()
-            elif len(masked_rgb.shape) == 4:  # If shape is [B, 3, H, W]
-                masked_rgb_np = masked_rgb[0].cpu().numpy()
-            else:
-                masked_rgb_np = masked_rgb.cpu().numpy()
-
-            # Always transpose to [H, W, 3] if we have [3, H, W]
-            if len(masked_rgb_np.shape) == 3 and masked_rgb_np.shape[0] == 3:
-                masked_rgb_np = np.transpose(masked_rgb_np, (1, 2, 0))
-
-            # Debug: print final shape
-            print(f"Final masked RGB shape for plotting: {masked_rgb_np.shape}")
-
-            # Ensure values are valid for display
-            masked_rgb_np = np.clip(masked_rgb_np, 0, 1)
-
-            # Create a more informative visualization
-            # Blend the original RGB with red color based on mask density
-            mask_density_np = mask_density.cpu().numpy()
-            enhanced_masked_rgb = masked_rgb_np.copy()
-
-            # Areas with high mask density will appear more red-tinted
-            for c in range(3):
-                if c == 0:  # Red channel
-                    # Keep red channel more visible
-                    enhanced_masked_rgb[:, :, c] = enhanced_masked_rgb[:, :, c] * (1.0 - mask_density_np * 0.5)
-                else:  # Green and Blue channels
-                    # Reduce green and blue more to create red tint in masked areas
-                    enhanced_masked_rgb[:, :, c] = enhanced_masked_rgb[:, :, c] * (1.0 - mask_density_np)
-
-            # Plot the enhanced masked version
-            axes[i, col_idx].imshow(enhanced_masked_rgb)
-            axes[i, col_idx].set_title("Masked HSI (red = masked)", fontsize=12)
-            axes[i, col_idx].axis('off')
-        except Exception as e:
-            print(f"Error creating masked HSI visualization: {e}")
-            import traceback
-            traceback.print_exc()
-            axes[i, col_idx].text(0.5, 0.5, "Error visualizing masked HSI",
-                                  ha='center', va='center', transform=axes[i, col_idx].transAxes)
-        col_idx += 1
-
-        # 4. Plot the reconstructed HSI directly from model output
-        try:
-            # Get the pre-computed reconstruction from model output
-            recon_hsi = output['reconstructed_img'][i].unsqueeze(0)  # Add batch dimension back
-
-            # Debug: print shape before RGB conversion
-            print(f"Reconstructed HSI shape before RGB conversion: {recon_hsi.shape}")
-
-            # Convert to RGB for visualization using the imported function
-            recon_rgb = simple_hsi_to_rgb(recon_hsi)
-
-            # Debug: print shape after conversion
-            print(f"Reconstructed RGB shape after conversion: {recon_rgb.shape}")
-
-            # Convert to numpy with proper dimension handling
-            if len(recon_rgb.shape) == 5:  # If shape is [B, C, 3, H, W]
-                recon_rgb_np = recon_rgb[0, 0].cpu().numpy()
-            elif len(recon_rgb.shape) == 4:  # If shape is [B, 3, H, W]
-                recon_rgb_np = recon_rgb[0].cpu().numpy()
-            else:
-                recon_rgb_np = recon_rgb.cpu().numpy()
-
-            # Always transpose to [H, W, 3] if we have [3, H, W]
-            if len(recon_rgb_np.shape) == 3 and recon_rgb_np.shape[0] == 3:
-                recon_rgb_np = np.transpose(recon_rgb_np, (1, 2, 0))
-
-            # Debug: print final shape
-            print(f"Final reconstructed RGB shape for plotting: {recon_rgb_np.shape}")
-
-            # Ensure valid range for display
-            recon_rgb_np = np.clip(recon_rgb_np, 0, 1)
-
-            axes[i, col_idx].imshow(recon_rgb_np)
-            axes[i, col_idx].set_title("Reconstructed HSI", fontsize=12)
-            axes[i, col_idx].axis('off')
-        except Exception as e:
-            print(f"Error creating reconstructed HSI visualization: {e}")
-            import traceback
-            traceback.print_exc()
-            axes[i, col_idx].text(0.5, 0.5, "Error visualizing reconstruction",
-                                  ha='center', va='center', transform=axes[i, col_idx].transAxes)
-        col_idx += 1
-
-        # 5. Plot auxiliary modalities if available and requested
-        if include_aux:
-            for modality, data in aux_data.items():
-                if data is not None:
-                    try:
-                        # Get auxiliary data for this sample
-                        aux_img = data[i, 0].cpu().numpy()  # Assuming shape [B, 1, H, W]
-
-                        # Display the auxiliary data
-                        axes[i, col_idx].imshow(aux_img, cmap='gray')
-                        axes[i, col_idx].set_title(f"{modality.upper()}", fontsize=12)
-                        axes[i, col_idx].axis('off')
-                    except Exception as e:
-                        print(f"Error displaying {modality} data: {e}")
-                        axes[i, col_idx].text(0.5, 0.5, f"Error: {modality}",
-                                              ha='center', va='center', transform=axes[i, col_idx].transAxes)
-                    col_idx += 1
-
-    # Add sample identifiers
-    for i, patient_id in enumerate(patient_ids):
-        # Add text to the left side of the row
-        plt.figtext(0.01, (batch_size - i - 0.5) / batch_size, f"ID: {patient_id}",
-                    va='center', ha='left', fontsize=10)
-
-    # Adjust layout
-    plt.tight_layout()
-    plt.subplots_adjust(top=0.95, left=0.05, wspace=0.3, hspace=0.3)
-
-    # Save the figure
-    save_path = os.path.join(viz_dir, f"reconstruction_epoch_{epoch}.png")
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
-
-    # Create a higher quality visualization for just one sample
-    if batch_size > 0:
-        try:
-            # Create a detailed visualization for the first sample with more spacing
-            fig, axes = plt.subplots(1, 4, figsize=(24, 6))
-            fig.suptitle(f"Epoch {epoch} - Detailed Reconstruction (ID: {patient_ids[0]})", fontsize=16)
-
-            # Add more space between subplots
-            plt.subplots_adjust(wspace=0.3)
-
-            # Original HSI
-            axes[0].imshow(orig_rgb_np)
-            axes[0].set_title("Original HSI", fontsize=14)
-            axes[0].axis('off')
-
-            # MAE Mask
-            mask_img = axes[1].imshow(spatial_mask_2d, cmap='hot', interpolation='nearest')
-            axes[1].set_title(f"MAE Mask ({mask[0].sum().item():.0f} tokens)", fontsize=14)
-            axes[1].axis('off')
-            plt.colorbar(mask_img, ax=axes[1], fraction=0.046, pad=0.04)
-
-            # Masked HSI with enhanced visualization
-            axes[2].imshow(enhanced_masked_rgb)
-            axes[2].set_title("Masked HSI (red = masked)", fontsize=14)
-            axes[2].axis('off')
-
-            # Reconstructed HSI
-            axes[3].imshow(recon_rgb_np)
-            axes[3].set_title("Reconstructed HSI", fontsize=14)
-            axes[3].axis('off')
-
-            # Save high-quality version
-            hq_save_path = os.path.join(viz_dir, f"detailed_reconstruction_epoch_{epoch}.png")
-            plt.savefig(hq_save_path, dpi=300, bbox_inches='tight')
-            plt.close(fig)
-        except Exception as e:
-            print(f"Error creating detailed visualization: {e}")
-            import traceback
-            traceback.print_exc()
-
-    print(f"Reconstructions visualized and saved to {save_path}")
-    return save_path
 
 def calculate_metrics(outputs, optimizer=None):
     """Calculate aggregate metrics from a list of model outputs."""
@@ -918,7 +503,8 @@ def main(cfg: DictConfig):
     print(f"Using device: {device}")
 
     # Run it
-    reserve_gpu_memory(device_id=0, target_gb=10.5)
+    if torch.cuda.is_available():
+        reserve_gpu_memory(device_id=0, target_gb=10.5)
 
     # Create output directory
     output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
@@ -1170,50 +756,52 @@ def main(cfg: DictConfig):
         # Keep track of validation losses for early stopping
         val_losses.append(val_metrics['loss'])
 
-        # Visualize reconstructions every N epochs
+        # Visualize embedding space reconstruction every N epochs
         if epoch % cfg.visualization.viz_frequency == 0:
-            print("Visualizing reconstructions...")
+            print("Visualizing embedding space reconstruction...")
             try:
                 # Get a validation batch
                 val_batch = next(iter(val_loader))
 
-                # Get model output with reconstructed image
+                # Get model output with embeddings
                 with torch.no_grad():
                     val_output = model(val_batch['hsi'].to(device),
                                        {k: v.to(device) if isinstance(v, torch.Tensor) else v
                                         for k, v in val_batch['aux_data'].items()},
                                        val_batch['batch_idx'].to(device))
 
-                # Save path for the quality visualization
-                viz_path = os.path.join(output_dir, 'visualizations', f'quality_viz_epoch_{epoch}.png')
-                os.makedirs(os.path.dirname(viz_path), exist_ok=True)
+                # Create visualization directory
+                viz_dir = os.path.join(output_dir, 'visualizations')
+                os.makedirs(viz_dir, exist_ok=True)
 
-                # Use the new visualization function
-                fig = visualize_reconstruction_quality(
-                    original=val_batch['hsi'].to(device),
-                    reconstruction=val_output['reconstructed_img'],
+                # Save path for the embedding visualization
+                embedding_viz_path = os.path.join(viz_dir, f'embedding_viz_epoch_{epoch}.png')
+
+                # Visualize embedding space reconstruction
+                fig = visualize_embedding_space_loss(
+                    original_tokens=val_output['original_tokens'],
+                    predicted_tokens=val_output['pred'],
                     mask=val_output['mask'],
                     thickness_mask=val_output['thickness_mask'],
-                    save_path=viz_path
+                    save_path=embedding_viz_path
                 )
                 plt.close(fig)
 
-                # Also keep existing visualization but pass the pre-computed output
-                recon_path = visualize_reconstruction(
-                    model,
-                    val_batch,
-                    epoch,
-                    output_dir,
-                    max_samples=cfg.visualization.num_samples,
-                    include_aux=cfg.visualization.include_aux,
-                    model_output=val_output  # Pass the pre-computed output to avoid redundant forward pass
-                )
+                # Log to TensorBoard
+                img = plt.imread(embedding_viz_path)
+                if img.shape[2] == 4:  # RGBA image with alpha channel
+                    img = img[:, :, :3]  # Remove alpha channel
 
-                # Log both visualizations
-                log_reconstruction(viz_path, epoch, writer, cfg.logging.use_mlflow)
-                log_reconstruction(recon_path, epoch, writer, cfg.logging.use_mlflow)
+                # TensorBoard expects images in [C, H, W] format
+                img = np.transpose(img, (2, 0, 1))
+                writer.add_image(f"EmbeddingSpace/epoch_{epoch}", img, epoch, dataformats='CHW')
+
+                # Log to MLflow if enabled
+                if cfg.logging.use_mlflow:
+                    mlflow.log_artifact(embedding_viz_path, f"visualizations/epoch_{epoch}")
+
             except Exception as e:
-                print(f"Error in reconstruction visualization: {e}")
+                print(f"Error in embedding space visualization: {e}")
                 import traceback
                 traceback.print_exc()
 

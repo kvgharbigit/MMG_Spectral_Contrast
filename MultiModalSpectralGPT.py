@@ -290,13 +290,7 @@ class MultiModalSpectralGPT(nn.Module):
         # Decoder prediction head (predicts in embedding space)
         self.decoder_pred = nn.Linear(decoder_embed_dim, embed_dim)
 
-        # Optional pixel decoder for better HSI reconstruction
-        self.pixel_decoder = self._create_pixel_decoder(
-            decoder_embed_dim=decoder_embed_dim,
-            patch_size=patch_size,
-            t_patch_size=t_patch_size,
-            in_chans=in_chans
-        )
+
 
         # Contrastive learning components
         self.temperature = temperature
@@ -780,117 +774,54 @@ class MultiModalSpectralGPT(nn.Module):
                 aux_embeddings[modality] = self.aux_norm(aux_embeddings[modality])
         return aux_embeddings
 
-    def forward_loss_with_thickness_mask(self, imgs, pred, mask, thickness_mask=None):
+
+
+    def forward_loss_in_embedding_space(self, pred, target, mask, thickness_mask=None):
         """
-        Compute reconstruction loss by directly comparing reconstructed pixels to original image pixels.
-        Optionally excludes black rim areas using thickness mask.
+        Compute loss in embedding space by directly comparing predicted embeddings
+        to target embeddings from the patches.
 
         Args:
-            imgs (torch.Tensor): Original HSI images of shape [B, C, T, H, W]
             pred (torch.Tensor): Predicted embeddings from decoder of shape [B, L, D]
+            target (torch.Tensor): Original embeddings from encoder of shape [B, L, D]
             mask (torch.Tensor): Binary mask indicating which tokens were masked (1=masked, 0=visible)
-            thickness_mask (torch.Tensor, optional): Mask indicating valid image regions (1=valid, 0=black rim)
+            thickness_mask (torch.Tensor, optional): Patch-level mask indicating valid image regions
 
         Returns:
-            torch.Tensor: Reconstruction loss
+            torch.Tensor: Reconstruction loss in embedding space
         """
-        B, C, T, H, W = imgs.shape
-
-        # Calculate patch dimensions for reconstruction
-        patch_h, patch_w = self.patch_size
-        t_patch_size = self.t_patch_size
-        num_patches_h = H // patch_h
-        num_patches_w = W // patch_w
-        num_patches_t = T // t_patch_size
-
-        # Process predicted embeddings through pixel decoder to get pixel-level predictions
-        pred_pixels_flat = self.pixel_decoder(pred)
-
-        # Reshape the predicted pixels into the original image format
-        # First, determine the patch volume
-        patch_volume = C * t_patch_size * patch_h * patch_w
-
-        # Reshape to [B, num_patches, patch_volume]
-        pred_pixels = pred_pixels_flat.reshape(B, -1, patch_volume)
-
-        # Initialize a tensor to hold the reconstructed image
-        recon_img = torch.zeros_like(imgs)
-
-        # Reshape patch dimensions to match the original image structure
-        pred_patches = pred_pixels.reshape(
-            B, num_patches_t, num_patches_h, num_patches_w,
-            C, t_patch_size, patch_h, patch_w
-        )
-
-        # Place each patch in the correct position of the reconstructed image
-        for t_idx in range(num_patches_t):
-            for h_idx in range(num_patches_h):
-                for w_idx in range(num_patches_w):
-                    # Get patch coordinates
-                    t_start = t_idx * t_patch_size
-                    h_start = h_idx * patch_h
-                    w_start = w_idx * patch_w
-
-                    # Get patch content
-                    patch = pred_patches[:, t_idx, h_idx, w_idx]
-
-                    # Place the patch in the reconstructed image
-                    recon_img[
-                    :, :,
-                    t_start:t_start + t_patch_size,
-                    h_start:h_start + patch_h,
-                    w_start:w_start + patch_w
-                    ] = patch
-
-        # Reshape the mask to correspond to patches
-        patch_mask = mask.reshape(B, num_patches_t * num_patches_h * num_patches_w)
-
-        # Convert to a patch mask that can be applied to the original image
-        full_mask = torch.zeros((B, 1, T, H, W), device=imgs.device)
-
-        patch_idx = 0
-        for t_idx in range(num_patches_t):
-            for h_idx in range(num_patches_h):
-                for w_idx in range(num_patches_w):
-                    # Get patch coordinates
-                    t_start = t_idx * t_patch_size
-                    h_start = h_idx * patch_h
-                    w_start = w_idx * patch_w
-
-                    # Set mask values for this patch location
-                    for b in range(B):
-                        if patch_mask[b, patch_idx] > 0.5:  # If this patch was masked
-                            full_mask[
-                            b, :,
-                            t_start:t_start + t_patch_size,
-                            h_start:h_start + patch_h,
-                            w_start:w_start + patch_w
-                            ] = 1.0
-
-                    patch_idx += 1
-
-        # Calculate pixel-wise squared error
-        pixel_loss = (recon_img - imgs) ** 2
+        # We only compute loss on masked tokens
+        B, L, D = pred.shape
 
         # Apply the MAE mask (we only compute loss on masked regions)
-        masked_loss = pixel_loss * full_mask
+        # Expand mask for broadcasting
+        mask_expanded = mask.unsqueeze(-1).expand_as(pred)  # [B, L, D]
 
-        if thickness_mask is not None:
-            # Apply the thickness mask to focus only on valid regions
-            thickness_mask = thickness_mask.unsqueeze(2)  # Add spectral dimension [B, 1, 1, H, W]
-            thickness_mask = thickness_mask.expand(-1, -1, T, -1, -1)  # Expand to match spectral dimension
+        # If thickness mask is provided, convert it to patch level and apply it
+        if thickness_mask is not None and self.use_thickness_mask:
+            # Convert pixel-level mask to patch-level
+            patch_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)  # [B, num_patches]
 
-            # Apply the thickness mask to the loss
-            masked_loss = masked_loss * thickness_mask
+            # Expand patch mask for broadcasting
+            patch_mask_expanded = patch_mask.unsqueeze(-1).expand_as(pred)  # [B, L, D]
 
-            # Normalize by the number of pixels that are both masked by MAE and in valid regions
-            combined_mask = full_mask * thickness_mask
-            valid_pixel_count = combined_mask.sum() + 1e-6
+            # Combine MAE mask with thickness mask (both must be 1 for a token to be used)
+            # For MAE mask, 1 = masked token, for thickness mask, 1 = valid region
+            combined_mask = mask_expanded * patch_mask_expanded
 
-            return masked_loss.sum() / valid_pixel_count
+            # Compute squared error only on tokens that are both masked and in valid regions
+            loss = ((pred - target) ** 2) * combined_mask
+
+            # Sum loss and normalize by the number of tokens that contribute
+            valid_token_count = combined_mask.sum() + 1e-6  # Add small epsilon to avoid division by zero
+            return loss.sum() / valid_token_count
         else:
-            # If no thickness mask is provided, normalize by the number of masked pixels
-            return masked_loss.sum() / (full_mask.sum() + 1e-6)
+            # No thickness mask, just use MAE mask
+            loss = ((pred - target) ** 2) * mask_expanded
+
+            # Sum loss and normalize by the number of masked tokens
+            masked_token_count = mask.sum() * D + 1e-6  # Multiply by embedding dim and add epsilon
+            return loss.sum() / masked_token_count
 
     def create_patch_mask_from_pixel_mask(self, pixel_mask):
         """
@@ -943,101 +874,13 @@ class MultiModalSpectralGPT(nn.Module):
 
         return patch_mask
 
-    def _create_pixel_decoder(self, decoder_embed_dim, patch_size, t_patch_size, in_chans):
-        """
-        Create a pixel decoder module to reconstruct HSI from embeddings.
-        """
-        patch_size = to_2tuple(patch_size)
 
-        # Calculate patch volume
-        patch_volume = in_chans * t_patch_size * patch_size[0] * patch_size[1]
 
-        # A more robust decoder with intermediate layers
-        pixel_decoder = nn.Sequential(
-            nn.Linear(self.embed_dim, self.embed_dim),
-            nn.GELU(),
-            nn.Linear(self.embed_dim, self.embed_dim // 2),
-            nn.GELU(),
-            nn.Linear(self.embed_dim // 2, patch_volume)
-        )
 
-        print(
-            f"Created pixel decoder: input={self.embed_dim}, hidden={self.embed_dim}, hidden2={self.embed_dim // 2}, output={patch_volume}")
-        print(f"Patch dimensions: {in_chans}×{t_patch_size}×{patch_size[0]}×{patch_size[1]}")
-
-        return pixel_decoder
-
-    def reconstruct_pixels(self, tokens, B, C, T, H, W):
-        """
-        Reconstruct pixel values from tokens using the pixel decoder.
-        Ensures proper placement of patches to form the complete image.
-
-        Args:
-            tokens (torch.Tensor): Embeddings from the decoder
-            B (int): Batch size
-            C (int): Number of channels
-            T (int): Number of spectral bands
-            H (int): Height of the image
-            W (int): Width of the image
-
-        Returns:
-            torch.Tensor: Reconstructed image of shape [B, C, T, H, W]
-        """
-        # Get patch dimensions
-        patch_h, patch_w = self.patch_size
-        t_patch_size = self.t_patch_size
-
-        # Calculate grid dimensions
-        num_patches_h = H // patch_h
-        num_patches_w = W // patch_w
-        num_patches_t = T // t_patch_size
-
-        # Process tokens through the pixel decoder
-        pixels_flat = self.pixel_decoder(tokens)
-
-        # Calculate patch volume
-        patch_volume = C * t_patch_size * patch_h * patch_w
-
-        # Create output tensor
-        output = torch.zeros((B, C, T, H, W), device=tokens.device)
-
-        # Reshape to [B, num_patches, patch_volume]
-        pixels = pixels_flat.reshape(B, -1, patch_volume)
-
-        # Reshape to match the original image structure for easier placement
-        pixels_structured = pixels.reshape(
-            B, num_patches_t, num_patches_h, num_patches_w,
-            C, t_patch_size, patch_h, patch_w
-        )
-
-        # Place each patch in the correct position
-        for t_idx in range(num_patches_t):
-            t_start = t_idx * t_patch_size
-            t_end = min(t_start + t_patch_size, T)
-            t_size = t_end - t_start
-
-            for h_idx in range(num_patches_h):
-                h_start = h_idx * patch_h
-                h_end = min(h_start + patch_h, H)
-                h_size = h_end - h_start
-
-                for w_idx in range(num_patches_w):
-                    w_start = w_idx * patch_w
-                    w_end = min(w_start + patch_w, W)
-                    w_size = w_end - w_start
-
-                    # Extract this patch
-                    patch = pixels_structured[:, t_idx, h_idx, w_idx, :, :t_size, :h_size, :w_size]
-
-                    # Place in output tensor
-                    output[:, :, t_start:t_end, h_start:h_end, w_start:w_end] = patch
-
-        return output
 
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
         """Forward pass through the full model with configurable contrastive loss mode."""
         # Apply spatial registration to ensure all modalities have the same dimensions
-        # Now also returns a mask derived from thickness map
         hsi_img, aux_data, thickness_mask = self.spatial_registration(hsi_img, aux_data)
 
         # If thickness mask should not be used, set it to None
@@ -1065,18 +908,21 @@ class MultiModalSpectralGPT(nn.Module):
         if thickness_mask is not None:
             thickness_mask = thickness_mask.to(device)
 
+        # Store original tokens for target in loss calculation
+        # First, get original patch tokens (without masking)
+        original_tokens = self.patch_embed(hsi_img)
+        B, T, HW, D = original_tokens.shape
+        original_tokens = original_tokens.reshape(B, T * HW, D)
+        original_tokens = original_tokens + self.pos_embed
+
         # Encode with masking for reconstruction
         latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
 
         # Decode and reconstruct
         pred = self.forward_decoder(latent, ids_restore)
 
-        # Calculate reconstruction loss using thickness mask if enabled
-        loss_recon = self.forward_loss_with_thickness_mask(hsi_img, pred, mask, thickness_mask)
-
-        # Create the reconstructed image for visualization and evaluation
-        B, C, T, H, W = hsi_img.shape
-        reconstructed_img = self.reconstruct_pixels(pred, B, C, T, H, W)
+        # Calculate reconstruction loss in embedding space
+        loss_recon = self.forward_loss_in_embedding_space(pred, original_tokens, mask, thickness_mask)
 
         # Calculate contrastive loss if auxiliary data present
         loss_contrast = torch.tensor(0.0, device=device)
@@ -1107,7 +953,7 @@ class MultiModalSpectralGPT(nn.Module):
             'num_modalities': torch.tensor(num_available, device=device),
             'pred': pred,
             'mask': mask,
-            'thickness_mask': thickness_mask,  # Include thickness mask in output
+            'thickness_mask': thickness_mask,
             'contrastive_mode': self.contrastive_mode,
-            'reconstructed_img': reconstructed_img  # Add the reconstructed image to the output
+            'original_tokens': original_tokens  # Include original tokens for visualization
         }

@@ -328,6 +328,138 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
     return fig
 
 
+def visualize_embedding_space_loss(original_tokens, predicted_tokens, mask, thickness_mask=None, save_path=None):
+    """
+    Visualize the reconstruction quality in embedding space.
+
+    Args:
+        original_tokens (torch.Tensor): Original embeddings of shape [B, L, D]
+        predicted_tokens (torch.Tensor): Predicted embeddings of shape [B, L, D]
+        mask (torch.Tensor): Binary mask indicating which tokens were masked (1=masked, 0=visible)
+        thickness_mask (torch.Tensor, optional): Thickness mask indicating valid regions
+        save_path (str, optional): Path to save the visualization
+
+    Returns:
+        matplotlib.figure.Figure: The created figure
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import torch
+    from sklearn.decomposition import PCA
+
+    # Select the first batch element for visualization
+    original = original_tokens[0].detach().cpu().numpy()
+    predicted = predicted_tokens[0].detach().cpu().numpy()
+    mask_np = mask[0].detach().cpu().numpy()
+
+    # Compute token-wise reconstruction error
+    token_error = np.mean((original - predicted) ** 2, axis=1)
+
+    # Reduce dimensionality for visualization using PCA
+    pca = PCA(n_components=2)
+    combined = np.vstack([original, predicted])
+    reduced = pca.fit_transform(combined)
+
+    # Split back into original and predicted
+    original_2d = reduced[:len(original)]
+    predicted_2d = reduced[len(original):]
+
+    # Create the figure
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    # Plot 1: Scatter plot of embeddings in 2D PCA space
+    # Plot original tokens (blue) and their corresponding predicted tokens (red)
+    # Only for masked tokens
+    masked_indices = np.where(mask_np > 0.5)[0]
+
+    if len(masked_indices) > 0:
+        # For clarity, sample at most 500 tokens if there are too many
+        if len(masked_indices) > 500:
+            np.random.seed(42)  # For reproducibility
+            sampled_indices = np.random.choice(masked_indices, 500, replace=False)
+        else:
+            sampled_indices = masked_indices
+
+        # Plot original tokens
+        orig_scatter = axes[0].scatter(
+            original_2d[sampled_indices, 0],
+            original_2d[sampled_indices, 1],
+            c='blue', s=10, alpha=0.7, label='Original'
+        )
+
+        # Plot predicted tokens
+        pred_scatter = axes[0].scatter(
+            predicted_2d[sampled_indices, 0],
+            predicted_2d[sampled_indices, 1],
+            c='red', s=10, alpha=0.7, label='Predicted'
+        )
+
+        # Draw lines connecting original and predicted points
+        for i in sampled_indices:
+            axes[0].plot(
+                [original_2d[i, 0], predicted_2d[i, 0]],
+                [original_2d[i, 1], predicted_2d[i, 1]],
+                'k-', alpha=0.2
+            )
+
+        axes[0].set_title('Token Embeddings in 2D PCA Space')
+        axes[0].legend()
+        axes[0].set_xlabel('PC1')
+        axes[0].set_ylabel('PC2')
+    else:
+        axes[0].text(0.5, 0.5, "No masked tokens found",
+                     ha='center', va='center', transform=axes[0].transAxes)
+
+    # Plot 2: Token-wise reconstruction error
+    error_plot = axes[1].bar(range(len(token_error)), token_error)
+    axes[1].set_title('Token-wise Reconstruction Error')
+    axes[1].set_xlabel('Token Index')
+    axes[1].set_ylabel('MSE')
+
+    # Highlight masked tokens in red
+    for i in masked_indices:
+        if i < len(error_plot):
+            error_plot[i].set_color('red')
+
+    # Plot 3: Visualization of mask (and thickness mask if available)
+    # Create a 2D representation of the mask based on the patch structure
+    try:
+        # Assume the spatial layout is square
+        spatial_side = int(np.sqrt(len(mask_np) / 6))  # 6 = spectral chunks
+        mask_2d = mask_np.reshape(6, spatial_side, spatial_side).mean(axis=0)
+
+        mask_img = axes[2].imshow(mask_2d, cmap='gray', interpolation='nearest')
+        axes[2].set_title('Mask Visualization')
+        plt.colorbar(mask_img, ax=axes[2])
+
+        # Overlay thickness mask if available
+        if thickness_mask is not None:
+            thickness_mask_np = thickness_mask[0, 0].detach().cpu().numpy()
+            # Downsample to match patch grid
+            import torch.nn.functional as F
+            h, w = thickness_mask_np.shape
+            patch_size = h // spatial_side
+            thickness_mask_patches = F.avg_pool2d(
+                torch.tensor(thickness_mask_np).unsqueeze(0).unsqueeze(0),
+                kernel_size=patch_size,
+                stride=patch_size
+            )[0, 0].numpy()
+
+            # Plot contour of thickness mask
+            axes[2].contour(thickness_mask_patches, levels=[0.5],
+                            colors='red', linewidths=2)
+            axes[2].set_title('Mask with Thickness Boundary')
+    except Exception as e:
+        axes[2].text(0.5, 0.5, f"Error visualizing mask: {str(e)}",
+                     ha='center', va='center', transform=axes[2].transAxes)
+
+    # Save the figure if a path is provided
+    if save_path:
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    return fig
+
 if __name__ == "__main__":
     import os
     import sys
