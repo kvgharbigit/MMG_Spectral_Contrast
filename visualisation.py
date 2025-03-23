@@ -460,6 +460,201 @@ def visualize_embedding_space_loss(original_tokens, predicted_tokens, mask, thic
 
     return fig
 
+
+def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thickness_mask=None, save_path=None):
+    """
+    Visualize the reconstruction quality of token embeddings with spatial layout.
+
+    Args:
+        original_tokens (torch.Tensor): Original embeddings [B, L, D]
+        predicted_tokens (torch.Tensor): Predicted embeddings [B, L, D]
+        mask (torch.Tensor): Binary mask (1=masked, 0=visible) [B, L]
+        thickness_mask (torch.Tensor, optional): Thickness mask
+        save_path (str, optional): Path to save visualization
+
+    Returns:
+        matplotlib.figure.Figure: Generated figure
+    """
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+    from sklearn.manifold import TSNE
+    import torch.nn.functional as F
+
+    # Use only the first batch item
+    orig = original_tokens[0].detach().cpu()
+    pred = predicted_tokens[0].detach().cpu()
+    mask_np = mask[0].detach().cpu().numpy()
+
+    # Assume 2400 tokens = 6 spectral chunks × 400 spatial locations (20×20 grid)
+    num_spatial = 400
+    num_spectral = 6
+    spatial_side = 20  # 20×20 spatial grid
+
+    # Compute token-wise reconstruction quality
+    # Using cosine similarity (higher is better)
+    cos_sim = torch.zeros(len(mask_np))
+    for i in range(len(mask_np)):
+        if mask_np[i] > 0.5:  # For masked tokens
+            orig_norm = F.normalize(orig[i:i + 1], p=2, dim=1)
+            pred_norm = F.normalize(pred[i:i + 1], p=2, dim=1)
+            cos_sim[i] = torch.sum(orig_norm * pred_norm).item()
+        else:
+            cos_sim[i] = 0  # For unmasked tokens, set to 0
+
+    # Convert to numpy
+    cos_sim = cos_sim.numpy()
+
+    # Create reconstruction quality maps
+    # 1. Spectral average: For each spatial location, average across spectral chunks
+    spatial_cos_sim = np.zeros((num_spatial))
+    spatial_mask_count = np.zeros((num_spatial))
+
+    for i in range(len(cos_sim)):
+        spec_idx = i // num_spatial  # Spectral chunk index
+        spatial_idx = i % num_spatial  # Spatial location index
+
+        if mask_np[i] > 0.5:  # Only consider masked tokens
+            spatial_cos_sim[spatial_idx] += cos_sim[i]
+            spatial_mask_count[spatial_idx] += 1
+
+    # Normalize by count of masked tokens at each spatial location
+    spatial_mask_count[spatial_mask_count == 0] = 1  # Avoid division by zero
+    spatial_cos_sim = spatial_cos_sim / spatial_mask_count
+
+    # Reshape to 2D grid
+    spatial_cos_sim_grid = spatial_cos_sim.reshape(spatial_side, spatial_side)
+
+    # 2. Spatial average: For each spectral chunk, average across spatial locations
+    spectral_cos_sim = np.zeros((num_spectral))
+    spectral_mask_count = np.zeros((num_spectral))
+
+    for i in range(len(cos_sim)):
+        spec_idx = i // num_spatial  # Spectral chunk index
+
+        if mask_np[i] > 0.5:  # Only consider masked tokens
+            spectral_cos_sim[spec_idx] += cos_sim[i]
+            spectral_mask_count[spec_idx] += 1
+
+    # Normalize by count of masked tokens in each spectral chunk
+    spectral_mask_count[spectral_mask_count == 0] = 1  # Avoid division by zero
+    spectral_cos_sim = spectral_cos_sim / spectral_mask_count
+
+    # 3. Full 2D+spectral visualization
+    # Reshape mask to [spectral, spatial_h, spatial_w]
+    mask_grid = mask_np.reshape(num_spectral, spatial_side, spatial_side)
+
+    # Reshape cosine similarity to same shape, but handle zeros properly
+    cos_sim_grid = np.zeros((num_spectral, spatial_side, spatial_side))
+
+    for s in range(num_spectral):
+        for h in range(spatial_side):
+            for w in range(spatial_side):
+                idx = s * num_spatial + h * spatial_side + w
+                if mask_np[idx] > 0.5:
+                    cos_sim_grid[s, h, w] = cos_sim[idx]
+
+    # Create custom colormap: black for unmasked, blue-to-red for reconstruction quality
+    colors = [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0), (1, 1, 0), (1, 0, 0)]
+    positions = [0, 0.001, 0.25, 0.5, 0.75, 1.0]
+    cmap = LinearSegmentedColormap.from_list("recon_cmap", list(zip(positions, colors)))
+
+    # Create layout:
+    # - Top: 20×20 spatial reconstruction quality
+    # - Middle: 6 spectral chunks × 20×20 spatial grid
+    # - Bottom: Bar chart of spectral chunk quality
+
+    fig = plt.figure(figsize=(15, 10))
+
+    # Top plot: Spatial reconstruction quality
+    ax1 = plt.subplot2grid((2, 3), (0, 0), colspan=2)
+    im1 = ax1.imshow(spatial_cos_sim_grid, cmap='viridis', vmin=0, vmax=1)
+    ax1.set_title("Spatial Reconstruction Quality (Cosine Similarity)")
+    plt.colorbar(im1, ax=ax1)
+
+    # Bottom-left plot: Spectral reconstruction quality
+    ax2 = plt.subplot2grid((2, 3), (1, 0))
+    bars = ax2.bar(range(num_spectral), spectral_cos_sim)
+    ax2.set_xlabel("Spectral Chunk")
+    ax2.set_ylabel("Avg. Cosine Similarity")
+    ax2.set_title("Spectral Reconstruction Quality")
+    ax2.set_ylim(0, 1)
+
+    # Add specific colors to the bars based on quality
+    for i, bar in enumerate(bars):
+        bar.set_color(plt.cm.viridis(spectral_cos_sim[i]))
+
+    # Bottom-middle: Show embedding T-SNE
+    ax3 = plt.subplot2grid((2, 3), (1, 1))
+
+    # Only consider masked tokens for T-SNE
+    masked_indices = np.where(mask_np > 0.5)[0]
+
+    if len(masked_indices) > 500:  # Limit to 500 points for T-SNE efficiency
+        np.random.seed(42)
+        masked_indices = np.random.choice(masked_indices, 500, replace=False)
+
+    if len(masked_indices) > 0:
+        # Combine original and predicted for T-SNE
+        orig_masked = orig[masked_indices].numpy()
+        pred_masked = pred[masked_indices].numpy()
+        combined = np.vstack([orig_masked, pred_masked])
+
+        # Compute T-SNE
+        try:
+            tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(masked_indices) - 1))
+            result = tsne.fit_transform(combined)
+
+            # Split results
+            orig_tsne = result[:len(masked_indices)]
+            pred_tsne = result[len(masked_indices):]
+
+            # Plot with lines connecting original and predicted
+            ax3.scatter(orig_tsne[:, 0], orig_tsne[:, 1], c='blue', alpha=0.5, label='Original')
+            ax3.scatter(pred_tsne[:, 0], pred_tsne[:, 1], c='red', alpha=0.5, label='Predicted')
+
+            # Draw lines connecting pairs
+            for i in range(len(masked_indices)):
+                ax3.plot(
+                    [orig_tsne[i, 0], pred_tsne[i, 0]],
+                    [orig_tsne[i, 1], pred_tsne[i, 1]],
+                    'k-', alpha=0.1
+                )
+
+            ax3.legend()
+            ax3.set_title("Token Embedding T-SNE")
+        except Exception as e:
+            ax3.text(0.5, 0.5, f"T-SNE error: {str(e)}", ha='center', va='center', transform=ax3.transAxes)
+    else:
+        ax3.text(0.5, 0.5, "No masked tokens", ha='center', va='center', transform=ax3.transAxes)
+
+    # Bottom-right: Show full spectral-spatial grid
+    ax4 = plt.subplot2grid((2, 3), (0, 2), rowspan=2)
+
+    # Create a grid that combines all spectral chunks
+    full_grid = np.zeros((spatial_side * num_spectral, spatial_side))
+
+    for s in range(num_spectral):
+        full_grid[s * spatial_side:(s + 1) * spatial_side, :] = cos_sim_grid[s]
+
+    im4 = ax4.imshow(full_grid, cmap=cmap, vmin=0, vmax=1)
+    ax4.set_title("Full Spectral-Spatial Reconstruction Quality")
+
+    # Add spectral chunk labels
+    for s in range(num_spectral):
+        ax4.text(-2, s * spatial_side + spatial_side / 2, f"Chunk {s}", va='center', ha='right')
+
+    plt.colorbar(im4, ax=ax4)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    return fig
+
+
 if __name__ == "__main__":
     import os
     import sys

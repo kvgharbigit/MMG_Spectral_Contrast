@@ -21,6 +21,8 @@ from tqdm import tqdm
 import hydra.utils
 from datetime import datetime
 from pathlib import Path
+from sklearn.manifold import TSNE
+from matplotlib.colors import LinearSegmentedColormap
 
 
 # Import custom modules
@@ -900,6 +902,36 @@ def main(cfg: DictConfig):
                 # Log to MLflow if enabled
                 if cfg.logging.use_mlflow:
                     mlflow.log_artifact(embedding_viz_path, f"visualizations/epoch_{epoch}")
+
+                # Add patch reconstruction visualization
+                patch_viz_path = os.path.join(viz_dir, f'patch_reconstruction_epoch_{epoch}.png')
+                try:
+                    # Visualize patch reconstruction
+                    patch_fig = visualize_patch_reconstruction(
+                        original_tokens=val_output['original_tokens'],
+                        predicted_tokens=val_output['pred'],
+                        mask=val_output['mask'],
+                        thickness_mask=val_output['thickness_mask'],
+                        save_path=patch_viz_path
+                    )
+                    plt.close(patch_fig)
+
+                    # Log to TensorBoard
+                    patch_img = plt.imread(patch_viz_path)
+                    if patch_img.shape[2] == 4:  # RGBA image with alpha channel
+                        patch_img = patch_img[:, :, :3]  # Remove alpha channel
+
+                    # TensorBoard expects images in [C, H, W] format
+                    patch_img = np.transpose(patch_img, (2, 0, 1))
+                    writer.add_image(f"PatchReconstruction/epoch_{epoch}", patch_img, epoch, dataformats='CHW')
+
+                    # Log to MLflow if enabled
+                    if cfg.logging.use_mlflow:
+                        mlflow.log_artifact(patch_viz_path, f"visualizations/patch_reconstruction_epoch_{epoch}")
+                except Exception as e:
+                    print(f"Error in patch reconstruction visualization: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             except Exception as e:
                 print(f"Error in embedding space visualization: {e}")
