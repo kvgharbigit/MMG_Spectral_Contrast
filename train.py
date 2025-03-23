@@ -5,6 +5,7 @@ from visualisation import visualize_embedding_space_loss
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 import sys
 import time
+import torch.nn.functional as F
 import glob
 import torch
 import numpy as np
@@ -105,8 +106,7 @@ def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, bas
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-
-def calculate_metrics(outputs, optimizer=None):
+def calculate_metrics(outputs, embedding_metrics_list=None, optimizer=None):
     """Calculate aggregate metrics from a list of model outputs."""
     metrics = {
         'loss': 0.0,
@@ -114,6 +114,13 @@ def calculate_metrics(outputs, optimizer=None):
         'loss_contrast': 0.0,
         'num_modalities': 0.0,
     }
+
+    # Add embedding metrics if available
+    if embedding_metrics_list and len(embedding_metrics_list) > 0:
+        # Initialize embedding metrics
+        metrics['mean_embedding_distance'] = 0.0
+        metrics['mean_cosine_similarity'] = 0.0
+        metrics['mean_token_mse'] = 0.0
 
     # Add current learning rate if optimizer is provided
     if optimizer is not None:
@@ -132,10 +139,25 @@ def calculate_metrics(outputs, optimizer=None):
         metrics['loss_contrast'] += output['loss_contrast'].item()
         metrics['num_modalities'] += output['num_modalities'].item()
 
-    # Calculate the average for each metric (except learning_rate)
-    for key in metrics:
-        if key != 'learning_rate':
-            metrics[key] /= batch_count
+    # Process embedding metrics if available
+    if embedding_metrics_list and len(embedding_metrics_list) > 0:
+        embed_count = len(embedding_metrics_list)
+        for embed_metrics in embedding_metrics_list:
+            if 'mean_embedding_distance' in embed_metrics:
+                metrics['mean_embedding_distance'] += embed_metrics['mean_embedding_distance']
+            if 'mean_cosine_similarity' in embed_metrics:
+                metrics['mean_cosine_similarity'] += embed_metrics['mean_cosine_similarity']
+            if 'mean_token_mse' in embed_metrics:
+                metrics['mean_token_mse'] += embed_metrics['mean_token_mse']
+
+        # Calculate averages for embedding metrics
+        metrics['mean_embedding_distance'] /= embed_count
+        metrics['mean_cosine_similarity'] /= embed_count
+        metrics['mean_token_mse'] /= embed_count
+
+    # Calculate the average for normal metrics
+    for key in ['loss', 'loss_recon', 'loss_contrast', 'num_modalities']:
+        metrics[key] /= batch_count
 
     return metrics
 
@@ -227,6 +249,77 @@ def save_metrics_to_csv(metrics_dict, output_dir, epoch, split='train'):
     # Save to CSV
     metrics_df.to_csv(csv_path, index=False)
 
+
+def calculate_embedding_metrics(pred_embeddings, target_embeddings, mask):
+    """
+    Calculate metrics to evaluate embedding space reconstruction quality.
+
+    Args:
+        pred_embeddings (torch.Tensor): Predicted embeddings [B, L, D]
+        target_embeddings (torch.Tensor): Target embeddings [B, L, D]
+        mask (torch.Tensor): Binary mask (1=masked, 0=visible) [B, L]
+
+    Returns:
+        dict: Dictionary of embedding metrics
+    """
+    # Move tensors to CPU for calculation
+    pred = pred_embeddings.detach().cpu()
+    target = target_embeddings.detach().cpu()
+    mask_cpu = mask.detach().cpu()
+
+    # Get masked tokens only
+    batch_size = pred.shape[0]
+    metrics = {}
+
+    # Calculate metrics across the batch
+    for b in range(batch_size):
+        # Get masked indices for this batch item
+        masked_indices = torch.where(mask_cpu[b] > 0.5)[0]
+
+        if len(masked_indices) == 0:
+            continue
+
+        # Get embeddings for masked tokens
+        pred_masked = pred[b, masked_indices]
+        target_masked = target[b, masked_indices]
+
+        # 1. Mean Euclidean Distance
+        distances = torch.norm(pred_masked - target_masked, dim=1)
+        batch_mean_dist = distances.mean().item()
+
+        # 2. Cosine Similarity
+        # Normalize embeddings for cosine similarity
+        pred_norm = F.normalize(pred_masked, p=2, dim=1)
+        target_norm = F.normalize(target_masked, p=2, dim=1)
+
+        # Calculate pairwise cosine similarity
+        similarities = torch.sum(pred_norm * target_norm, dim=1)
+        batch_cos_sim = similarities.mean().item()
+
+        # 3. Token-wise MSE
+        batch_token_mse = ((pred_masked - target_masked) ** 2).mean(dim=1).mean().item()
+
+        # Store batch metrics
+        if 'mean_embedding_distance' not in metrics:
+            metrics['mean_embedding_distance'] = []
+            metrics['mean_cosine_similarity'] = []
+            metrics['mean_token_mse'] = []
+
+        metrics['mean_embedding_distance'].append(batch_mean_dist)
+        metrics['mean_cosine_similarity'].append(batch_cos_sim)
+        metrics['mean_token_mse'].append(batch_token_mse)
+
+    # Calculate global averages
+    if metrics:
+        for key in metrics:
+            metrics[key] = sum(metrics[key]) / len(metrics[key])
+    else:
+        # Default values if no valid metrics were calculated
+        metrics['mean_embedding_distance'] = 0.0
+        metrics['mean_cosine_similarity'] = 0.0
+        metrics['mean_token_mse'] = 0.0
+
+    return metrics
 
 def update_best_metrics(val_metrics, epoch, summaries_dir, current_lr=None):
     """
@@ -361,6 +454,7 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
     """Train the model for one epoch."""
     model.train()
     outputs = []
+    embedding_metrics_list = []  # Add this line
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:
@@ -384,6 +478,15 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         loss.backward()
         optimizer.step()
 
+        # Calculate embedding metrics - add this block
+        with torch.no_grad():
+            batch_embedding_metrics = calculate_embedding_metrics(
+                output['pred'],
+                output['original_tokens'],
+                output['mask']
+            )
+            embedding_metrics_list.append(batch_embedding_metrics)
+
         # Get current learning rate for progress bar
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -398,24 +501,16 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         # Store outputs
         outputs.append(output)
 
-    return outputs
+    return outputs, embedding_metrics_list  # Update this line to return both
 
 
 def validate_epoch(model, dataloader, device, contrastive_mode=None):
     """
     Validate the model on the validation set.
-
-    Args:
-        model: The model to validate
-        dataloader: DataLoader for validation data
-        device: Device to validate on
-        contrastive_mode: Contrastive mode to use (if None, use model's default)
-
-    Returns:
-        List of outputs from each batch
     """
     model.eval()
     outputs = []
+    embedding_metrics_list = []  # Add this line
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:
@@ -434,6 +529,14 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             # Forward pass
             output = model(hsi, aux_data, batch_idx)
 
+            # Calculate embedding metrics - add this block
+            batch_embedding_metrics = calculate_embedding_metrics(
+                output['pred'],
+                output['original_tokens'],
+                output['mask']
+            )
+            embedding_metrics_list.append(batch_embedding_metrics)
+
             # Update progress bar with more decimal places
             pbar.set_postfix({
                 'loss': f"{output['loss'].item():.10f}",
@@ -444,7 +547,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             # Store outputs
             outputs.append(output)
 
-    return outputs
+    return outputs, embedding_metrics_list  # Update this line to return both
 
 def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False):
     """
@@ -703,26 +806,24 @@ def main(cfg: DictConfig):
     # Training loop
     print(f"Starting training for {cfg.training.epochs} epochs")
 
-    # In your main training loop
+    # Training loop
     for epoch in range(start_epoch, cfg.training.epochs):
         print(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
         epoch_start_time = time.time()
 
         # Training phase
-        train_outputs = train_epoch(
+        train_outputs, train_embedding_metrics = train_epoch(
             model, train_loader, optimizer, device,
             contrastive_mode=cfg.model.contrastive_mode
         )
-        train_metrics = calculate_metrics(train_outputs, optimizer)  # Now passing optimizer
+        train_metrics = calculate_metrics(train_outputs, train_embedding_metrics, optimizer)
 
         # Validation phase
-        val_outputs = validate_epoch(
+        val_outputs, val_embedding_metrics = validate_epoch(
             model, val_loader, device,
             contrastive_mode=cfg.model.contrastive_mode
         )
-        val_metrics = calculate_metrics(val_outputs, optimizer)  # Also pass optimizer here
-
-
+        val_metrics = calculate_metrics(val_outputs, val_embedding_metrics)
 
         # Update learning rate scheduler - only for epoch-based schedulers
         if scheduler is not None and scheduler_step_frequency == "epoch":
@@ -731,14 +832,14 @@ def main(cfg: DictConfig):
             else:
                 scheduler.step()
 
-
-
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
 
-        # Update the print statement to include learning rate
+        # Print metrics summary including the new embedding metrics
         print(f"Train Loss: {train_metrics['loss']:.10f}, "
               f"Val Loss: {val_metrics['loss']:.10f}, "
+              f"Embed Dist: {val_metrics['mean_embedding_distance']:.6f}, "
+              f"Cos Sim: {val_metrics['mean_cosine_similarity']:.6f}, "
               f"LR: {train_metrics.get('learning_rate', 0):.8f}, "
               f"Time: {epoch_time:.2f}s")
 
