@@ -2,7 +2,10 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb
-
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from hsi_to_rgb import simple_hsi_to_rgb
 
 def visualize_patient_data(patient_data, save_dir='visualizations', show=True):
     """
@@ -653,6 +656,123 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
     return fig
+
+
+def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
+                                   thickness_mask=None, save_path=None):
+    """
+    Visualize the reconstruction quality in pixel space.
+
+    Args:
+        model: The MultiModalSpectralGPT model
+        original_input: Original input of shape [B, C, T, H, W]
+        pred_embeddings: Predicted embeddings from decoder of shape [B, L, D]
+        mask: Binary mask indicating which tokens were masked
+        thickness_mask: Mask indicating valid regions (optional)
+        save_path: Path to save the visualization (optional)
+
+    Returns:
+        matplotlib.figure.Figure: The created figure
+    """
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from hsi_to_rgb import simple_hsi_to_rgb
+
+    # Use only the first batch item for visualization
+    orig_input = original_input[0].detach().cpu()
+
+    # Generate the pixel-level reconstruction
+    with torch.no_grad():
+        # Convert to device for model processing
+        pred_device = pred_embeddings.to(model.pixel_projection.weight.device)
+        reconstructed = model.unpatchify(pred_device, original_input.shape)
+        reconstructed = reconstructed[0].detach().cpu()
+
+    # Convert token mask to pixel mask
+    pixel_mask = model.token_mask_to_pixel_mask(mask, original_input.shape)[0].detach().cpu()
+
+    # Convert to RGB for visualization
+    orig_rgb = simple_hsi_to_rgb(orig_input.unsqueeze(0))[0]
+    recon_rgb = simple_hsi_to_rgb(reconstructed.unsqueeze(0))[0]
+
+    # Convert to numpy and properly reshape
+    orig_rgb_np = orig_rgb.permute(1, 2, 0).numpy()
+    recon_rgb_np = recon_rgb.permute(1, 2, 0).numpy()
+
+    # Create error map between original and reconstruction (masked regions only)
+    # Take mean across all bands
+    error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1)).numpy()
+
+    # Prepare the visualization
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+    # First row: Original, Reconstruction, Error Map
+    axes[0, 0].imshow(orig_rgb_np)
+    axes[0, 0].set_title("Original Input (RGB)")
+    axes[0, 0].axis('off')
+
+    axes[0, 1].imshow(recon_rgb_np)
+    axes[0, 1].set_title("Reconstructed (RGB)")
+    axes[0, 1].axis('off')
+
+    # Error map
+    error_img = axes[0, 2].imshow(error_map, cmap='hot')
+    plt.colorbar(error_img, ax=axes[0, 2])
+    axes[0, 2].set_title("Reconstruction Error (MSE)")
+    axes[0, 2].axis('off')
+
+    # Second row: masks and masked error
+
+    # Show pixel mask
+    pixel_mask_vis = pixel_mask.mean(dim=(0, 1)).numpy()
+    axes[1, 0].imshow(pixel_mask_vis, cmap='gray')
+    axes[1, 0].set_title("MAE Mask (White = Masked)")
+    axes[1, 0].axis('off')
+
+    # Show thickness mask if available
+    if thickness_mask is not None:
+        thick_mask = thickness_mask[0, 0].detach().cpu().numpy()
+        axes[1, 1].imshow(thick_mask, cmap='gray')
+        axes[1, 1].set_title("Thickness Mask (White = Valid)")
+        axes[1, 1].axis('off')
+
+        # Show masked error (error only in masked & valid regions)
+        # Combine pixel mask with thickness mask
+        combined_mask = pixel_mask_vis * thick_mask
+        masked_error = error_map * combined_mask
+        masked_error_img = axes[1, 2].imshow(masked_error, cmap='hot')
+        plt.colorbar(masked_error_img, ax=axes[1, 2])
+        axes[1, 2].set_title("Error in Masked & Valid Regions")
+        axes[1, 2].axis('off')
+    else:
+        # If no thickness mask, just show masked error
+        masked_error = error_map * pixel_mask_vis
+        masked_error_img = axes[1, 1].imshow(masked_error, cmap='hot')
+        plt.colorbar(masked_error_img, ax=axes[1, 1])
+        axes[1, 1].set_title("Error in Masked Regions")
+        axes[1, 1].axis('off')
+
+        # Show spectral profile for a sample point
+        mid_h, mid_w = error_map.shape[0] // 2, error_map.shape[1] // 2
+        orig_spectrum = orig_input[:, :, mid_h, mid_w].numpy()
+        recon_spectrum = reconstructed[:, :, mid_h, mid_w].numpy()
+
+        # Plot spectral profile
+        axes[1, 2].plot(orig_spectrum, 'b-', label='Original')
+        axes[1, 2].plot(recon_spectrum, 'r-', label='Reconstructed')
+        axes[1, 2].set_title(f"Spectral Profile at ({mid_h}, {mid_w})")
+        axes[1, 2].set_xlabel("Spectral Band")
+        axes[1, 2].set_ylabel("Value")
+        axes[1, 2].legend()
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    return fig
+
 
 
 if __name__ == "__main__":

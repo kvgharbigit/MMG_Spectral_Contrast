@@ -30,7 +30,11 @@ from MultiModalSpectralGPT import MultiModalSpectralGPT
 from dataset import PatientDataset, custom_collate_fn, create_patient_dataloader
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb  # These are already imported elsewhere
 from dataset import MultiModalTransforms
-from visualisation import visualize_patch_reconstruction
+from visualisation import (
+    visualize_embedding_space_loss,
+    visualize_patch_reconstruction,
+    visualize_pixel_reconstruction  # Add this line
+)
 
 import matplotlib.cm as cm
 
@@ -930,6 +934,37 @@ def main(cfg: DictConfig):
                         mlflow.log_artifact(patch_viz_path, f"visualizations/patch_reconstruction_epoch_{epoch}")
                 except Exception as e:
                     print(f"Error in patch reconstruction visualization: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Add pixel-level reconstruction visualization
+                pixel_viz_path = os.path.join(viz_dir, f'pixel_reconstruction_epoch_{epoch}.png')
+                try:
+                    # Visualize pixel-level reconstruction
+                    pixel_fig = visualize_pixel_reconstruction(
+                        model=model,
+                        original_input=val_output['original_input'],
+                        pred_embeddings=val_output['pred'],
+                        mask=val_output['mask'],
+                        thickness_mask=val_output['thickness_mask'],
+                        save_path=pixel_viz_path
+                    )
+                    plt.close(pixel_fig)
+
+                    # Log to TensorBoard
+                    pixel_img = plt.imread(pixel_viz_path)
+                    if pixel_img.shape[2] == 4:  # RGBA image with alpha channel
+                        pixel_img = pixel_img[:, :, :3]  # Remove alpha channel
+
+                    # TensorBoard expects images in [C, H, W] format
+                    pixel_img = np.transpose(pixel_img, (2, 0, 1))
+                    writer.add_image(f"PixelReconstruction/epoch_{epoch}", pixel_img, epoch, dataformats='CHW')
+
+                    # Log to MLflow if enabled
+                    if cfg.logging.use_mlflow:
+                        mlflow.log_artifact(pixel_viz_path, f"visualizations/pixel_reconstruction_epoch_{epoch}")
+                except Exception as e:
+                    print(f"Error in pixel reconstruction visualization: {e}")
                     import traceback
                     traceback.print_exc()
 
