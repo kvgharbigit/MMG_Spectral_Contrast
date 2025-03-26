@@ -661,18 +661,7 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
 def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
                                    thickness_mask=None, save_path=None):
     """
-    Visualize the reconstruction quality in pixel space.
-
-    Args:
-        model: The MultiModalSpectralGPT model
-        original_input: Original input of shape [B, C, T, H, W]
-        pred_embeddings: Predicted embeddings from decoder of shape [B, L, D]
-        mask: Binary mask indicating which tokens were masked
-        thickness_mask: Mask indicating valid regions (optional)
-        save_path: Path to save the visualization (optional)
-
-    Returns:
-        matplotlib.figure.Figure: The created figure
+    Visualize the reconstruction quality in pixel space using simple_hsi_to_rgb.
     """
     import torch
     import numpy as np
@@ -692,22 +681,63 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
     # Convert token mask to pixel mask
     pixel_mask = model.token_mask_to_pixel_mask(mask, original_input.shape)[0].detach().cpu()
 
-    # Convert to RGB for visualization
-    orig_rgb = simple_hsi_to_rgb(orig_input.unsqueeze(0))[0]
-    recon_rgb = simple_hsi_to_rgb(reconstructed.unsqueeze(0))[0]
+    # Print shapes for debugging
+    print(f"Original input shape: {orig_input.shape}")
+    print(f"Reconstructed shape: {reconstructed.shape}")
 
-    # Convert to numpy and properly reshape
-    orig_rgb_np = orig_rgb.permute(1, 2, 0).numpy()
-    recon_rgb_np = recon_rgb.permute(1, 2, 0).numpy()
+    # Handle the HSI to RGB conversion carefully
+    # Make sure input has proper shape for simple_hsi_to_rgb
+    # It expects input of shape [T, H, W] or [B, C, T, H, W]
 
-    # Create error map between original and reconstruction (masked regions only)
-    # Take mean across all bands
+    # Reshape if needed to [T, H, W]
+    if orig_input.shape[1] == 1:  # If [C, 1, T, H, W]
+        orig_input_hsi = orig_input[:, 0, :, :]  # Now [T, H, W]
+        recon_input_hsi = reconstructed[:, 0, :, :]
+    else:
+        # Keep as is if already in correct format
+        orig_input_hsi = orig_input
+        recon_input_hsi = reconstructed
+
+    # Convert to RGB using simple_hsi_to_rgb
+    try:
+        # Use unsqueeze to add batch dimension if needed
+        orig_rgb = simple_hsi_to_rgb(orig_input_hsi.unsqueeze(0) if orig_input_hsi.dim() == 3 else orig_input_hsi)
+        recon_rgb = simple_hsi_to_rgb(recon_input_hsi.unsqueeze(0) if recon_input_hsi.dim() == 3 else recon_input_hsi)
+
+        # Remove batch dimension if present
+        if orig_rgb.dim() == 4 and orig_rgb.shape[0] == 1:
+            orig_rgb = orig_rgb[0]
+        if recon_rgb.dim() == 4 and recon_rgb.shape[0] == 1:
+            recon_rgb = recon_rgb[0]
+
+        # Convert to numpy and proper format for matplotlib (H, W, 3)
+        if orig_rgb.shape[0] == 3:  # If [3, H, W]
+            orig_rgb_np = orig_rgb.permute(1, 2, 0).numpy()
+            recon_rgb_np = recon_rgb.permute(1, 2, 0).numpy()
+        else:
+            # Handle unexpected shape
+            print(f"Unexpected RGB shape from simple_hsi_to_rgb: {orig_rgb.shape}")
+            # Create placeholder
+            orig_rgb_np = np.zeros((orig_input.shape[2], orig_input.shape[3], 3))
+            recon_rgb_np = np.zeros((reconstructed.shape[2], reconstructed.shape[3], 3))
+    except Exception as e:
+        print(f"Error in RGB conversion: {e}")
+        # Fallback to using individual bands for visualization
+        mid_band = orig_input.shape[0] // 2
+        orig_rgb_np = np.stack([orig_input[mid_band, 0].numpy()] * 3, axis=-1)
+        recon_rgb_np = np.stack([reconstructed[mid_band, 0].numpy()] * 3, axis=-1)
+
+    # Clip values to valid range
+    orig_rgb_np = np.clip(orig_rgb_np, 0, 1)
+    recon_rgb_np = np.clip(recon_rgb_np, 0, 1)
+
+    # Create error map between original and reconstruction
     error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1)).numpy()
 
     # Prepare the visualization
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 
-    # First row: Original, Reconstruction, Error Map
+    # First row: Original RGB, Reconstructed RGB, Error Map
     axes[0, 0].imshow(orig_rgb_np)
     axes[0, 0].set_title("Original Input (RGB)")
     axes[0, 0].axis('off')
@@ -730,41 +760,55 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
     axes[1, 0].set_title("MAE Mask (White = Masked)")
     axes[1, 0].axis('off')
 
-    # Show thickness mask if available
-    if thickness_mask is not None:
-        thick_mask = thickness_mask[0, 0].detach().cpu().numpy()
-        axes[1, 1].imshow(thick_mask, cmap='gray')
-        axes[1, 1].set_title("Thickness Mask (White = Valid)")
-        axes[1, 1].axis('off')
+    # Show masked error (error only in masked regions)
+    masked_error = error_map * pixel_mask_vis
+    masked_error_img = axes[1, 1].imshow(masked_error, cmap='hot')
+    plt.colorbar(masked_error_img, ax=axes[1, 1])
+    axes[1, 1].set_title("Error in Masked Regions")
+    axes[1, 1].axis('off')
 
-        # Show masked error (error only in masked & valid regions)
-        # Combine pixel mask with thickness mask
-        combined_mask = pixel_mask_vis * thick_mask
-        masked_error = error_map * combined_mask
-        masked_error_img = axes[1, 2].imshow(masked_error, cmap='hot')
-        plt.colorbar(masked_error_img, ax=axes[1, 2])
-        axes[1, 2].set_title("Error in Masked & Valid Regions")
-        axes[1, 2].axis('off')
+    # Show spectral profile for a sample point
+    mid_h, mid_w = error_map.shape[0] // 2, error_map.shape[1] // 2
+
+    # Extract spectral profile based on input dimensions
+    if len(orig_input.shape) == 4 and orig_input.shape[1] == 1:  # [C, 1, H, W]
+        # If the shape is [channels, 1, height, width]
+        orig_spectrum = orig_input[:, 0, mid_h, mid_w].numpy()
+        recon_spectrum = reconstructed[:, 0, mid_h, mid_w].numpy()
+    elif len(orig_input.shape) == 3:  # [T, H, W]
+        orig_spectrum = orig_input[:, mid_h, mid_w].numpy()
+        recon_spectrum = reconstructed[:, mid_h, mid_w].numpy()
     else:
-        # If no thickness mask, just show masked error
-        masked_error = error_map * pixel_mask_vis
-        masked_error_img = axes[1, 1].imshow(masked_error, cmap='hot')
-        plt.colorbar(masked_error_img, ax=axes[1, 1])
-        axes[1, 1].set_title("Error in Masked Regions")
-        axes[1, 1].axis('off')
+        try:
+            # Try to handle other formats
+            if len(orig_input.shape) >= 4:
+                # For [B, C, T, H, W] or similar, take first indices of batch and channel
+                idx = [0] * (len(orig_input.shape) - 3)
+                idx.extend([slice(None), mid_h, mid_w])
+                orig_spectrum = orig_input[tuple(idx)].numpy()
+                recon_spectrum = reconstructed[tuple(idx)].numpy()
+            else:
+                raise ValueError(f"Unsupported tensor shape: {orig_input.shape}")
+        except Exception as e:
+            print(f"Error extracting spectrum: {e}")
+            # Create dummy data
+            orig_spectrum = np.zeros(30)
+            recon_spectrum = np.zeros(30)
 
-        # Show spectral profile for a sample point
-        mid_h, mid_w = error_map.shape[0] // 2, error_map.shape[1] // 2
-        orig_spectrum = orig_input[:, :, mid_h, mid_w].numpy()
-        recon_spectrum = reconstructed[:, :, mid_h, mid_w].numpy()
+    # Print for debugging
+    print(f"Spectral profile shapes - Original: {orig_spectrum.shape}, Reconstructed: {recon_spectrum.shape}")
 
-        # Plot spectral profile
+    # Plot spectral profile if data is available
+    if orig_spectrum.size > 0 and recon_spectrum.size > 0:
         axes[1, 2].plot(orig_spectrum, 'b-', label='Original')
         axes[1, 2].plot(recon_spectrum, 'r-', label='Reconstructed')
         axes[1, 2].set_title(f"Spectral Profile at ({mid_h}, {mid_w})")
         axes[1, 2].set_xlabel("Spectral Band")
         axes[1, 2].set_ylabel("Value")
         axes[1, 2].legend()
+    else:
+        axes[1, 2].text(0.5, 0.5, "Could not extract spectral profile",
+                        ha='center', va='center', transform=axes[1, 2].transAxes)
 
     plt.tight_layout()
 
