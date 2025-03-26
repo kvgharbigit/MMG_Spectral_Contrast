@@ -584,7 +584,7 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         outputs.append(output)
 
         # Periodic memory cleanup (every 5 batches)
-        if batch_idx % 5 == 0:
+        if batch_idx[0].item() % 5 == 0:
             # Print memory stats
             allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
             reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
@@ -645,7 +645,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             outputs.append(output)
 
             # Periodic memory cleanup (every 5 batches)
-            if batch_idx % 5 == 0:
+            if batch_idx[0].item() % 5 == 0:
                 # Print memory stats
                 allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
                 max_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
