@@ -16,7 +16,7 @@ in_chans: 1
 aux_chans: 1
 aux_embed_dim: 256
 temperature: 0.07
-mask_ratio: 0.50
+mask_ratio: 0.75
 
 # Contrastive learning mode: 'global' or 'spatial'
 contrastive_mode: global

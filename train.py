@@ -613,7 +613,7 @@ def main(cfg: DictConfig):
 
     # Run it
     if torch.cuda.is_available():
-        reserve_gpu_memory(device_id=0, target_gb=10.5)
+        reserve_gpu_memory(device_id=0, target_gb=15)
 
     # Create output directory
     output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
