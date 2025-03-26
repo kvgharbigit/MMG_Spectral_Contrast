@@ -333,6 +333,13 @@ class MultiModalSpectralGPT(nn.Module):
         # Initialize positional embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
 
+        # Create projection layer from embedding to pixel space
+        patch_pixels = patch_size[0] * patch_size[1] * t_patch_size * in_chans
+        self.pixel_projection = nn.Linear(embed_dim, patch_pixels)
+        # Initialize weights
+        nn.init.xavier_uniform_(self.pixel_projection.weight)
+        nn.init.zeros_(self.pixel_projection.bias)
+
         # Initialize weights
         self.initialize_weights()
 
@@ -898,16 +905,9 @@ class MultiModalSpectralGPT(nn.Module):
             B, L, D = embeddings.shape
             embeddings = embeddings.reshape(B, self.spectral_patches, self.spatial_patches, D)
 
-        # Create a projection layer from embedding space to patch space if it doesn't exist
-        if not hasattr(self, 'pixel_projection'):
-            # This projection maps from embedding dimension to patch pixels
-            # Each patch has patch_h * patch_w * t_patch * C pixels
-            patch_pixels = patch_h * patch_w * t_patch * C
-            self.pixel_projection = nn.Linear(self.embed_dim, patch_pixels).to(embeddings.device)
-
-            # Initialize weights
-            nn.init.xavier_uniform_(self.pixel_projection.weight)
-            nn.init.zeros_(self.pixel_projection.bias)
+        # Ensure the pixel projection is on the same device as the embeddings
+        if self.pixel_projection.weight.device != embeddings.device:
+            self.pixel_projection = self.pixel_projection.to(embeddings.device)
 
         # Project from embedding space to patch space
         B, S, P, D = embeddings.shape
