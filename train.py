@@ -52,7 +52,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 _MEMORY_RESERVED = False
 
 # Reserve GPU memory by allocating a large dummy tensor
-def reserve_gpu_memory(device_id=0, target_gb=20):
+def reserve_gpu_memory(device_id=0, target_gb=22):
     """Allocates memory to effectively reserve the GPU."""
     global _MEMORY_RESERVED
 
