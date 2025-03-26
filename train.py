@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 from sklearn.manifold import TSNE
 from matplotlib.colors import LinearSegmentedColormap
+import gc
 
 
 # Import custom modules
@@ -534,7 +535,8 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
     """Train the model for one epoch."""
     model.train()
     outputs = []
-    embedding_metrics_list = []  # Add this line
+    embedding_metrics_list = []
+
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:
@@ -543,7 +545,7 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
     # Create progress bar
     pbar = tqdm(dataloader, desc="Training")
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         # Move data to device
         hsi = batch['hsi'].to(device)
         aux_data = {k: v.to(device) if v is not None else None for k, v in batch['aux_data'].items()}
@@ -558,7 +560,7 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         loss.backward()
         optimizer.step()
 
-        # Calculate embedding metrics - add this block
+        # Calculate embedding metrics
         with torch.no_grad():
             batch_embedding_metrics = calculate_embedding_metrics(
                 output['pred'],
@@ -570,27 +572,42 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         # Get current learning rate for progress bar
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Update progress bar with more decimal places
+        # Update progress bar
         pbar.set_postfix({
             'loss': f"{loss.item():.10f}",
             'recon_loss': f"{output['loss_recon'].item():.10f}",
             'contrast_loss': f"{output['loss_contrast'].item():.10f}",
-            'lr': f"{current_lr}\n"  # Add a newline character after the learning rate
+            'lr': f"{current_lr}\n"
         })
 
         # Store outputs
         outputs.append(output)
 
-    return outputs, embedding_metrics_list  # Update this line to return both
+        # Periodic memory cleanup (every 5 batches)
+        if batch_idx % 5 == 0:
+            # Print memory stats
+            allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+            reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+            max_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+
+            print(
+                f"\nMemory stats - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Peak: {max_allocated:.2f}GB")
+
+            # Clear cache if we're approaching peak memory usage
+            if allocated > 0.8 * max_allocated and max_allocated > 8.0:  # If using >80% of peak and peak is significant
+                print("Clearing CUDA cache and collecting garbage...")
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    return outputs, embedding_metrics_list
 
 
 def validate_epoch(model, dataloader, device, contrastive_mode=None):
-    """
-    Validate the model on the validation set.
-    """
+    """Validate the model on the validation set."""
     model.eval()
     outputs = []
-    embedding_metrics_list = []  # Add this line
+    embedding_metrics_list = []
+
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:
@@ -600,7 +617,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
     pbar = tqdm(dataloader, desc="Validation")
 
     with torch.no_grad():
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             # Move data to device
             hsi = batch['hsi'].to(device)
             aux_data = {k: v.to(device) if v is not None else None for k, v in batch['aux_data'].items()}
@@ -609,7 +626,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             # Forward pass
             output = model(hsi, aux_data, batch_idx)
 
-            # Calculate embedding metrics - add this block
+            # Calculate embedding metrics
             batch_embedding_metrics = calculate_embedding_metrics(
                 output['pred'],
                 output['original_tokens'],
@@ -617,7 +634,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             )
             embedding_metrics_list.append(batch_embedding_metrics)
 
-            # Update progress bar with more decimal places
+            # Update progress bar
             pbar.set_postfix({
                 'loss': f"{output['loss'].item():.10f}",
                 'recon_loss': f"{output['loss_recon'].item():.10f}",
@@ -627,7 +644,19 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             # Store outputs
             outputs.append(output)
 
-    return outputs, embedding_metrics_list  # Update this line to return both
+            # Periodic memory cleanup (every 5 batches)
+            if batch_idx % 5 == 0:
+                # Print memory stats
+                allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                max_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+
+                # Clear cache if we're using a lot of memory
+                if allocated > 9.0 or (allocated > 0.8 * max_allocated and max_allocated > 8.0):
+                    print(f"\nClearing CUDA cache (current: {allocated:.2f}GB)...")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+    return outputs, embedding_metrics_list
 
 def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False):
     """
@@ -890,6 +919,10 @@ def main(cfg: DictConfig):
     for epoch in range(start_epoch, cfg.training.epochs):
         print(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
         epoch_start_time = time.time()
+
+        # Clear memory before each epoch
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # Training phase
         train_outputs, train_embedding_metrics = train_epoch(
