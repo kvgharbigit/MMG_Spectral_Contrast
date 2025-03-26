@@ -48,39 +48,113 @@ import os
 # Optional: only necessary if you want to lock to GPU 0
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-# Add a global flag to track memory reservation status
+# Global variables to track memory reservation status and store tensors
 _MEMORY_RESERVED = False
+_RESERVED_TENSORS = []
 
-# Reserve GPU memory by allocating a large dummy tensor
-def reserve_gpu_memory(device_id=0, target_gb=22):
-    """Allocates memory to effectively reserve the GPU."""
-    global _MEMORY_RESERVED
+
+def reserve_gpu_memory(device_id=0, target_gb=20, chunk_size_mb=512):
+    """
+    Allocates memory to effectively reserve the GPU.
+
+    Args:
+        device_id (int): CUDA device ID to use
+        target_gb (float): Target amount of memory to reserve in GB
+        chunk_size_mb (int): Size of individual memory chunks to allocate in MB
+
+    Returns:
+        float: Amount of memory actually reserved in GB, or 0 if reservation failed
+    """
+    global _MEMORY_RESERVED, _RESERVED_TENSORS
 
     # If memory is already reserved, skip allocation
     if _MEMORY_RESERVED:
-        print("GPU memory already reserved. Skipping.")
-        return
+        print(f"GPU memory already reserved ({len(_RESERVED_TENSORS)} tensors). Skipping.")
+        # Calculate and return current allocation
+        if _RESERVED_TENSORS:
+            allocated = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
+            return allocated
+        return 0
+
+    # Clear any previous reservations (shouldn't happen, but as a safeguard)
+    _RESERVED_TENSORS.clear()
+
+    # Get available memory on GPU
+    torch.cuda.empty_cache()  # Clear any unused memory first
+    total_memory = torch.cuda.get_device_properties(device_id).total_memory / (1024 ** 3)
+    reserved_memory = torch.cuda.memory_reserved(device_id) / (1024 ** 3)
+    allocated_memory = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
+    available_memory = total_memory - allocated_memory
+
+    # Calculate safe target (don't try to allocate more than is available)
+    safe_target = min(target_gb, available_memory * 0.95)  # 95% of available to be safe
+    print(f"[GPU {device_id}] Total memory: {total_memory:.2f} GB")
+    print(f"[GPU {device_id}] Already allocated: {allocated_memory:.2f} GB")
+    print(f"[GPU {device_id}] Target allocation: {safe_target:.2f} GB")
 
     device = torch.device(f"cuda:{device_id}")
-    tensor_list = []
 
     try:
         # Try allocating chunks to fill up the GPU
-        chunk_size_mb = 512
         while True:
-            tensor = torch.empty((chunk_size_mb * 1024 * 1024 // 4,), dtype=torch.float32, device=device)
-            tensor_list.append(tensor)
-            allocated = torch.cuda.memory_allocated(device_id) / 1024 ** 3
-            print(f"[GPU {device_id}] Reserved ~{allocated:.2f} GB")
-            if allocated >= target_gb:
+            # Each float32 element is 4 bytes
+            tensor_size = chunk_size_mb * 1024 * 1024 // 4
+            tensor = torch.empty((tensor_size,), dtype=torch.float32, device=device)
+            _RESERVED_TENSORS.append(tensor)
+
+            # Check how much we've allocated so far
+            allocated = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
+            print(f"[GPU {device_id}] Reserved ~{allocated:.2f} GB with {len(_RESERVED_TENSORS)} tensors")
+
+            # Stop when we reach the target
+            if allocated >= safe_target:
                 break
 
-        # Set the flag to indicate memory has been reserved
-        _MEMORY_RESERVED = True
-        print("Memory reservation complete.")
     except RuntimeError as e:
         print(f"[!] Stopped allocating: {e}")
+        # If we hit an error but still allocated some tensors, consider it partially successful
+        if _RESERVED_TENSORS:
+            allocated = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
+            print(f"[GPU {device_id}] Partially reserved ~{allocated:.2f} GB")
+            _MEMORY_RESERVED = True
+            return allocated
+        return 0
 
+    # Calculate final allocation
+    final_allocated = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
+    print(f"[GPU {device_id}] Successfully reserved {final_allocated:.2f} GB with {len(_RESERVED_TENSORS)} tensors")
+
+    # Set the flag to indicate memory has been reserved
+    _MEMORY_RESERVED = True
+
+    return final_allocated
+
+
+def release_reserved_memory():
+    """
+    Release any memory that was reserved by reserve_gpu_memory.
+    """
+    global _MEMORY_RESERVED, _RESERVED_TENSORS
+
+    if not _MEMORY_RESERVED:
+        print("No GPU memory was reserved. Nothing to release.")
+        return
+
+    tensor_count = len(_RESERVED_TENSORS)
+    _RESERVED_TENSORS.clear()
+
+    # Force garbage collection to ensure tensors are freed
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    _MEMORY_RESERVED = False
+    print(f"Released memory from {tensor_count} reserved tensors.")
+
+    # Return current allocation for verification
+    allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
+    print(f"Current GPU memory allocation: {allocated:.2f} GB")
+    return allocated
 
 
 
