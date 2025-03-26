@@ -52,7 +52,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 _MEMORY_RESERVED = False
 
 # Reserve GPU memory by allocating a large dummy tensor
-def reserve_gpu_memory(device_id=0, target_gb=10):
+def reserve_gpu_memory(device_id=0, target_gb=20):
     """Allocates memory to effectively reserve the GPU."""
     global _MEMORY_RESERVED
 
@@ -613,7 +613,7 @@ def main(cfg: DictConfig):
 
     # Run it
     if torch.cuda.is_available():
-        reserve_gpu_memory(device_id=0, target_gb=15)
+        reserve_gpu_memory(device_id=0)
 
     # Create output directory
     output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
