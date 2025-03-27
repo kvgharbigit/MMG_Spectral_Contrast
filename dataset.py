@@ -101,7 +101,7 @@ class PatientDataset(Dataset):
 
 def custom_collate_fn(batch):
     """
-    Custom collate function to handle missing modalities and thickness masks.
+    Memory-efficient custom collate function to handle missing modalities and thickness masks.
     """
     # Process each key separately
     result = {}
@@ -118,80 +118,133 @@ def custom_collate_fn(batch):
 
             for mod_key in modality_keys:
                 # Collect all values for this modality across the batch
-                mod_values = [sample['aux_data'][mod_key] for sample in batch]
+                valid_values = []
+                for sample in batch:
+                    if sample['aux_data'][mod_key] is not None:
+                        valid_values.append(sample['aux_data'][mod_key])
 
-                # Check if any values are None
-                if any(v is None for v in mod_values):
-                    # If any are None, replace with zero tensors of the right shape
-                    has_values = [i for i, v in enumerate(mod_values) if v is not None]
-                    if not has_values:
-                        # If all are None, just store None
-                        aux_result[mod_key] = None
-                    else:
-                        # Get shape from the first non-None tensor
-                        template = mod_values[has_values[0]]
-                        shape = template.shape
-                        device = template.device
-                        dtype = template.dtype
-
-                        # Replace None with zero tensors
-                        for i in range(len(mod_values)):
-                            if mod_values[i] is None:
-                                mod_values[i] = torch.zeros(shape[1:], dtype=dtype, device=device)
-                                # Add batch dimension of 1
-                                mod_values[i] = mod_values[i].unsqueeze(0)
-
-                        # Stack along batch dimension
-                        aux_result[mod_key] = torch.cat(mod_values, dim=0)
+                # Handle different cases
+                if not valid_values:
+                    # If all are None, just store None
+                    aux_result[mod_key] = None
                 else:
-                    # All values are tensors, use standard stacking
-                    aux_result[mod_key] = torch.cat(mod_values, dim=0)
+                    # Get shape from the first non-None tensor
+                    template = valid_values[0]
+
+                    # Create tensors of the right shape for missing entries
+                    filled_values = []
+                    for sample in batch:
+                        if sample['aux_data'][mod_key] is not None:
+                            filled_values.append(sample['aux_data'][mod_key])
+                        else:
+                            # Create a zero tensor of the right shape
+                            zeros = torch.zeros_like(template)
+                            filled_values.append(zeros)
+
+                    # Stack along batch dimension
+                    try:
+                        aux_result[mod_key] = torch.cat(filled_values, dim=0)
+                    except Exception as e:
+                        print(f"Error stacking {mod_key}: {e}")
+                        aux_result[mod_key] = None
 
             result['aux_data'] = aux_result
+
         elif key == 'thickness_mask':
-            # Handle thickness mask
-            values = [sample[key] for sample in batch]
-            if all(v is not None for v in values):
-                result[key] = torch.cat(values, dim=0)
+            # Handle thickness mask with memory efficiency
+            values = []
+            valid_count = 0
+
+            for sample in batch:
+                if sample[key] is not None:
+                    values.append(sample[key])
+                    valid_count += 1
+
+            if valid_count > 0:
+                # At least one valid mask
+                template = values[0]
+
+                # Fill in missing values with ones
+                filled_values = []
+                for sample in batch:
+                    if sample[key] is not None:
+                        filled_values.append(sample[key])
+                    else:
+                        ones = torch.ones_like(template)
+                        filled_values.append(ones)
+
+                result[key] = torch.cat(filled_values, dim=0)
             else:
-                # Handle missing masks
-                has_values = [i for i, v in enumerate(values) if v is not None]
-                if not has_values:
-                    sample_hsi = batch[0]['hsi']
-                    B = len(batch)
-                    H, W = sample_hsi.shape[-2], sample_hsi.shape[-1]
-                    result[key] = torch.ones(B, 1, H, W, device=sample_hsi.device)
-                else:
-                    # Use the first non-None mask as a template
-                    template = values[has_values[0]]
-                    for i in range(len(values)):
-                        if values[i] is None:
-                            values[i] = torch.ones_like(template)
-                    result[key] = torch.cat(values, dim=0)
-        elif key == 'patient_id' or key == 'patient_dir':
-            # Handle string values by keeping them as a list
+                # If no valid masks, create a generic one based on HSI
+                sample_hsi = batch[0]['hsi']
+                B = len(batch)
+                H, W = sample_hsi.shape[-2], sample_hsi.shape[-1]
+                result[key] = torch.ones(B, 1, H, W, device=sample_hsi.device)
+
+        elif key in ['patient_id', 'patient_dir']:
+            # String values kept as a list
             result[key] = [sample[key] for sample in batch]
+
         elif key == 'batch_idx':
-            # For batch indices, stack them properly
-            values = [sample[key] for sample in batch]
-            if all(isinstance(v, torch.Tensor) for v in values):
-                # Convert zero-dimensional tensors to 1D if needed
-                values = [v.unsqueeze(0) if v.dim() == 0 else v for v in values]
-                result[key] = torch.cat(values, dim=0)
-            else:
-                result[key] = torch.tensor(values)
+            # Handle batch indices carefully
+            try:
+                indices = []
+                for sample in batch:
+                    idx = sample[key]
+                    if isinstance(idx, torch.Tensor):
+                        if idx.dim() == 0:  # Zero-dimension tensor
+                            idx = idx.unsqueeze(0)
+                    else:
+                        idx = torch.tensor([idx])  # Convert to tensor
+                    indices.append(idx)
+                result[key] = torch.cat(indices, dim=0)
+            except Exception as e:
+                print(f"Error processing batch indices: {e}")
+                # Fallback to list of indices
+                result[key] = [sample[key] for sample in batch]
+
         elif key == 'hsi':
-            # Handle HSI data (5D tensors)
-            values = [sample[key].squeeze(0) for sample in batch]  # Remove single-item batch dimension
-            result[key] = torch.stack(values, dim=0)
+            # Handle HSI data efficiently
+            try:
+                # Stack HSI tensors
+                hsi_tensors = []
+                for sample in batch:
+                    # Remove single-item batch dimension if present
+                    if sample[key].dim() == 5 and sample[key].shape[0] == 1:
+                        hsi_tensors.append(sample[key].squeeze(0))
+                    else:
+                        hsi_tensors.append(sample[key])
+                result[key] = torch.stack(hsi_tensors, dim=0)
+            except Exception as e:
+                print(f"Error stacking HSI tensors: {e}")
+                # Fallback to list
+                result[key] = [sample[key] for sample in batch]
         else:
-            # For other keys, use standard stacking
-            values = [sample[key] for sample in batch]
-            if all(isinstance(v, torch.Tensor) for v in values):
-                values = [v.unsqueeze(0) if v.dim() == 0 else v for v in values]
-                result[key] = torch.cat(values, dim=0)
-            else:
-                result[key] = values
+            # For other tensor keys, use standard stacking
+            try:
+                values = []
+                for sample in batch:
+                    if isinstance(sample[key], torch.Tensor):
+                        # Handle zero-dimensional tensors
+                        if sample[key].dim() == 0:
+                            values.append(sample[key].unsqueeze(0))
+                        else:
+                            values.append(sample[key])
+                    else:
+                        # Not a tensor
+                        values.append(sample[key])
+
+                # If all values are tensors, stack them
+                if all(isinstance(v, torch.Tensor) for v in values):
+                    result[key] = torch.cat(values, dim=0)
+                else:
+                    result[key] = values
+            except Exception as e:
+                print(f"Error processing key {key}: {e}")
+                result[key] = [sample[key] for sample in batch]
+
+    # Clear source data to free memory
+    del batch
 
     return result
 
@@ -213,7 +266,7 @@ def create_patient_dataloader(parent_dir, analysis_dim=500, target_bands=30,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,  # Changed from True to reduce memory usage
         drop_last=False,
         collate_fn=custom_collate_fn
     )
