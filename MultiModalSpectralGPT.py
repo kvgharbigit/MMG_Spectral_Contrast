@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
+from torch.utils.checkpoint import checkpoint
+
 
 
 class SpatialRegistration(nn.Module):
@@ -491,13 +493,35 @@ class MultiModalSpectralGPT(nn.Module):
             aux_embeddings = self.encode_auxiliary(aux_data)
             # Apply cross-attention for each modality
             for modality, embedding in aux_embeddings.items():
-                cond_tokens = self.modality_proj(embedding).unsqueeze(1)
-                for block in self.cross_attn:
-                    x = x + block(torch.cat([x, cond_tokens], dim=1))[:, :-1, :]
+                if embedding is not None:
+                    cond_tokens = self.modality_proj(embedding).unsqueeze(1)
+                    for block in self.cross_attn:
+                        # Use gradient checkpointing for cross-attention blocks
+                        def create_custom_forward(mod):
+                            def custom_forward(*inputs):
+                                return mod(torch.cat(inputs, dim=1))[:, :-1, :]
 
-        # Apply main transformer blocks
-        for block in self.blocks:
-            x = block(x)
+                            return custom_forward
+
+                        if self.training:
+                            # Use checkpointing during training
+                            x = x + checkpoint(
+                                create_custom_forward(block),
+                                x, cond_tokens
+                            )
+                        else:
+                            # Regular forward pass during evaluation
+                            x = x + block(torch.cat([x, cond_tokens], dim=1))[:, :-1, :]
+
+        # Apply main transformer blocks with gradient checkpointing
+        for i, block in enumerate(self.blocks):
+            if self.training:
+                # Use gradient checkpointing during training
+                x = checkpoint(block, x)
+            else:
+                # Regular forward pass during evaluation
+                x = block(x)
+
         x = self.norm(x)
 
         return x, mask, ids_restore
@@ -521,10 +545,17 @@ class MultiModalSpectralGPT(nn.Module):
             index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2])
         )
 
-        # Add position embeddings and apply decoder
+        # Add position embeddings and apply decoder with gradient checkpointing
         x = x_ + self.decoder_pos_embed
+
         for block in self.decoder_blocks:
-            x = block(x)
+            if self.training:
+                # Use gradient checkpointing during training
+                x = checkpoint(block, x)
+            else:
+                # Regular forward pass during evaluation
+                x = block(x)
+
         x = self.decoder_norm(x)
 
         # Predict original embeddings

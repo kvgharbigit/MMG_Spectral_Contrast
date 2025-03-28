@@ -1,4 +1,6 @@
 import os
+import gc
+
 import numpy as np
 import matplotlib.pyplot as plt
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb
@@ -350,55 +352,68 @@ def visualize_embedding_space_loss(original_tokens, predicted_tokens, mask, thic
     import torch
     from sklearn.decomposition import PCA
 
+    # Process only a subset of tokens for visualization
+    max_tokens = 1000  # Limit the number of tokens to process
+
     # Select the first batch element for visualization
     original = original_tokens[0].detach().cpu().numpy()
     predicted = predicted_tokens[0].detach().cpu().numpy()
     mask_np = mask[0].detach().cpu().numpy()
+
+    # Limit the tokens if there are too many
+    if len(mask_np) > max_tokens:
+        original = original[:max_tokens]
+        predicted = predicted[:max_tokens]
+        mask_np = mask_np[:max_tokens]
 
     # Compute token-wise reconstruction error
     token_error = np.mean((original - predicted) ** 2, axis=1)
 
     # Reduce dimensionality for visualization using PCA
     pca = PCA(n_components=2)
-    combined = np.vstack([original, predicted])
-    reduced = pca.fit_transform(combined)
 
-    # Split back into original and predicted
-    original_2d = reduced[:len(original)]
-    predicted_2d = reduced[len(original):]
+    # Only use masked tokens for PCA
+    masked_indices = np.where(mask_np > 0.5)[0]
+
+    # If too many masked tokens, sample a subset
+    if len(masked_indices) > 500:
+        np.random.seed(42)  # For reproducibility
+        masked_indices = np.random.choice(masked_indices, 500, replace=False)
+
+    if len(masked_indices) > 0:
+        # Combine selected masked tokens for PCA
+        combined = np.vstack([original[masked_indices], predicted[masked_indices]])
+        reduced = pca.fit_transform(combined)
+
+        # Split back into original and predicted
+        original_2d = reduced[:len(masked_indices)]
+        predicted_2d = reduced[len(masked_indices):]
+    else:
+        # Handle case with no masked tokens
+        original_2d = np.zeros((0, 2))
+        predicted_2d = np.zeros((0, 2))
 
     # Create the figure
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
     # Plot 1: Scatter plot of embeddings in 2D PCA space
-    # Plot original tokens (blue) and their corresponding predicted tokens (red)
-    # Only for masked tokens
-    masked_indices = np.where(mask_np > 0.5)[0]
-
     if len(masked_indices) > 0:
-        # For clarity, sample at most 500 tokens if there are too many
-        if len(masked_indices) > 500:
-            np.random.seed(42)  # For reproducibility
-            sampled_indices = np.random.choice(masked_indices, 500, replace=False)
-        else:
-            sampled_indices = masked_indices
-
         # Plot original tokens
-        orig_scatter = axes[0].scatter(
-            original_2d[sampled_indices, 0],
-            original_2d[sampled_indices, 1],
+        axes[0].scatter(
+            original_2d[:, 0],
+            original_2d[:, 1],
             c='blue', s=10, alpha=0.7, label='Original'
         )
 
         # Plot predicted tokens
-        pred_scatter = axes[0].scatter(
-            predicted_2d[sampled_indices, 0],
-            predicted_2d[sampled_indices, 1],
+        axes[0].scatter(
+            predicted_2d[:, 0],
+            predicted_2d[:, 1],
             c='red', s=10, alpha=0.7, label='Predicted'
         )
 
         # Draw lines connecting original and predicted points
-        for i in sampled_indices:
+        for i in range(len(masked_indices)):
             axes[0].plot(
                 [original_2d[i, 0], predicted_2d[i, 0]],
                 [original_2d[i, 1], predicted_2d[i, 1]],
@@ -413,7 +428,7 @@ def visualize_embedding_space_loss(original_tokens, predicted_tokens, mask, thic
         axes[0].text(0.5, 0.5, "No masked tokens found",
                      ha='center', va='center', transform=axes[0].transAxes)
 
-    # Plot 2: Token-wise reconstruction error
+    # Plot 2: Token-wise reconstruction error (limit to max_tokens)
     error_plot = axes[1].bar(range(len(token_error)), token_error)
     axes[1].set_title('Token-wise Reconstruction Error')
     axes[1].set_xlabel('Token Index')
@@ -425,11 +440,10 @@ def visualize_embedding_space_loss(original_tokens, predicted_tokens, mask, thic
             error_plot[i].set_color('red')
 
     # Plot 3: Visualization of mask (and thickness mask if available)
-    # Create a 2D representation of the mask based on the patch structure
     try:
-        # Assume the spatial layout is square
-        spatial_side = int(np.sqrt(len(mask_np) / 6))  # 6 = spectral chunks
-        mask_2d = mask_np.reshape(6, spatial_side, spatial_side).mean(axis=0)
+        # Limit tokens for visualization
+        spatial_side = min(20, int(np.sqrt(len(mask_np) / 6)))  # Assuming 6 spectral chunks
+        mask_2d = mask_np[:spatial_side * spatial_side * 6].reshape(6, spatial_side, spatial_side).mean(axis=0)
 
         mask_img = axes[2].imshow(mask_2d, cmap='gray', interpolation='nearest')
         axes[2].set_title('Mask Visualization')
@@ -442,16 +456,17 @@ def visualize_embedding_space_loss(original_tokens, predicted_tokens, mask, thic
             import torch.nn.functional as F
             h, w = thickness_mask_np.shape
             patch_size = h // spatial_side
-            thickness_mask_patches = F.avg_pool2d(
-                torch.tensor(thickness_mask_np).unsqueeze(0).unsqueeze(0),
-                kernel_size=patch_size,
-                stride=patch_size
-            )[0, 0].numpy()
+            if patch_size > 0:  # Ensure valid patch size
+                thickness_mask_patches = F.avg_pool2d(
+                    torch.tensor(thickness_mask_np).unsqueeze(0).unsqueeze(0),
+                    kernel_size=patch_size,
+                    stride=patch_size
+                )[0, 0].numpy()
 
-            # Plot contour of thickness mask
-            axes[2].contour(thickness_mask_patches, levels=[0.5],
-                            colors='red', linewidths=2)
-            axes[2].set_title('Mask with Thickness Boundary')
+                # Plot contour of thickness mask
+                axes[2].contour(thickness_mask_patches, levels=[0.5],
+                                colors='red', linewidths=2)
+                axes[2].set_title('Mask with Thickness Boundary')
     except Exception as e:
         axes[2].text(0.5, 0.5, f"Error visualizing mask: {str(e)}",
                      ha='center', va='center', transform=axes[2].transAxes)
@@ -461,22 +476,20 @@ def visualize_embedding_space_loss(original_tokens, predicted_tokens, mask, thic
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
+    # Ensure cleanup of large variables
+    del original, predicted, mask_np
+    if 'reduced' in locals():
+        del reduced
+    if 'combined' in locals():
+        del combined
+    gc.collect()
+
     return fig
 
 
 def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thickness_mask=None, save_path=None):
     """
     Visualize the reconstruction quality of token embeddings with spatial layout.
-
-    Args:
-        original_tokens (torch.Tensor): Original embeddings [B, L, D]
-        predicted_tokens (torch.Tensor): Predicted embeddings [B, L, D]
-        mask (torch.Tensor): Binary mask (1=masked, 0=visible) [B, L]
-        thickness_mask (torch.Tensor, optional): Thickness mask
-        save_path (str, optional): Path to save visualization
-
-    Returns:
-        matplotlib.figure.Figure: Generated figure
     """
     import torch
     import numpy as np
@@ -490,13 +503,19 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
     pred = predicted_tokens[0].detach().cpu()
     mask_np = mask[0].detach().cpu().numpy()
 
-    # Assume 2400 tokens = 6 spectral chunks × 400 spatial locations (20×20 grid)
-    num_spatial = 400
-    num_spectral = 6
-    spatial_side = 20  # 20×20 spatial grid
+    # Limit tokens for visualization
+    max_tokens = min(2400, len(mask_np))  # Limit to 2400 tokens or fewer
+    orig = orig[:max_tokens]
+    pred = pred[:max_tokens]
+    mask_np = mask_np[:max_tokens]
 
-    # Compute token-wise reconstruction quality
-    # Using cosine similarity (higher is better)
+    # Assume reasonable dimensions for visualization
+    # If 2400 tokens, assume 6 spectral chunks × 400 spatial locations (20×20 grid)
+    num_spatial = min(400, max_tokens // 6)
+    num_spectral = 6
+    spatial_side = int(np.sqrt(num_spatial))  # Should be 20 for 400 spatial tokens
+
+    # Compute token-wise reconstruction quality using cosine similarity
     cos_sim = torch.zeros(len(mask_np))
     for i in range(len(mask_np)):
         if mask_np[i] > 0.5:  # For masked tokens
@@ -509,12 +528,13 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
     # Convert to numpy
     cos_sim = cos_sim.numpy()
 
-    # Create reconstruction quality maps
-    # 1. Spectral average: For each spatial location, average across spectral chunks
+    # Create reconstruction quality maps - spatial average
     spatial_cos_sim = np.zeros((num_spatial))
     spatial_mask_count = np.zeros((num_spatial))
 
     for i in range(len(cos_sim)):
+        if i >= num_spatial * num_spectral:
+            break
         spec_idx = i // num_spatial  # Spectral chunk index
         spatial_idx = i % num_spatial  # Spatial location index
 
@@ -529,11 +549,13 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
     # Reshape to 2D grid
     spatial_cos_sim_grid = spatial_cos_sim.reshape(spatial_side, spatial_side)
 
-    # 2. Spatial average: For each spectral chunk, average across spatial locations
+    # Create spectral average
     spectral_cos_sim = np.zeros((num_spectral))
     spectral_mask_count = np.zeros((num_spectral))
 
     for i in range(len(cos_sim)):
+        if i >= num_spatial * num_spectral:
+            break
         spec_idx = i // num_spatial  # Spectral chunk index
 
         if mask_np[i] > 0.5:  # Only consider masked tokens
@@ -544,30 +566,24 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
     spectral_mask_count[spectral_mask_count == 0] = 1  # Avoid division by zero
     spectral_cos_sim = spectral_cos_sim / spectral_mask_count
 
-    # 3. Full 2D+spectral visualization
-    # Reshape mask to [spectral, spatial_h, spatial_w]
-    mask_grid = mask_np.reshape(num_spectral, spatial_side, spatial_side)
-
-    # Reshape cosine similarity to same shape, but handle zeros properly
+    # Calculate full 2D+spectral grid safely
     cos_sim_grid = np.zeros((num_spectral, spatial_side, spatial_side))
-
+    tmp_idx = 0
     for s in range(num_spectral):
         for h in range(spatial_side):
             for w in range(spatial_side):
-                idx = s * num_spatial + h * spatial_side + w
-                if mask_np[idx] > 0.5:
-                    cos_sim_grid[s, h, w] = cos_sim[idx]
+                if tmp_idx < len(mask_np) and mask_np[tmp_idx] > 0.5:
+                    cos_sim_grid[s, h, w] = cos_sim[tmp_idx]
+                tmp_idx += 1
+                if tmp_idx >= len(mask_np):
+                    break
 
-    # Create custom colormap: black for unmasked, blue-to-red for reconstruction quality
+    # Create custom colormap
     colors = [(0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0), (1, 1, 0), (1, 0, 0)]
     positions = [0, 0.001, 0.25, 0.5, 0.75, 1.0]
     cmap = LinearSegmentedColormap.from_list("recon_cmap", list(zip(positions, colors)))
 
-    # Create layout:
-    # - Top: 20×20 spatial reconstruction quality
-    # - Middle: 6 spectral chunks × 20×20 spatial grid
-    # - Bottom: Bar chart of spectral chunk quality
-
+    # Create figure
     fig = plt.figure(figsize=(15, 10))
 
     # Top plot: Spatial reconstruction quality
@@ -584,28 +600,29 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
     ax2.set_title("Spectral Reconstruction Quality")
     ax2.set_ylim(0, 1)
 
-    # Add specific colors to the bars based on quality
+    # Color the bars
     for i, bar in enumerate(bars):
         bar.set_color(plt.cm.viridis(spectral_cos_sim[i]))
 
-    # Bottom-middle: Show embedding T-SNE
+    # T-SNE visualization with limited tokens
     ax3 = plt.subplot2grid((2, 3), (1, 1))
 
-    # Only consider masked tokens for T-SNE
+    # Only consider a small subset of masked tokens for T-SNE
     masked_indices = np.where(mask_np > 0.5)[0]
+    max_tsne_tokens = min(100, len(masked_indices))  # Use at most 100 tokens for T-SNE
 
-    if len(masked_indices) > 500:  # Limit to 500 points for T-SNE efficiency
+    if len(masked_indices) > max_tsne_tokens:
         np.random.seed(42)
-        masked_indices = np.random.choice(masked_indices, 500, replace=False)
+        masked_indices = np.random.choice(masked_indices, max_tsne_tokens, replace=False)
 
     if len(masked_indices) > 0:
-        # Combine original and predicted for T-SNE
-        orig_masked = orig[masked_indices].numpy()
-        pred_masked = pred[masked_indices].numpy()
-        combined = np.vstack([orig_masked, pred_masked])
-
         # Compute T-SNE
         try:
+            # Use only a subset of the embedding dimensions for T-SNE
+            orig_masked = orig[masked_indices, :50].numpy()  # Use first 50 dimensions only
+            pred_masked = pred[masked_indices, :50].numpy()
+            combined = np.vstack([orig_masked, pred_masked])
+
             tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(masked_indices) - 1))
             result = tsne.fit_transform(combined)
 
@@ -613,12 +630,13 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
             orig_tsne = result[:len(masked_indices)]
             pred_tsne = result[len(masked_indices):]
 
-            # Plot with lines connecting original and predicted
+            # Plot with limited lines
             ax3.scatter(orig_tsne[:, 0], orig_tsne[:, 1], c='blue', alpha=0.5, label='Original')
             ax3.scatter(pred_tsne[:, 0], pred_tsne[:, 1], c='red', alpha=0.5, label='Predicted')
 
-            # Draw lines connecting pairs
-            for i in range(len(masked_indices)):
+            # Draw only a few lines
+            max_lines = min(50, len(masked_indices))
+            for i in range(max_lines):
                 ax3.plot(
                     [orig_tsne[i, 0], pred_tsne[i, 0]],
                     [orig_tsne[i, 1], pred_tsne[i, 1]],
@@ -626,34 +644,42 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
                 )
 
             ax3.legend()
-            ax3.set_title("Token Embedding T-SNE")
+            ax3.set_title("Token Embedding T-SNE (Sample)")
         except Exception as e:
             ax3.text(0.5, 0.5, f"T-SNE error: {str(e)}", ha='center', va='center', transform=ax3.transAxes)
     else:
         ax3.text(0.5, 0.5, "No masked tokens", ha='center', va='center', transform=ax3.transAxes)
 
-    # Bottom-right: Show full spectral-spatial grid
+    # Bottom-right: Show limited spectral-spatial grid
     ax4 = plt.subplot2grid((2, 3), (0, 2), rowspan=2)
 
-    # Create a grid that combines all spectral chunks
-    full_grid = np.zeros((spatial_side * num_spectral, spatial_side))
+    # Create a grid with limited size
+    max_spatial_rows = min(spatial_side, 20)
+    max_spectral_rows = min(num_spectral, 6)
+    full_grid = np.zeros((max_spatial_rows * max_spectral_rows, max_spatial_rows))
 
-    for s in range(num_spectral):
-        full_grid[s * spatial_side:(s + 1) * spatial_side, :] = cos_sim_grid[s]
+    for s in range(max_spectral_rows):
+        full_grid[s * max_spatial_rows:(s + 1) * max_spatial_rows, :] = cos_sim_grid[s, :max_spatial_rows,
+                                                                        :max_spatial_rows]
 
     im4 = ax4.imshow(full_grid, cmap=cmap, vmin=0, vmax=1)
-    ax4.set_title("Full Spectral-Spatial Reconstruction Quality")
+    ax4.set_title("Spectral-Spatial Quality (Sample)")
 
     # Add spectral chunk labels
-    for s in range(num_spectral):
-        ax4.text(-2, s * spatial_side + spatial_side / 2, f"Chunk {s}", va='center', ha='right')
+    for s in range(max_spectral_rows):
+        ax4.text(-2, s * max_spatial_rows + max_spatial_rows / 2, f"Chunk {s}", va='center', ha='right')
 
     plt.colorbar(im4, ax=ax4)
-
     plt.tight_layout()
 
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
+
+    # Clean up memory
+    del orig, pred, mask_np, cos_sim, spatial_cos_sim, spectral_cos_sim, cos_sim_grid
+    if 'combined' in locals():
+        del combined, result, orig_masked, pred_masked
+    gc.collect()
 
     return fig
 
@@ -667,40 +693,54 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
     import numpy as np
     import matplotlib.pyplot as plt
     from hsi_to_rgb import simple_hsi_to_rgb
+    import gc
 
     # Use only the first batch item for visualization
     orig_input = original_input[0].detach().cpu()
 
-    # Generate the pixel-level reconstruction
+    # Get model parameters for proper unpatchify calculation
+    spectral_patches = model.spectral_patches  # Should be 6
+    spatial_patches = model.spatial_patches  # Should be 400
+    embed_dim = model.embed_dim  # Should be 768
+
+    # Generate the pixel-level reconstruction with memory optimization
     with torch.no_grad():
-        # Convert to device for model processing
-        pred_device = pred_embeddings.to(model.pixel_projection.weight.device)
-        reconstructed = model.unpatchify(pred_device, original_input.shape)
-        reconstructed = reconstructed[0].detach().cpu()
+        # Move to device
+        device = model.pixel_projection.weight.device
 
-    # Convert token mask to pixel mask
-    pixel_mask = model.token_mask_to_pixel_mask(mask, original_input.shape)[0].detach().cpu()
+        # Get the prediction tensor and ensure it has the right shape
+        # pred_embeddings shape is likely [B, L, D] where L is total patches
+        # we need to reshape it to [B, spectral_patches, spatial_patches, D]
+        B = pred_embeddings.shape[0]
+        total_tokens = spectral_patches * spatial_patches
 
-    # Print shapes for debugging
-    print(f"Original input shape: {orig_input.shape}")
-    print(f"Reconstructed shape: {reconstructed.shape}")
+        # Ensure we have the right number of tokens
+        if pred_embeddings.shape[1] >= total_tokens:
+            # Take just enough tokens from the full set
+            prediction_tensor = pred_embeddings[:, :total_tokens, :].to(device)
+            # Reshape to the expected format for unpatchify
+            prediction_reshaped = prediction_tensor.reshape(B, spectral_patches, spatial_patches, embed_dim)
 
-    # Handle the HSI to RGB conversion carefully
-    # Make sure input has proper shape for simple_hsi_to_rgb
-    # It expects input of shape [T, H, W] or [B, C, T, H, W]
+            # Now we can call unpatchify with the properly shaped tensor
+            reconstructed = model.unpatchify(prediction_reshaped, original_input.shape)
+            reconstructed = reconstructed[0].detach().cpu()
+        else:
+            # Not enough tokens, create a placeholder
+            print(
+                f"Warning: Not enough tokens for reconstruction. Have {pred_embeddings.shape[1]}, need {total_tokens}")
+            reconstructed = torch.zeros_like(orig_input)
 
-    # Reshape if needed to [T, H, W]
-    if orig_input.shape[1] == 1:  # If [C, 1, T, H, W]
-        orig_input_hsi = orig_input[:, 0, :, :]  # Now [T, H, W]
-        recon_input_hsi = reconstructed[:, 0, :, :]
-    else:
-        # Keep as is if already in correct format
-        orig_input_hsi = orig_input
-        recon_input_hsi = reconstructed
-
-    # Convert to RGB using simple_hsi_to_rgb
+    # Convert to RGB for visualization
     try:
-        # Use unsqueeze to add batch dimension if needed
+        # Handle shape properly for RGB conversion
+        if orig_input.shape[1] == 1:  # If [C, 1, T, H, W]
+            orig_input_hsi = orig_input[0]  # Now [T, H, W]
+            recon_input_hsi = reconstructed[0]
+        else:
+            orig_input_hsi = orig_input
+            recon_input_hsi = reconstructed
+
+        # Convert to RGB
         orig_rgb = simple_hsi_to_rgb(orig_input_hsi.unsqueeze(0) if orig_input_hsi.dim() == 3 else orig_input_hsi)
         recon_rgb = simple_hsi_to_rgb(recon_input_hsi.unsqueeze(0) if recon_input_hsi.dim() == 3 else recon_input_hsi)
 
@@ -710,34 +750,31 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
         if recon_rgb.dim() == 4 and recon_rgb.shape[0] == 1:
             recon_rgb = recon_rgb[0]
 
-        # Convert to numpy and proper format for matplotlib (H, W, 3)
+        # Convert to numpy with proper format for matplotlib (H, W, 3)
         if orig_rgb.shape[0] == 3:  # If [3, H, W]
             orig_rgb_np = orig_rgb.permute(1, 2, 0).numpy()
             recon_rgb_np = recon_rgb.permute(1, 2, 0).numpy()
         else:
-            # Handle unexpected shape
-            print(f"Unexpected RGB shape from simple_hsi_to_rgb: {orig_rgb.shape}")
-            # Create placeholder
-            orig_rgb_np = np.zeros((orig_input.shape[2], orig_input.shape[3], 3))
-            recon_rgb_np = np.zeros((reconstructed.shape[2], reconstructed.shape[3], 3))
+            # If unexpected shape, create simple visualization
+            orig_rgb_np = np.zeros((min(100, orig_input.shape[3]), min(100, orig_input.shape[4]), 3))
+            recon_rgb_np = np.zeros_like(orig_rgb_np)
     except Exception as e:
         print(f"Error in RGB conversion: {e}")
-        # Fallback to using individual bands for visualization
-        mid_band = orig_input.shape[0] // 2
-        orig_rgb_np = np.stack([orig_input[mid_band, 0].numpy()] * 3, axis=-1)
-        recon_rgb_np = np.stack([reconstructed[mid_band, 0].numpy()] * 3, axis=-1)
+        # Create simple placeholders
+        h, w = min(100, orig_input.shape[3]), min(100, orig_input.shape[4])
+        orig_rgb_np = np.zeros((h, w, 3))
+        recon_rgb_np = np.zeros_like(orig_rgb_np)
 
-    # Clip values to valid range
-    orig_rgb_np = np.clip(orig_rgb_np, 0, 1)
-    recon_rgb_np = np.clip(recon_rgb_np, 0, 1)
+    # Create a simplified error map
+    try:
+        error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1)).numpy()
+    except:
+        error_map = np.zeros((min(100, orig_input.shape[3]), min(100, orig_input.shape[4])))
 
-    # Create error map between original and reconstruction
-    error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1)).numpy()
+    # Create figure
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-    # Prepare the visualization
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-
-    # First row: Original RGB, Reconstructed RGB, Error Map
+    # First row: Original RGB, Reconstructed RGB
     axes[0, 0].imshow(orig_rgb_np)
     axes[0, 0].set_title("Original Input (RGB)")
     axes[0, 0].axis('off')
@@ -746,74 +783,43 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
     axes[0, 1].set_title("Reconstructed (RGB)")
     axes[0, 1].axis('off')
 
-    # Error map
-    error_img = axes[0, 2].imshow(error_map, cmap='hot')
-    plt.colorbar(error_img, ax=axes[0, 2])
-    axes[0, 2].set_title("Reconstruction Error (MSE)")
-    axes[0, 2].axis('off')
-
-    # Second row: masks and masked error
-
-    # Show pixel mask
-    pixel_mask_vis = pixel_mask.mean(dim=(0, 1)).numpy()
-    axes[1, 0].imshow(pixel_mask_vis, cmap='gray')
-    axes[1, 0].set_title("MAE Mask (White = Masked)")
+    # Second row: Error map and spectral profile
+    error_img = axes[1, 0].imshow(error_map, cmap='hot')
+    plt.colorbar(error_img, ax=axes[1, 0])
+    axes[1, 0].set_title("Error Map")
     axes[1, 0].axis('off')
 
-    # Show masked error (error only in masked regions)
-    masked_error = error_map * pixel_mask_vis
-    masked_error_img = axes[1, 1].imshow(masked_error, cmap='hot')
-    plt.colorbar(masked_error_img, ax=axes[1, 1])
-    axes[1, 1].set_title("Error in Masked Regions")
-    axes[1, 1].axis('off')
+    # Spectral profile plot
+    try:
+        mid_h, mid_w = error_map.shape[0] // 2, error_map.shape[1] // 2
+        num_bands = min(20, orig_input.shape[2])  # Limit to 20 bands
 
-    # Show spectral profile for a sample point
-    mid_h, mid_w = error_map.shape[0] // 2, error_map.shape[1] // 2
+        # Extract profiles using slicing
+        if orig_input.dim() >= 4 and orig_input.shape[1] == 1:
+            orig_spectrum = orig_input[0, 0, :num_bands, mid_h, mid_w].numpy()
+            recon_spectrum = reconstructed[0, 0, :num_bands, mid_h, mid_w].numpy()
+        else:
+            orig_spectrum = orig_input[:num_bands, mid_h, mid_w].numpy()
+            recon_spectrum = reconstructed[:num_bands, mid_h, mid_w].numpy()
 
-    # Extract spectral profile based on input dimensions
-    if len(orig_input.shape) == 4 and orig_input.shape[1] == 1:  # [C, 1, H, W]
-        # If the shape is [channels, 1, height, width]
-        orig_spectrum = orig_input[:, 0, mid_h, mid_w].numpy()
-        recon_spectrum = reconstructed[:, 0, mid_h, mid_w].numpy()
-    elif len(orig_input.shape) == 3:  # [T, H, W]
-        orig_spectrum = orig_input[:, mid_h, mid_w].numpy()
-        recon_spectrum = reconstructed[:, mid_h, mid_w].numpy()
-    else:
-        try:
-            # Try to handle other formats
-            if len(orig_input.shape) >= 4:
-                # For [B, C, T, H, W] or similar, take first indices of batch and channel
-                idx = [0] * (len(orig_input.shape) - 3)
-                idx.extend([slice(None), mid_h, mid_w])
-                orig_spectrum = orig_input[tuple(idx)].numpy()
-                recon_spectrum = reconstructed[tuple(idx)].numpy()
-            else:
-                raise ValueError(f"Unsupported tensor shape: {orig_input.shape}")
-        except Exception as e:
-            print(f"Error extracting spectrum: {e}")
-            # Create dummy data
-            orig_spectrum = np.zeros(30)
-            recon_spectrum = np.zeros(30)
-
-    # Print for debugging
-    print(f"Spectral profile shapes - Original: {orig_spectrum.shape}, Reconstructed: {recon_spectrum.shape}")
-
-    # Plot spectral profile if data is available
-    if orig_spectrum.size > 0 and recon_spectrum.size > 0:
-        axes[1, 2].plot(orig_spectrum, 'b-', label='Original')
-        axes[1, 2].plot(recon_spectrum, 'r-', label='Reconstructed')
-        axes[1, 2].set_title(f"Spectral Profile at ({mid_h}, {mid_w})")
-        axes[1, 2].set_xlabel("Spectral Band")
-        axes[1, 2].set_ylabel("Value")
-        axes[1, 2].legend()
-    else:
-        axes[1, 2].text(0.5, 0.5, "Could not extract spectral profile",
-                        ha='center', va='center', transform=axes[1, 2].transAxes)
+        axes[1, 1].plot(orig_spectrum, 'b-', label='Original')
+        axes[1, 1].plot(recon_spectrum, 'r-', label='Reconstructed')
+        axes[1, 1].set_title(f"Spectral Profile at ({mid_h}, {mid_w})")
+        axes[1, 1].set_xlabel("Band")
+        axes[1, 1].set_ylabel("Value")
+        axes[1, 1].legend()
+    except Exception as e:
+        print(f"Error plotting spectral profile: {e}")
+        axes[1, 1].axis('off')
 
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+
+    # Clean up memory
+    del orig_input, reconstructed
+    gc.collect()
 
     return fig
 
