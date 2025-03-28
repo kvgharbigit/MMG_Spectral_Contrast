@@ -688,7 +688,8 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
         torch.save(checkpoint, best_path)
         print(f"Saved new best model with validation loss: {val_loss:.10f}")
 
-@hydra.main(config_path="configs", config_name="train",version_base="1.1")
+
+@hydra.main(config_path="configs", config_name="train", version_base="1.1")
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
 
@@ -722,6 +723,10 @@ def main(cfg: DictConfig):
     output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
     print(f"Output directory: {output_dir}")
 
+    # Save hyperparameter and training configuration summary
+    summary_path = save_training_summary(cfg, output_dir)
+    print(f"Training configuration summary saved to: {summary_path}")
+
     # Set up MLflow
     if cfg.logging.use_mlflow:
         mlflow.set_experiment(cfg.logging.experiment_name)
@@ -729,6 +734,10 @@ def main(cfg: DictConfig):
 
         # Log Hydra config
         mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
+
+        # Log configuration summary to MLflow
+        if summary_path and os.path.exists(summary_path):
+            mlflow.log_artifact(summary_path)
 
     # Set up TensorBoard
     writer = SummaryWriter(log_dir=os.path.join(output_dir, 'tensorboard'))
@@ -914,6 +923,8 @@ def main(cfg: DictConfig):
 
     # Training loop
     print(f"Starting training for {cfg.training.epochs} epochs")
+    total_start_time = time.time()  # Add this line to record when training started
+    early_stopped = False  # Add this line to track if early stopping occurred
 
     # Training loop
     for epoch in range(start_epoch, cfg.training.epochs):
@@ -1093,20 +1104,295 @@ def main(cfg: DictConfig):
         # Check for early stopping
         if cfg.training.early_stopping.enabled:
             if check_early_stopping(
-                val_losses,
-                cfg.training.early_stopping.patience,
-                cfg.training.early_stopping.min_delta
+                    val_losses,
+                    cfg.training.early_stopping.patience,
+                    cfg.training.early_stopping.min_delta
             ):
-                print(f"Early stopping triggered after epoch {epoch+1}")
+                print(f"Early stopping triggered after epoch {epoch + 1}")
+                early_stopped = True  # Add this line to record that early stopping happened
                 break
+
+    # Calculate total training time
+    total_training_time = time.time() - total_start_time
 
     # Final logging
     print("\nTraining completed!")
     print(f"Best validation loss: {best_val_loss:.6f}")
 
-    # Close MLflow run
+    # Update the summary file with training results
+    update_summary_with_results(
+        output_dir,
+        best_val_loss,
+        total_training_time,
+        epoch + 1,  # Number of epochs completed
+        early_stopped
+    )
+
+    # Log the configuration summary to MLflow if enabled
     if cfg.logging.use_mlflow:
+        summary_path = os.path.join(output_dir, 'summaries', "training_configuration.txt")
+        if os.path.exists(summary_path):
+            mlflow.log_artifact(summary_path, "training_summary")
         mlflow.end_run()
+
+    # Close TensorBoard writer
+    writer.close()
+
+def save_training_summary(cfg, output_dir):
+    """
+    Save a comprehensive summary of hyperparameters and training configuration to a text file.
+
+    Args:
+        cfg: The Hydra configuration object containing all parameters
+        output_dir: Directory to save the summary file
+    """
+    import os
+    from datetime import datetime
+    import torch
+
+    # Create summaries directory if it doesn't exist
+    summaries_dir = os.path.join(output_dir, 'summaries')
+    os.makedirs(summaries_dir, exist_ok=True)
+
+    # Define file path
+    summary_path = os.path.join(summaries_dir, "training_configuration.txt")
+
+    # Get current time
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Get system info
+    device_info = f"CPU" if not torch.cuda.is_available() else f"GPU: {torch.cuda.get_device_name(0)}"
+    cuda_version = torch.version.cuda if torch.cuda.is_available() else "N/A"
+
+    try:
+        with open(summary_path, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"MULTIMODAL SPECTRALGPT TRAINING CONFIGURATION\n")
+            f.write(f"Generated on: {current_time}\n")
+            f.write("=" * 80 + "\n\n")
+
+            # System Information
+            f.write("SYSTEM INFORMATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Device: {device_info}\n")
+            f.write(f"PyTorch Version: {torch.__version__}\n")
+            f.write(f"CUDA Version: {cuda_version}\n")
+            f.write(f"Random Seed: {cfg.seed}\n\n")
+
+            # Model Configuration
+            f.write("MODEL CONFIGURATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Analysis Dimension: {cfg.model.analysis_dim}\n")
+            f.write(f"Patch Size: {cfg.model.patch_size}\n")
+            f.write(f"Embedding Dimension: {cfg.model.embed_dim}\n")
+            f.write(f"Decoder Embedding Dimension: {cfg.model.decoder_embed_dim}\n")
+            f.write(f"Transformer Depth: {cfg.model.depth}\n")
+            f.write(f"Decoder Depth: {cfg.model.decoder_depth}\n")
+            f.write(f"Number of Attention Heads: {cfg.model.num_heads}\n")
+            f.write(f"Decoder Attention Heads: {cfg.model.decoder_num_heads}\n")
+            f.write(f"MLP Ratio: {cfg.model.mlp_ratio}\n")
+            f.write(f"Spectral Bands: {cfg.model.num_frames}\n")
+            f.write(f"Temporal Patch Size: {cfg.model.t_patch_size}\n")
+            f.write(f"Input Channels: {cfg.model.in_chans}\n")
+            f.write(f"Auxiliary Channels: {cfg.model.aux_chans}\n")
+            f.write(f"Auxiliary Embed Dimension: {cfg.model.aux_embed_dim}\n")
+            f.write(f"Temperature: {cfg.model.temperature}\n")
+            f.write(f"Mask Ratio: {cfg.model.mask_ratio}\n")
+            f.write(f"Contrastive Mode: {cfg.model.contrastive_mode}\n")
+            f.write(f"Using Thickness Mask: {cfg.model.use_thickness_mask}\n\n")
+
+            # Optimizer Configuration
+            f.write("OPTIMIZER CONFIGURATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Optimizer: AdamW\n")  # Hardcoded as your code uses AdamW
+            f.write(f"Learning Rate: {cfg.optimizer.lr}\n")
+            f.write(f"Weight Decay: {cfg.optimizer.weight_decay}\n")
+            f.write(f"Beta1: {cfg.optimizer.beta1}\n")
+            f.write(f"Beta2: {cfg.optimizer.beta2}\n\n")
+
+            # Scheduler Configuration
+            if cfg.scheduler.use_scheduler:
+                f.write("LEARNING RATE SCHEDULER\n")
+                f.write("-" * 50 + "\n")
+                f.write(f"Scheduler Type: {cfg.scheduler.type}\n")
+
+                # Write scheduler-specific parameters
+                if cfg.scheduler.type == "cosine":
+                    f.write(f"Minimum Learning Rate: {cfg.scheduler.min_lr}\n")
+                    if hasattr(cfg.scheduler, 'warmup_ratio'):
+                        f.write(f"Warmup Ratio: {cfg.scheduler.warmup_ratio}\n")
+                elif cfg.scheduler.type == "step":
+                    f.write(f"Step Size: {cfg.scheduler.step_size}\n")
+                    f.write(f"Gamma: {cfg.scheduler.gamma}\n")
+                elif cfg.scheduler.type == "reduce_on_plateau":
+                    f.write(f"Factor: {cfg.scheduler.factor}\n")
+                    f.write(f"Patience: {cfg.scheduler.patience}\n")
+                    f.write(f"Minimum Learning Rate: {cfg.scheduler.min_lr}\n")
+                f.write("\n")
+
+            # Training Configuration
+            f.write("TRAINING CONFIGURATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Batch Size: {cfg.training.batch_size}\n")
+            f.write(f"Number of Epochs: {cfg.training.epochs}\n")
+            f.write(f"Resume from Checkpoint: {cfg.training.resume_from_checkpoint}\n")
+            if hasattr(cfg.training, 'checkpoint_path') and cfg.training.resume_from_checkpoint:
+                f.write(f"Checkpoint Path: {cfg.training.checkpoint_path}\n")
+
+            # Early Stopping
+            if cfg.training.early_stopping.enabled:
+                f.write(f"Early Stopping Enabled: Yes\n")
+                f.write(f"Patience: {cfg.training.early_stopping.patience}\n")
+                f.write(f"Minimum Delta: {cfg.training.early_stopping.min_delta}\n")
+            else:
+                f.write(f"Early Stopping Enabled: No\n")
+            f.write("\n")
+
+            # Data Configuration
+            f.write("DATA CONFIGURATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Parent Directory: {cfg.data.parent_dir}\n")
+            f.write(f"Training Directory: {cfg.data.train_dir}\n")
+            f.write(f"Validation Directory: {cfg.data.val_dir}\n")
+            f.write(f"Using Auto Split: {cfg.data.use_auto_split}\n")
+            if cfg.data.use_auto_split:
+                f.write(f"Auto Split Ratio: {cfg.data.auto_split_ratio}\n")
+            f.write(f"Number of Workers: {cfg.data.num_workers}\n")
+            f.write(f"Drop Last Batch: {cfg.data.drop_last}\n")
+            f.write(f"Using Data Augmentation: {cfg.data.use_augmentation}\n")
+            if cfg.data.use_augmentation:
+                f.write(f"Augmentation Probability: {cfg.data.augmentation.prob}\n")
+                f.write(f"Rotation Degrees: {cfg.data.augmentation.rotation_degrees}\n")
+                f.write(f"Scale Range: {cfg.data.augmentation.scale_range}\n")
+            f.write("\n")
+
+            # Logging Configuration
+            f.write("LOGGING CONFIGURATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Using MLflow: {cfg.logging.use_mlflow}\n")
+            if cfg.logging.use_mlflow:
+                f.write(f"Experiment Name: {cfg.logging.experiment_name}\n")
+                f.write(f"Run Name: {cfg.logging.run_name}\n")
+            f.write(f"Visualization Frequency: {cfg.visualization.viz_frequency}\n")
+            f.write("\n")
+
+            # Additional Information
+            f.write("ADDITIONAL INFORMATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Output Directory: {output_dir}\n")
+            f.write(f"Command Line/Config Overrides: {get_overrides_str(cfg)}\n")
+            f.write("\n")
+
+            f.write("=" * 80 + "\n")
+            f.write("END OF CONFIGURATION SUMMARY\n")
+            f.write("=" * 80 + "\n")
+
+        print(f"Training configuration summary saved to: {summary_path}")
+        return summary_path
+
+    except Exception as e:
+        print(f"Error saving training configuration summary: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def get_overrides_str(cfg):
+    """
+    Attempts to extract override information from Hydra config if available.
+
+    Args:
+        cfg: The Hydra configuration object
+
+    Returns:
+        str: String representation of overrides or "Not available"
+    """
+    try:
+        # Try to access Hydra's override history if available
+        if hasattr(cfg, '_metadata') and hasattr(cfg._metadata, 'overrides'):
+            return ', '.join(cfg._metadata.overrides.items())
+        else:
+            return "Not available in config object"
+    except:
+        return "Could not extract overrides"
+
+
+def update_summary_with_results(output_dir, best_val_loss, training_time, epochs_completed, early_stopped=False):
+    """
+    Update the training configuration summary with the results of training.
+
+    Args:
+        output_dir: Directory where the summary file is located
+        best_val_loss: Best validation loss achieved during training
+        training_time: Total training time in seconds
+        epochs_completed: Number of epochs completed
+        early_stopped: Whether training was stopped early
+    """
+    import os
+    from datetime import timedelta
+
+    # Path to the summary file
+    summary_path = os.path.join(output_dir, 'summaries', "training_configuration.txt")
+
+    if not os.path.exists(summary_path):
+        print(f"Warning: Could not find configuration summary at {summary_path}")
+        return
+
+    try:
+        # Read the existing file
+        with open(summary_path, 'r') as f:
+            content = f.read()
+
+        # Format training time as hours:minutes:seconds
+        hours, remainder = divmod(training_time, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        formatted_time = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+
+        # Create results section
+        results_section = (
+                "\nTRAINING RESULTS\n" +
+                "-" * 50 + "\n" +
+                f"Best Validation Loss: {best_val_loss:.10f}\n" +
+                f"Epochs Completed: {epochs_completed}\n" +
+                f"Early Stopping Triggered: {'Yes' if early_stopped else 'No'}\n" +
+                f"Total Training Time: {formatted_time} (HH:MM:SS)\n" +
+                "\n"
+        )
+
+        # Find the end marker in the file
+        end_marker = "=" * 80 + "\nEND OF CONFIGURATION SUMMARY\n" + "=" * 80
+
+        if end_marker in content:
+            # Insert results before the end marker
+            updated_content = content.replace(end_marker, results_section + end_marker)
+        else:
+            # If end marker not found, just append to the end
+            updated_content = content + "\n" + results_section
+
+        # Write the updated content back to the file
+        with open(summary_path, 'w') as f:
+            f.write(updated_content)
+
+        print(f"Training results added to configuration summary: {summary_path}")
+
+        # Also create a separate results file for quick reference
+        results_path = os.path.join(output_dir, 'summaries', "training_results.txt")
+        with open(results_path, 'w') as f:
+            f.write("TRAINING RESULTS SUMMARY\n")
+            f.write("=" * 50 + "\n\n")
+            f.write(f"Best Validation Loss: {best_val_loss:.10f}\n")
+            f.write(f"Epochs Completed: {epochs_completed}\n")
+            f.write(f"Early Stopping Triggered: {'Yes' if early_stopped else 'No'}\n")
+            f.write(f"Total Training Time: {formatted_time} (HH:MM:SS)\n")
+
+        return True
+
+    except Exception as e:
+        print(f"Error updating training summary with results: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 
 if __name__ == "__main__":
     main()
