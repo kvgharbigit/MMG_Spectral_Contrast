@@ -547,7 +547,7 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
     model.train()
     outputs = []
     embedding_metrics_list = []
-    scaler = GradScaler()  # Create gradient scaler for mixed precision
+    scaler = torch.amp.GradScaler()  # Create gradient scaler for mixed precision
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:

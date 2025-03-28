@@ -1,4 +1,6 @@
 import os
+import gc
+
 import numpy as np
 import matplotlib.pyplot as plt
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb
@@ -691,48 +693,44 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
     import numpy as np
     import matplotlib.pyplot as plt
     from hsi_to_rgb import simple_hsi_to_rgb
+    import gc
 
     # Use only the first batch item for visualization
     orig_input = original_input[0].detach().cpu()
 
+    # Get model parameters for proper unpatchify calculation
+    spectral_patches = model.spectral_patches  # Should be 6
+    spatial_patches = model.spatial_patches  # Should be 400
+    embed_dim = model.embed_dim  # Should be 768
+
     # Generate the pixel-level reconstruction with memory optimization
     with torch.no_grad():
-        # Move to device and downsample if needed for visualization
+        # Move to device
         device = model.pixel_projection.weight.device
 
-        # Limit reconstruction computation to the first 1000 tokens if there are more
-        if pred_embeddings.shape[1] > 1000:
-            # Create a smaller version just for visualization
-            prediction_sample = pred_embeddings[0:1, :1000].to(device)
-            # Create a mask sample too
-            mask_sample = mask[0:1, :1000]
-        else:
-            prediction_sample = pred_embeddings.to(device)
-            mask_sample = mask
+        # Get the prediction tensor and ensure it has the right shape
+        # pred_embeddings shape is likely [B, L, D] where L is total patches
+        # we need to reshape it to [B, spectral_patches, spatial_patches, D]
+        B = pred_embeddings.shape[0]
+        total_tokens = spectral_patches * spatial_patches
 
-        # Generate reconstruction at a lower resolution for visualization if needed
-        if original_input.shape[3] > 200 or original_input.shape[4] > 200:
-            # Downsample original for comparison
-            smaller_shape = list(original_input.shape)
-            smaller_shape[3] = min(200, smaller_shape[3])
-            smaller_shape[4] = min(200, smaller_shape[4])
+        # Ensure we have the right number of tokens
+        if pred_embeddings.shape[1] >= total_tokens:
+            # Take just enough tokens from the full set
+            prediction_tensor = pred_embeddings[:, :total_tokens, :].to(device)
+            # Reshape to the expected format for unpatchify
+            prediction_reshaped = prediction_tensor.reshape(B, spectral_patches, spatial_patches, embed_dim)
 
-            # Downsample the original
-            smaller_original = torch.nn.functional.interpolate(
-                orig_input.unsqueeze(0),
-                size=(orig_input.shape[2], smaller_shape[3], smaller_shape[4]),
-                mode='trilinear'
-            )[0]
-
-            # Generate a reconstructed version at the smaller size
-            reconstructed = model.unpatchify(prediction_sample, tuple(smaller_shape))
+            # Now we can call unpatchify with the properly shaped tensor
+            reconstructed = model.unpatchify(prediction_reshaped, original_input.shape)
             reconstructed = reconstructed[0].detach().cpu()
-            orig_input = smaller_original
         else:
-            reconstructed = model.unpatchify(prediction_sample, original_input.shape)
-            reconstructed = reconstructed[0].detach().cpu()
+            # Not enough tokens, create a placeholder
+            print(
+                f"Warning: Not enough tokens for reconstruction. Have {pred_embeddings.shape[1]}, need {total_tokens}")
+            reconstructed = torch.zeros_like(orig_input)
 
-    # Convert to RGB for visualization with limited memory use
+    # Convert to RGB for visualization
     try:
         # Handle shape properly for RGB conversion
         if orig_input.shape[1] == 1:  # If [C, 1, T, H, W]
@@ -742,10 +740,9 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
             orig_input_hsi = orig_input
             recon_input_hsi = reconstructed
 
-        # Convert to RGB - limit spectral bands if needed
-        max_bands = min(30, orig_input_hsi.shape[0])
-        orig_rgb = simple_hsi_to_rgb(orig_input_hsi[:max_bands].unsqueeze(0))
-        recon_rgb = simple_hsi_to_rgb(recon_input_hsi[:max_bands].unsqueeze(0))
+        # Convert to RGB
+        orig_rgb = simple_hsi_to_rgb(orig_input_hsi.unsqueeze(0) if orig_input_hsi.dim() == 3 else orig_input_hsi)
+        recon_rgb = simple_hsi_to_rgb(recon_input_hsi.unsqueeze(0) if recon_input_hsi.dim() == 3 else recon_input_hsi)
 
         # Remove batch dimension if present
         if orig_rgb.dim() == 4 and orig_rgb.shape[0] == 1:
@@ -768,17 +765,13 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
         orig_rgb_np = np.zeros((h, w, 3))
         recon_rgb_np = np.zeros_like(orig_rgb_np)
 
-    # Clip values to valid range
-    orig_rgb_np = np.clip(orig_rgb_np, 0, 1)
-    recon_rgb_np = np.clip(recon_rgb_np, 0, 1)
-
     # Create a simplified error map
     try:
         error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1)).numpy()
     except:
         error_map = np.zeros((min(100, orig_input.shape[3]), min(100, orig_input.shape[4])))
 
-    # Create a simpler figure
+    # Create figure
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
     # First row: Original RGB, Reconstructed RGB
@@ -790,13 +783,13 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
     axes[0, 1].set_title("Reconstructed (RGB)")
     axes[0, 1].axis('off')
 
-    # Second row: Error map and simplified spectral profile
+    # Second row: Error map and spectral profile
     error_img = axes[1, 0].imshow(error_map, cmap='hot')
     plt.colorbar(error_img, ax=axes[1, 0])
     axes[1, 0].set_title("Error Map")
     axes[1, 0].axis('off')
 
-    # Simplified spectral profile plot
+    # Spectral profile plot
     try:
         mid_h, mid_w = error_map.shape[0] // 2, error_map.shape[1] // 2
         num_bands = min(20, orig_input.shape[2])  # Limit to 20 bands
@@ -809,17 +802,15 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
             orig_spectrum = orig_input[:num_bands, mid_h, mid_w].numpy()
             recon_spectrum = reconstructed[:num_bands, mid_h, mid_w].numpy()
 
-        # Plot
         axes[1, 1].plot(orig_spectrum, 'b-', label='Original')
         axes[1, 1].plot(recon_spectrum, 'r-', label='Reconstructed')
-        axes[1, 1].set_title(f"Sample Spectral Profile")
+        axes[1, 1].set_title(f"Spectral Profile at ({mid_h}, {mid_w})")
         axes[1, 1].set_xlabel("Band")
         axes[1, 1].set_ylabel("Value")
         axes[1, 1].legend()
     except Exception as e:
         print(f"Error plotting spectral profile: {e}")
-        axes[1, 1].text(0.5, 0.5, "Spectral profile unavailable",
-                        ha='center', va='center', transform=axes[1, 1].transAxes)
+        axes[1, 1].axis('off')
 
     plt.tight_layout()
 
@@ -827,9 +818,7 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
 
     # Clean up memory
-    del orig_input, reconstructed, prediction_sample, mask_sample
-    if 'smaller_original' in locals():
-        del smaller_original
+    del orig_input, reconstructed
     gc.collect()
 
     return fig
