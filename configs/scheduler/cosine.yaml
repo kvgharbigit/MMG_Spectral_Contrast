@@ -3,7 +3,7 @@
 # Learning rate scheduler settings
 use_scheduler: true
 type: cosine  # Options: cosine, step, reduce_on_plateau
-min_lr: 1e-7
+min_lr: 1e-8
 
 # New parameter for cosine warmup
 warmup_ratio: 0.00  # 1% of training for warmup phase
