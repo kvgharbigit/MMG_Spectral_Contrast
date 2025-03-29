@@ -685,9 +685,22 @@ def visualize_patch_reconstruction(original_tokens, predicted_tokens, mask, thic
 
 
 def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
-                                   thickness_mask=None, save_path=None):
+                                   thickness_mask=None, save_path=None, num_wavelengths=5):
     """
-    Visualize the reconstruction quality in pixel space using simple_hsi_to_rgb.
+    Visualize the reconstruction quality in pixel space comparing RGB visualization
+    and selected wavelength bands.
+
+    Args:
+        model: The model with unpatchify method
+        original_input: Original HSI data tensor [B, C, T, H, W]
+        pred_embeddings: Predicted embedding tensor [B, L, D]
+        mask: Binary mask indicating masked tokens [B, L]
+        thickness_mask: Optional thickness mask [B, 1, H, W]
+        save_path: Path to save the visualization
+        num_wavelengths: Number of wavelength bands to visualize (default=5)
+
+    Returns:
+        matplotlib.figure.Figure: The created figure
     """
     import torch
     import numpy as np
@@ -703,6 +716,11 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
     spatial_patches = model.spatial_patches  # Should be 400
     embed_dim = model.embed_dim  # Should be 768
 
+    # Print shape information for debugging
+    print(f"Original input shape: {orig_input.shape}")
+    print(f"Prediction embeddings shape: {pred_embeddings.shape}")
+    print(f"Expected tokens: {spectral_patches * spatial_patches}")
+
     # Generate the pixel-level reconstruction with memory optimization
     with torch.no_grad():
         # Move to device
@@ -714,28 +732,36 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
         B = pred_embeddings.shape[0]
         total_tokens = spectral_patches * spatial_patches
 
-        # Ensure we have the right number of tokens
-        if pred_embeddings.shape[1] >= total_tokens:
-            # Take just enough tokens from the full set
-            prediction_tensor = pred_embeddings[:, :total_tokens, :].to(device)
-            # Reshape to the expected format for unpatchify
-            prediction_reshaped = prediction_tensor.reshape(B, spectral_patches, spatial_patches, embed_dim)
+        # Ensure we have the right number of tokens - raise error if not
+        if pred_embeddings.shape[1] < total_tokens:
+            raise ValueError(
+                f"Not enough tokens for reconstruction. Have {pred_embeddings.shape[1]}, need {total_tokens}")
 
-            # Now we can call unpatchify with the properly shaped tensor
-            reconstructed = model.unpatchify(prediction_reshaped, original_input.shape)
-            reconstructed = reconstructed[0].detach().cpu()
-        else:
-            # Not enough tokens, create a placeholder
-            print(
-                f"Warning: Not enough tokens for reconstruction. Have {pred_embeddings.shape[1]}, need {total_tokens}")
-            reconstructed = torch.zeros_like(orig_input)
+        # Take just enough tokens from the full set
+        prediction_tensor = pred_embeddings[:, :total_tokens, :].to(device)
+        # Reshape to the expected format for unpatchify
+        prediction_reshaped = prediction_tensor.reshape(B, spectral_patches, spatial_patches, embed_dim)
 
-    # Convert to RGB for visualization
-    try:
-        # Handle shape properly for RGB conversion
-        if orig_input.shape[1] == 1:  # If [C, 1, T, H, W]
+        # Now we can call unpatchify with the properly shaped tensor
+        reconstructed = model.unpatchify(prediction_reshaped, original_input.shape)
+        reconstructed = reconstructed[0].detach().cpu()
+
+        # Print statistics for debugging
+        print(
+            f"Original stats: min={orig_input.min().item():.4f}, max={orig_input.max().item():.4f}, mean={orig_input.mean().item():.4f}, std={orig_input.std().item():.4f}")
+        print(
+            f"Reconstructed stats: min={reconstructed.min().item():.4f}, max={reconstructed.max().item():.4f}, mean={reconstructed.mean().item():.4f}, std={reconstructed.std().item():.4f}")
+
+    # Convert to RGB for visualization - no fallbacks, raise errors
+    # Handle shape properly for RGB conversion
+    if orig_input.dim() >= 3:
+        # Extract HSI data, handling different possible shapes
+        if orig_input.dim() == 4 and orig_input.shape[0] == 1:  # [1, T, H, W]
             orig_input_hsi = orig_input[0]  # Now [T, H, W]
             recon_input_hsi = reconstructed[0]
+        elif orig_input.dim() == 5 and orig_input.shape[0] == 1 and orig_input.shape[1] == 1:  # [1, 1, T, H, W]
+            orig_input_hsi = orig_input[0, 0]  # Now [T, H, W]
+            recon_input_hsi = reconstructed[0, 0]
         else:
             orig_input_hsi = orig_input
             recon_input_hsi = reconstructed
@@ -755,67 +781,123 @@ def visualize_pixel_reconstruction(model, original_input, pred_embeddings, mask,
             orig_rgb_np = orig_rgb.permute(1, 2, 0).numpy()
             recon_rgb_np = recon_rgb.permute(1, 2, 0).numpy()
         else:
-            # If unexpected shape, create simple visualization
-            orig_rgb_np = np.zeros((min(100, orig_input.shape[3]), min(100, orig_input.shape[4]), 3))
-            recon_rgb_np = np.zeros_like(orig_rgb_np)
-    except Exception as e:
-        print(f"Error in RGB conversion: {e}")
-        # Create simple placeholders
-        h, w = min(100, orig_input.shape[3]), min(100, orig_input.shape[4])
-        orig_rgb_np = np.zeros((h, w, 3))
-        recon_rgb_np = np.zeros_like(orig_rgb_np)
+            raise ValueError(
+                f"Unexpected RGB shape: {orig_rgb.shape}. Expected first dimension to be 3 (RGB channels).")
 
-    # Create a simplified error map
-    try:
-        error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1)).numpy()
-    except:
-        error_map = np.zeros((min(100, orig_input.shape[3]), min(100, orig_input.shape[4])))
+        # Print RGB stats for debugging
+        print(
+            f"RGB Original stats: min={orig_rgb_np.min():.4f}, max={orig_rgb_np.max():.4f}, mean={orig_rgb_np.mean():.4f}")
+        print(
+            f"RGB Reconstructed stats: min={recon_rgb_np.min():.4f}, max={recon_rgb_np.max():.4f}, mean={recon_rgb_np.mean():.4f}")
+    else:
+        raise ValueError(f"Input dimension too low: {orig_input.dim()}. Expected at least 3 dimensions.")
 
-    # Create figure
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    # Create a simplified error map - no fallbacks
+    error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1) if reconstructed.dim() > 3 else 0).numpy()
 
-    # First row: Original RGB, Reconstructed RGB
-    axes[0, 0].imshow(orig_rgb_np)
-    axes[0, 0].set_title("Original Input (RGB)")
-    axes[0, 0].axis('off')
+    # Extract spectral bands for visualization - no fallbacks
+    spectral_bands = []
 
-    axes[0, 1].imshow(recon_rgb_np)
-    axes[0, 1].set_title("Reconstructed (RGB)")
-    axes[0, 1].axis('off')
+    # Determine total number of spectral bands
+    if orig_input.dim() == 5:  # [B, C, T, H, W]
+        num_bands = orig_input.shape[2]
+        orig_bands = orig_input[0, 0]  # [T, H, W]
+        recon_bands = reconstructed[0, 0]
+    elif orig_input.dim() == 4:  # [B, T, H, W]
+        num_bands = orig_input.shape[1]
+        orig_bands = orig_input[0]  # [T, H, W]
+        recon_bands = reconstructed[0]
+    elif orig_input.dim() == 3:  # [T, H, W]
+        num_bands = orig_input.shape[0]
+        orig_bands = orig_input
+        recon_bands = reconstructed
+    else:
+        raise ValueError(f"Unexpected input shape: {orig_input.shape}")
 
-    # Second row: Error map and spectral profile
-    error_img = axes[1, 0].imshow(error_map, cmap='hot')
-    plt.colorbar(error_img, ax=axes[1, 0])
-    axes[1, 0].set_title("Error Map")
-    axes[1, 0].axis('off')
+    # Select evenly spaced bands for visualization
+    indices = np.linspace(0, num_bands - 1, num_wavelengths, dtype=int)
+    print(f"Visualizing wavelength bands at indices: {indices}")
 
-    # Spectral profile plot
-    try:
-        mid_h, mid_w = error_map.shape[0] // 2, error_map.shape[1] // 2
-        num_bands = min(20, orig_input.shape[2])  # Limit to 20 bands
+    for idx in indices:
+        if idx < num_bands:
+            spectral_bands.append({
+                'index': idx,
+                'original': orig_bands[idx].numpy(),
+                'reconstructed': recon_bands[idx].numpy(),
+                'error': ((orig_bands[idx] - recon_bands[idx]) ** 2).numpy()
+            })
 
-        # Extract profiles using slicing
-        if orig_input.dim() >= 4 and orig_input.shape[1] == 1:
-            orig_spectrum = orig_input[0, 0, :num_bands, mid_h, mid_w].numpy()
-            recon_spectrum = reconstructed[0, 0, :num_bands, mid_h, mid_w].numpy()
-        else:
-            orig_spectrum = orig_input[:num_bands, mid_h, mid_w].numpy()
-            recon_spectrum = reconstructed[:num_bands, mid_h, mid_w].numpy()
+    # Create figure layout: RGB visualization + wavelengths comparison
+    # Top row: RGB original and reconstruction
+    # Bottom rows: Wavelength comparisons (3 columns per row: original, reconstructed, error)
+    num_wavelength_rows = (num_wavelengths + 2) // 3  # Ceiling division to get number of rows
 
-        axes[1, 1].plot(orig_spectrum, 'b-', label='Original')
-        axes[1, 1].plot(recon_spectrum, 'r-', label='Reconstructed')
-        axes[1, 1].set_title(f"Spectral Profile at ({mid_h}, {mid_w})")
-        axes[1, 1].set_xlabel("Band")
-        axes[1, 1].set_ylabel("Value")
-        axes[1, 1].legend()
-    except Exception as e:
-        print(f"Error plotting spectral profile: {e}")
-        axes[1, 1].axis('off')
+    # Create figure with enough height to accommodate all rows
+    fig = plt.figure(figsize=(15, 8 + 4 * num_wavelength_rows))
+
+    # Define grid layout
+    gs = plt.GridSpec(2 + num_wavelength_rows, 3, figure=fig, height_ratios=[1, 1] + [1] * num_wavelength_rows)
+
+    # Plot RGB and Error map
+    ax_orig_rgb = fig.add_subplot(gs[0, 0:2])
+    ax_orig_rgb.imshow(orig_rgb_np)
+    ax_orig_rgb.set_title("Original Input (RGB)")
+    ax_orig_rgb.axis('off')
+
+    ax_recon_rgb = fig.add_subplot(gs[0, 2])
+    ax_recon_rgb.imshow(recon_rgb_np)
+    ax_recon_rgb.set_title("Reconstructed (RGB)")
+    ax_recon_rgb.axis('off')
+
+    # Plot error map in second row, spanning all columns
+    ax_error = fig.add_subplot(gs[1, :])
+    error_img = ax_error.imshow(error_map, cmap='hot')
+    ax_error.set_title("Reconstruction Error (Mean Squared Error)")
+    ax_error.axis('off')
+    plt.colorbar(error_img, ax=ax_error)
+
+    # Plot wavelength comparisons
+    for i, band in enumerate(spectral_bands):
+        row = 2 + i // 3
+        col = i % 3
+
+        # Create subplot for this wavelength
+        ax = fig.add_subplot(gs[row, col])
+
+        # Create side-by-side comparison for this wavelength
+        # Combine original, reconstructed, and error into one image
+        h, w = band['original'].shape
+        combined = np.zeros((h, w * 3))
+
+        # Normalize each image for better visualization
+        orig_norm = (band['original'] - band['original'].min()) / (
+                    band['original'].max() - band['original'].min() + 1e-9)
+        recon_norm = (band['reconstructed'] - band['reconstructed'].min()) / (
+                    band['reconstructed'].max() - band['reconstructed'].min() + 1e-9)
+
+        # Scale error to [0, 1] for visualization
+        error_norm = band['error'] / (band['error'].max() + 1e-9)
+
+        # Place images side by side
+        combined[:, 0:w] = orig_norm
+        combined[:, w:2 * w] = recon_norm
+        combined[:, 2 * w:3 * w] = error_norm
+
+        # Plot combined image
+        ax.imshow(combined, cmap='viridis')
+        ax.set_title(f"Wavelength Band {band['index']}")
+        ax.axis('off')
+
+        # Add labels below the image
+        ax.text(w / 2, h + 5, "Original", ha='center', transform=ax.transData)
+        ax.text(3 * w / 2, h + 5, "Reconstructed", ha='center', transform=ax.transData)
+        ax.text(5 * w / 2, h + 5, "Error", ha='center', transform=ax.transData)
 
     plt.tight_layout()
 
     if save_path:
         plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        print(f"Visualization saved to {save_path}")
 
     # Clean up memory
     del orig_input, reconstructed
