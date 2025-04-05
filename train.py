@@ -1,6 +1,5 @@
 import os
 
-from visualisation import visualize_embedding_space_loss
 #tw
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.putenv('KMP_DUPLICATE_LIB_OK', 'TRUE')
@@ -35,8 +34,6 @@ from dataset import PatientDataset, custom_collate_fn, create_patient_dataloader
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb  # These are already imported elsewhere
 from dataset import MultiModalTransforms
 from visualisation import (
-
-    visualize_patch_reconstruction,
     visualize_pixel_reconstruction  # Add this line
 )
 
