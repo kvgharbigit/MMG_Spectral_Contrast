@@ -35,7 +35,7 @@ from dataset import PatientDataset, custom_collate_fn, create_patient_dataloader
 from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb  # These are already imported elsewhere
 from dataset import MultiModalTransforms
 from visualisation import (
-    visualize_embedding_space_loss,
+
     visualize_patch_reconstruction,
     visualize_pixel_reconstruction  # Add this line
 )
@@ -342,75 +342,7 @@ def save_metrics_to_csv(metrics_dict, output_dir, epoch, split='train'):
     metrics_df.to_csv(csv_path, index=False)
 
 
-def calculate_embedding_metrics(pred_embeddings, target_embeddings, mask):
-    # Ensure tensors are detached and on CPU
-    pred = pred_embeddings.detach().cpu()
-    target = target_embeddings.detach().cpu()
-    mask_cpu = mask.detach().cpu()
 
-    # Diagnostic print statements
-    print("\n--- Embedding Metrics Diagnostic ---")
-    print(f"Pred embeddings shape: {pred.shape}")
-    print(f"Target embeddings shape: {target.shape}")
-    print(f"Mask shape: {mask_cpu.shape}")
-
-    # Ensure batch size and embedding dimension consistency
-    B, L, D = pred.shape
-    metrics = {}
-
-    for b in range(B):
-        # Get masked indices for this batch item
-        masked_indices = torch.where(mask_cpu[b] > 0.5)[0]
-
-        if len(masked_indices) == 0:
-            raise ValueError(f"No masked tokens found in batch {b}")
-
-        # Get embeddings for masked tokens
-        pred_masked = pred[b, masked_indices]
-        target_masked = target[b, masked_indices]
-
-        # Print shapes before comparison
-        print(f"\nBatch {b} Details:")
-        print(f"  Pred masked shape: {pred_masked.shape}")
-        print(f"  Target masked shape: {target_masked.shape}")
-
-        # If shapes don't match in the second dimension, raise an error
-        if pred_masked.shape[1] != target_masked.shape[1]:
-            raise ValueError(
-                f"Embedding dimension mismatch in batch {b}: "
-                f"Predicted shape {pred_masked.shape} does not match "
-                f"Target shape {target_masked.shape}"
-            )
-
-        # 1. Mean Euclidean Distance
-        distances = torch.norm(pred_masked - target_masked, dim=1)
-        batch_mean_dist = distances.mean().item()
-
-        # 2. Cosine Similarity
-        pred_norm = F.normalize(pred_masked, p=2, dim=1)
-        target_norm = F.normalize(target_masked, p=2, dim=1)
-        similarities = torch.sum(pred_norm * target_norm, dim=1)
-        batch_cos_sim = similarities.mean().item()
-
-        # 3. Token-wise MSE
-        batch_token_mse = ((pred_masked - target_masked) ** 2).mean(dim=1).mean().item()
-
-        # Accumulate metrics
-        if 'mean_embedding_distance' not in metrics:
-            metrics['mean_embedding_distance'] = []
-            metrics['mean_cosine_similarity'] = []
-            metrics['mean_token_mse'] = []
-
-        metrics['mean_embedding_distance'].append(batch_mean_dist)
-        metrics['mean_cosine_similarity'].append(batch_cos_sim)
-        metrics['mean_token_mse'].append(batch_token_mse)
-
-    # Calculate global averages
-    for key in metrics:
-        metrics[key] = sum(metrics[key]) / len(metrics[key])
-
-    print("\n--- End of Embedding Metrics Diagnostic ---\n")
-    return metrics
 
 def update_best_metrics(val_metrics, epoch, summaries_dir, current_lr=None):
     """
@@ -585,14 +517,7 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         }
         outputs.append(output_dict)
 
-        # Calculate embedding metrics and detach immediately
-        with torch.no_grad():
-            batch_embedding_metrics = calculate_embedding_metrics(
-                output['pred'].detach(),
-                output['original_tokens'].detach(),
-                output['mask'].detach()
-            )
-            embedding_metrics_list.append(batch_embedding_metrics)
+
 
         # Get current learning rate for progress bar
         current_lr = optimizer.param_groups[0]['lr']
@@ -650,13 +575,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             }
             outputs.append(output_dict)
 
-            # Calculate embedding metrics
-            batch_embedding_metrics = calculate_embedding_metrics(
-                output['pred'].detach(),
-                output['original_tokens'].detach(),
-                output['mask'].detach()
-            )
-            embedding_metrics_list.append(batch_embedding_metrics)
+
 
             # Update progress bar
             pbar.set_postfix({
@@ -996,117 +915,7 @@ def main(cfg: DictConfig):
         # Keep track of validation losses for early stopping
         val_losses.append(val_metrics['loss'])
 
-        # Visualize embedding space reconstruction every N epochs
-        if epoch % cfg.visualization.viz_frequency == 0:
-            print("Visualizing embedding space reconstruction...")
-            try:
-                # Get a validation batch
-                val_batch = next(iter(val_loader))
 
-                # Get model output with embeddings
-                with torch.no_grad():
-                    val_output = model(val_batch['hsi'].to(device),
-                                       {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                                        for k, v in val_batch['aux_data'].items()},
-                                       val_batch['batch_idx'].to(device))
-
-                # Create visualization directory
-                viz_dir = os.path.join(output_dir, 'visualizations')
-                os.makedirs(viz_dir, exist_ok=True)
-
-                # Save path for the embedding visualization
-                embedding_viz_path = os.path.join(viz_dir, f'embedding_viz_epoch_{epoch}.png')
-
-                # Visualize embedding space reconstruction
-                fig = visualize_embedding_space_loss(
-                    original_tokens=val_output['original_tokens'],
-                    predicted_tokens=val_output['pred'],
-                    mask=val_output['mask'],
-                    thickness_mask=val_output['thickness_mask'],
-                    save_path=embedding_viz_path
-                )
-                plt.close(fig)
-
-                # Log to TensorBoard
-                img = plt.imread(embedding_viz_path)
-                if img.shape[2] == 4:  # RGBA image with alpha channel
-                    img = img[:, :, :3]  # Remove alpha channel
-
-                # TensorBoard expects images in [C, H, W] format
-                img = np.transpose(img, (2, 0, 1))
-                writer.add_image(f"EmbeddingSpace/epoch_{epoch}", img, epoch, dataformats='CHW')
-
-                # Log to MLflow if enabled
-                if cfg.logging.use_mlflow:
-                    mlflow.log_artifact(embedding_viz_path, f"visualizations/epoch_{epoch}")
-
-                # Add patch reconstruction visualization
-                patch_viz_path = os.path.join(viz_dir, f'patch_reconstruction_epoch_{epoch}.png')
-                try:
-                    # Visualize patch reconstruction
-                    patch_fig = visualize_patch_reconstruction(
-                        original_tokens=val_output['original_tokens'],
-                        predicted_tokens=val_output['pred'],
-                        mask=val_output['mask'],
-                        thickness_mask=val_output['thickness_mask'],
-                        save_path=patch_viz_path
-                    )
-                    plt.close(patch_fig)
-
-                    # Log to TensorBoard
-                    patch_img = plt.imread(patch_viz_path)
-                    if patch_img.shape[2] == 4:  # RGBA image with alpha channel
-                        patch_img = patch_img[:, :, :3]  # Remove alpha channel
-
-                    # TensorBoard expects images in [C, H, W] format
-                    patch_img = np.transpose(patch_img, (2, 0, 1))
-                    writer.add_image(f"PatchReconstruction/epoch_{epoch}", patch_img, epoch, dataformats='CHW')
-
-                    # Log to MLflow if enabled
-                    if cfg.logging.use_mlflow:
-                        mlflow.log_artifact(patch_viz_path, f"visualizations/patch_reconstruction_epoch_{epoch}")
-                except Exception as e:
-                    print(f"Error in patch reconstruction visualization: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-                # Add pixel-level reconstruction visualization
-                pixel_viz_path = os.path.join(viz_dir, f'pixel_reconstruction_epoch_{epoch}.png')
-                try:
-                    # Visualize pixel-level reconstruction
-                    pixel_fig = visualize_pixel_reconstruction(
-                        model=model,
-                        original_input=val_output['original_input'],
-                        pred_embeddings=val_output['pred'],
-                        mask=val_output['mask'],
-                        thickness_mask=val_output['thickness_mask'],
-                        save_path=pixel_viz_path
-                    )
-                    plt.close(pixel_fig)
-
-                    # Log to TensorBoard
-                    pixel_img = plt.imread(pixel_viz_path)
-                    if pixel_img.shape[2] == 4:  # RGBA image with alpha channel
-                        pixel_img = pixel_img[:, :, :3]  # Remove alpha channel
-
-                    # TensorBoard expects images in [C, H, W] format
-                    pixel_img = np.transpose(pixel_img, (2, 0, 1))
-                    writer.add_image(f"PixelReconstruction/epoch_{epoch}", pixel_img, epoch, dataformats='CHW')
-
-                    # Log to MLflow if enabled
-                    if cfg.logging.use_mlflow:
-                        mlflow.log_artifact(pixel_viz_path, f"visualizations/pixel_reconstruction_epoch_{epoch}")
-                except Exception as e:
-                    print(f"Error in pixel reconstruction visualization: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            except Exception as e:
-                print(f"Error in embedding space visualization: {e}")
-                import traceback
-                traceback.print_exc()
-
-        # Save checkpoint
         # Save checkpoint
         is_best = val_metrics['loss'] < best_val_loss
         if is_best:
