@@ -343,55 +343,59 @@ def save_metrics_to_csv(metrics_dict, output_dir, epoch, split='train'):
 
 
 def calculate_embedding_metrics(pred_embeddings, target_embeddings, mask):
-    """
-    Calculate metrics to evaluate embedding space reconstruction quality.
-
-    Args:
-        pred_embeddings (torch.Tensor): Predicted embeddings [B, L, D]
-        target_embeddings (torch.Tensor): Target embeddings [B, L, D]
-        mask (torch.Tensor): Binary mask (1=masked, 0=visible) [B, L]
-
-    Returns:
-        dict: Dictionary of embedding metrics
-    """
-    # Move tensors to CPU for calculation
+    # Ensure tensors are detached and on CPU
     pred = pred_embeddings.detach().cpu()
     target = target_embeddings.detach().cpu()
     mask_cpu = mask.detach().cpu()
 
-    # Get masked tokens only
-    batch_size = pred.shape[0]
+    # Diagnostic print statements
+    print("\n--- Embedding Metrics Diagnostic ---")
+    print(f"Pred embeddings shape: {pred.shape}")
+    print(f"Target embeddings shape: {target.shape}")
+    print(f"Mask shape: {mask_cpu.shape}")
+
+    # Ensure batch size and embedding dimension consistency
+    B, L, D = pred.shape
     metrics = {}
 
-    # Calculate metrics across the batch
-    for b in range(batch_size):
+    for b in range(B):
         # Get masked indices for this batch item
         masked_indices = torch.where(mask_cpu[b] > 0.5)[0]
 
         if len(masked_indices) == 0:
-            continue
+            raise ValueError(f"No masked tokens found in batch {b}")
 
         # Get embeddings for masked tokens
         pred_masked = pred[b, masked_indices]
         target_masked = target[b, masked_indices]
+
+        # Print shapes before comparison
+        print(f"\nBatch {b} Details:")
+        print(f"  Pred masked shape: {pred_masked.shape}")
+        print(f"  Target masked shape: {target_masked.shape}")
+
+        # If shapes don't match in the second dimension, raise an error
+        if pred_masked.shape[1] != target_masked.shape[1]:
+            raise ValueError(
+                f"Embedding dimension mismatch in batch {b}: "
+                f"Predicted shape {pred_masked.shape} does not match "
+                f"Target shape {target_masked.shape}"
+            )
 
         # 1. Mean Euclidean Distance
         distances = torch.norm(pred_masked - target_masked, dim=1)
         batch_mean_dist = distances.mean().item()
 
         # 2. Cosine Similarity
-        # Normalize embeddings for cosine similarity
         pred_norm = F.normalize(pred_masked, p=2, dim=1)
         target_norm = F.normalize(target_masked, p=2, dim=1)
-
-        # Calculate pairwise cosine similarity
         similarities = torch.sum(pred_norm * target_norm, dim=1)
         batch_cos_sim = similarities.mean().item()
 
         # 3. Token-wise MSE
         batch_token_mse = ((pred_masked - target_masked) ** 2).mean(dim=1).mean().item()
 
-        # Store batch metrics
+        # Accumulate metrics
         if 'mean_embedding_distance' not in metrics:
             metrics['mean_embedding_distance'] = []
             metrics['mean_cosine_similarity'] = []
@@ -402,15 +406,10 @@ def calculate_embedding_metrics(pred_embeddings, target_embeddings, mask):
         metrics['mean_token_mse'].append(batch_token_mse)
 
     # Calculate global averages
-    if metrics:
-        for key in metrics:
-            metrics[key] = sum(metrics[key]) / len(metrics[key])
-    else:
-        # Default values if no valid metrics were calculated
-        metrics['mean_embedding_distance'] = 0.0
-        metrics['mean_cosine_similarity'] = 0.0
-        metrics['mean_token_mse'] = 0.0
+    for key in metrics:
+        metrics[key] = sum(metrics[key]) / len(metrics[key])
 
+    print("\n--- End of Embedding Metrics Diagnostic ---\n")
     return metrics
 
 def update_best_metrics(val_metrics, epoch, summaries_dir, current_lr=None):

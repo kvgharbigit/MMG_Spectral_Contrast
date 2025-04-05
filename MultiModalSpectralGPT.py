@@ -198,25 +198,25 @@ class MultiModalSpectralGPT(nn.Module):
 
     def __init__(
             self,
-            analysis_dim=500,  # Common spatial dimension for all modalities
-            patch_size=(25, 25),  # Spatial patch size for tokenization
-            in_chans=1,  # Input channels for HSI (typically 1)
-            aux_chans=1,  # Channels for auxiliary modalities (all now 1 channel/grayscale)
-            embed_dim=768,  # Main transformer embedding dimension
-            depth=16,  # Number of transformer layers i.e. in hsi encoder
-            num_heads=12,  # Number of attention heads per transformer
-            decoder_embed_dim=512,  # Embedding dimension in decoder
-            decoder_depth=4,  # Number of decoder transformer layers
-            decoder_num_heads=16,  # Number of attention heads in decoder
-            mlp_ratio=4.0,  # Expansion ratio for MLP in transformer blocks
-            num_frames=30,  # Number of frames/spectral bands
-            t_patch_size=5,  # Temporal/spectral patch size
-            norm_layer=partial(nn.LayerNorm, eps=1e-6),  # Normalization layer
-            aux_embed_dim=256,  # Embedding dimension for auxiliary features
-            temperature=0.07,  # Temperature for contrastive loss scaling
-            mask_ratio=0.75,  # Proportion of tokens to mask in MAE
-            contrastive_mode='global',  # Type of contrastive learning ('global' or 'spatial')
-            use_thickness_mask=False,  # Whether to use thickness mask for rim exclusion
+            analysis_dim=500,
+            patch_size=(25, 25),
+            t_patch_size=5,
+            in_chans=1,
+            embed_dim=768,
+            depth=16,
+            num_heads=12,
+            decoder_embed_dim=512,
+            decoder_depth=4,
+            decoder_num_heads=16,
+            mlp_ratio=4.0,
+            num_frames=30,
+            aux_chans=1,
+            aux_embed_dim=256,
+            temperature=0.07,
+            mask_ratio=0.75,
+            contrastive_mode='global',
+            use_thickness_mask=False,
+            norm_layer=partial(nn.LayerNorm, eps=1e-6),
             **kwargs
     ):
         super().__init__()
@@ -224,19 +224,27 @@ class MultiModalSpectralGPT(nn.Module):
         # Convert patch_size to tuple if it isn't already
         patch_size = to_2tuple(patch_size)
 
+        # Dynamically calculate pixel output dimension
+        pixel_output_dim = (
+                patch_size[0] *  # Spatial patch width
+                patch_size[1] *  # Spatial patch height
+                t_patch_size *  # Temporal patch size
+                in_chans  # Input channels
+        )
+
         # Store configuration parameters
         self.analysis_dim = analysis_dim
         self.patch_size = patch_size
         self.mask_ratio = mask_ratio
         self.embed_dim = embed_dim
         self.t_patch_size = t_patch_size
-        self.contrastive_mode = contrastive_mode  # Parameter for contrastive learning mode
-        self.use_thickness_mask = use_thickness_mask  # Whether to use thickness mask
+        self.contrastive_mode = contrastive_mode
+        self.use_thickness_mask = use_thickness_mask
 
         # Derived parameters for patch organization
-        self.patches_per_dim = analysis_dim // patch_size[0]  # Number of patches in one spatial dimension
-        self.spatial_patches = self.patches_per_dim * self.patches_per_dim  # Total spatial patches
-        self.spectral_patches = num_frames // t_patch_size  # Number of spectral/temporal patches
+        self.patches_per_dim = analysis_dim // patch_size[0]
+        self.spatial_patches = self.patches_per_dim * self.patches_per_dim
+        self.spectral_patches = num_frames // t_patch_size
 
         # Set the expected number of modalities for loss standardization
         self.num_expected_modalities = 3  # ir, af, thickness
@@ -275,8 +283,17 @@ class MultiModalSpectralGPT(nn.Module):
         # Decoder components
         # Projects encoder features to decoder dimension
         self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim)
+
+        # New: Dynamically created projection layer to pixel output dimension
+        self.decoder_pred = nn.Sequential(
+            nn.Linear(decoder_embed_dim, decoder_embed_dim),  # Optional intermediate layer
+            nn.GELU(),  # Optional activation
+            nn.Linear(decoder_embed_dim, pixel_output_dim)  # Final projection to pixel dimension
+        )
+
         # Position embeddings for decoder
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
+
         # Decoder transformer blocks
         self.decoder_blocks = nn.ModuleList([
             Block(
@@ -290,16 +307,6 @@ class MultiModalSpectralGPT(nn.Module):
         # Final normalization layers
         self.norm = norm_layer(embed_dim)
         self.decoder_norm = norm_layer(decoder_embed_dim)
-
-        # Calculate patch pixels
-        patch_pixels = patch_size[0] * patch_size[1] * t_patch_size * in_chans
-        # Decoder prediction head (now predicts pixel values directly)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_pixels)
-        # Initialize weights
-        nn.init.xavier_uniform_(self.decoder_pred.weight)
-        nn.init.zeros_(self.decoder_pred.bias)
-
-
 
         # Contrastive learning components
         self.temperature = temperature
@@ -340,10 +347,23 @@ class MultiModalSpectralGPT(nn.Module):
         # Initialize positional embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
 
-
-
         # Initialize weights
         self.initialize_weights()
+
+        # Add detailed print statements
+        print(f"\nPatch Configuration:")
+        print(f"  Spatial Patch Size: {patch_size}")
+        print(f"  Temporal Patch Size: {t_patch_size}")
+        print(f"  Pixel Output Dimension: {pixel_output_dim}")
+
+        # Calculate and print derived parameters
+        spatial_patches_h = self.analysis_dim // self.patch_size[0]
+        spatial_patches_w = self.analysis_dim // self.patch_size[1]
+        spectral_patches = num_frames // self.t_patch_size
+
+        print(f"  Spatial Patches: {spatial_patches_h} x {spatial_patches_w}")
+        print(f"  Spectral Patches: {spectral_patches}")
+        print(f"  Total Patches: {spatial_patches_h * spatial_patches_w * spectral_patches}")
 
     def _make_aux_encoder(self, in_channels, embed_dim):
         """Creates a ViT encoder for auxiliary modalities."""
