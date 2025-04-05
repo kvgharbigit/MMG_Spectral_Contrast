@@ -361,6 +361,7 @@ class MultiModalSpectralGPT(nn.Module):
         spatial_patches_w = self.analysis_dim // self.patch_size[1]
         spectral_patches = num_frames // self.t_patch_size
 
+
         print(f"  Spatial Patches: {spatial_patches_h} x {spatial_patches_w}")
         print(f"  Spectral Patches: {spectral_patches}")
         print(f"  Total Patches: {spatial_patches_h * spatial_patches_w * spectral_patches}")
@@ -1060,11 +1061,20 @@ class MultiModalSpectralGPT(nn.Module):
         original_tokens = original_tokens.reshape(B, T * HW, D)
         original_tokens = original_tokens + self.pos_embed
 
+        # Print shape of original tokens
+        print(f"Original tokens shape: {original_tokens.shape}")
+
         # Encode with masking for reconstruction
         latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
 
-        # Decode and reconstruct (now directly to pixels)
+        # Print shape of latent embeddings
+        print(f"Latent embeddings shape: {latent.shape}")
+
+        # Decode and reconstruct
         pred_tokens = self.forward_decoder(latent, ids_restore)
+
+        # Print shape of predicted tokens
+        print(f"Predicted tokens shape: {pred_tokens.shape}")
 
         # Reshape for unpatchify (from flat token sequence to organized patches)
         pred_tokens_reshaped = pred_tokens.reshape(
@@ -1102,6 +1112,7 @@ class MultiModalSpectralGPT(nn.Module):
 
         # Calculate total loss
         loss = loss_recon + loss_contrast
+
 
         return {
             'loss': loss,
