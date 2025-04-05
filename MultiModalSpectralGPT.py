@@ -291,8 +291,13 @@ class MultiModalSpectralGPT(nn.Module):
         self.norm = norm_layer(embed_dim)
         self.decoder_norm = norm_layer(decoder_embed_dim)
 
-        # Decoder prediction head (predicts in embedding space)
-        self.decoder_pred = nn.Linear(decoder_embed_dim, embed_dim)
+        # Calculate patch pixels
+        patch_pixels = patch_size[0] * patch_size[1] * t_patch_size * in_chans
+        # Decoder prediction head (now predicts pixel values directly)
+        self.decoder_pred = nn.Linear(decoder_embed_dim, patch_pixels)
+        # Initialize weights
+        nn.init.xavier_uniform_(self.decoder_pred.weight)
+        nn.init.zeros_(self.decoder_pred.bias)
 
 
 
@@ -335,12 +340,7 @@ class MultiModalSpectralGPT(nn.Module):
         # Initialize positional embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
 
-        # Create projection layer from embedding to pixel space
-        patch_pixels = patch_size[0] * patch_size[1] * t_patch_size * in_chans
-        self.pixel_projection = nn.Linear(embed_dim, patch_pixels)
-        # Initialize weights
-        nn.init.xavier_uniform_(self.pixel_projection.weight)
-        nn.init.zeros_(self.pixel_projection.bias)
+
 
         # Initialize weights
         self.initialize_weights()
@@ -816,52 +816,6 @@ class MultiModalSpectralGPT(nn.Module):
 
 
 
-    def forward_loss_in_embedding_space(self, pred, target, mask, thickness_mask=None):
-        """
-        Compute loss in embedding space by directly comparing predicted embeddings
-        to target embeddings from the patches.
-
-        Args:
-            pred (torch.Tensor): Predicted embeddings from decoder of shape [B, L, D]
-            target (torch.Tensor): Original embeddings from encoder of shape [B, L, D]
-            mask (torch.Tensor): Binary mask indicating which tokens were masked (1=masked, 0=visible)
-            thickness_mask (torch.Tensor, optional): Patch-level mask indicating valid image regions
-
-        Returns:
-            torch.Tensor: Reconstruction loss in embedding space
-        """
-        # We only compute loss on masked tokens
-        B, L, D = pred.shape
-
-        # Apply the MAE mask (we only compute loss on masked regions)
-        # Expand mask for broadcasting
-        mask_expanded = mask.unsqueeze(-1).expand_as(pred)  # [B, L, D]
-
-        # If thickness mask is provided, convert it to patch level and apply it
-        if thickness_mask is not None and self.use_thickness_mask:
-            # Convert pixel-level mask to patch-level
-            patch_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)  # [B, num_patches]
-
-            # Expand patch mask for broadcasting
-            patch_mask_expanded = patch_mask.unsqueeze(-1).expand_as(pred)  # [B, L, D]
-
-            # Combine MAE mask with thickness mask (both must be 1 for a token to be used)
-            # For MAE mask, 1 = masked token, for thickness mask, 1 = valid region
-            combined_mask = mask_expanded * patch_mask_expanded
-
-            # Compute squared error only on tokens that are both masked and in valid regions
-            loss = ((pred - target) ** 2) * combined_mask
-
-            # Sum loss and normalize by the number of tokens that contribute
-            valid_token_count = combined_mask.sum() + 1e-6  # Add small epsilon to avoid division by zero
-            return loss.sum() / valid_token_count
-        else:
-            # No thickness mask, just use MAE mask
-            loss = ((pred - target) ** 2) * mask_expanded
-
-            # Sum loss and normalize by the number of masked tokens
-            masked_token_count = mask.sum() * D + 1e-6  # Multiply by embedding dim and add epsilon
-            return loss.sum() / masked_token_count
 
     def create_patch_mask_from_pixel_mask(self, pixel_mask):
         """
@@ -914,56 +868,48 @@ class MultiModalSpectralGPT(nn.Module):
 
         return patch_mask
 
-    def unpatchify(self, embeddings, original_shape):
+    def unpatchify(self, patches, original_shape):
         """
-        Convert patch embeddings back to pixel space.
+        Convert patch tokens directly to pixel space.
 
         Args:
-            embeddings: Tensor of shape [B, L, D] or [B, spectral_patches, spatial_patches, D]
-            original_shape: Tuple representing the original input shape [B, C, T, H, W]
+            patches: Tensor of shape [B, L, patch_pixels] or [B, S, P, patch_pixels]
+            original_shape: Tuple of original input shape [B, C, T, H, W]
 
         Returns:
             Tensor of shape [B, C, T, H, W] representing reconstructed pixels
         """
         B, C, T, H, W = original_shape
-
-        # Get patch dimensions
         patch_h, patch_w = self.patch_size
         t_patch = self.t_patch_size
 
         # Reshape if needed
-        if len(embeddings.shape) == 3:  # [B, L, D]
-            B, L, D = embeddings.shape
-            embeddings = embeddings.reshape(B, self.spectral_patches, self.spatial_patches, D)
+        if len(patches.shape) == 3:  # [B, L, patch_pixels]
+            patches = patches.reshape(B, self.spectral_patches, self.spatial_patches, -1)
 
-        # Ensure the pixel projection is on the same device as the embeddings
-        if self.pixel_projection.weight.device != embeddings.device:
-            self.pixel_projection = self.pixel_projection.to(embeddings.device)
-
-        # Project from embedding space to patch space
-        B, S, P, D = embeddings.shape
-        embeddings_flat = embeddings.reshape(B * S * P, D)
-        patches_flat = self.pixel_projection(embeddings_flat)
-        patches = patches_flat.reshape(B, S, P, patch_h * patch_w * t_patch * C)
-
-        # Reshape to get the proper patch dimensions
+        # Calculate spatial dimensions
         spatial_h = H // patch_h
         spatial_w = W // patch_w
-        patches = patches.reshape(B, S, spatial_h, spatial_w, t_patch, patch_h, patch_w, C)
 
-        # Rearrange dimensions to prepare for merging patches
+        # Reshape to get individual patch dimensions
+        patches = patches.reshape(B, self.spectral_patches, spatial_h, spatial_w, t_patch, patch_h, patch_w, C)
+
+        # Permute dimensions to match original image layout
         patches = patches.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
-        patches = patches.reshape(B, C, S * t_patch, H, W)
 
-        # Ensure spectral dimension matches the original
-        if S * t_patch != T:
-            if S * t_patch > T:
-                patches = patches[:, :, :T, :, :]
+        # Final reshape to image space
+        reconstructed = patches.reshape(B, C, self.spectral_patches * t_patch, H, W)
+
+        # Handle any dimension mismatch (e.g., if spectral dimensions don't match exactly)
+        if reconstructed.shape[2] != T:
+            if reconstructed.shape[2] > T:
+                reconstructed = reconstructed[:, :, :T, :, :]
             else:
-                padding = torch.zeros(B, C, T - S * t_patch, H, W, device=patches.device)
-                patches = torch.cat([patches, padding], dim=2)
+                # Pad if needed
+                padding = torch.zeros(B, C, T - reconstructed.shape[2], H, W, device=reconstructed.device)
+                reconstructed = torch.cat([reconstructed, padding], dim=2)
 
-        return patches
+        return reconstructed
 
     def token_mask_to_pixel_mask(self, token_mask, original_shape):
         """
@@ -1015,15 +961,12 @@ class MultiModalSpectralGPT(nn.Module):
 
         return pixel_mask
 
-    def forward_loss_in_pixel_space(self, pred_embeddings, target_embeddings, original_input, mask,
-                                    thickness_mask=None):
+    def forward_loss_in_pixel_space(self, pred_pixels, original_input, mask, thickness_mask=None):
         """
-        Compute loss in pixel space by decoding the embeddings back to pixels and
-        comparing with the original input.
+        Compute loss in pixel space by directly comparing with the original input.
 
         Args:
-            pred_embeddings: Predicted embeddings from decoder of shape [B, L, D]
-            target_embeddings: Original embeddings from encoder of shape [B, L, D]
+            pred_pixels: Reconstructed pixels from decoder of shape [B, C, T, H, W]
             original_input: Original input images of shape [B, C, T, H, W]
             mask: Binary mask indicating which tokens were masked (1=masked, 0=visible)
             thickness_mask: Mask indicating valid image regions (optional)
@@ -1031,9 +974,6 @@ class MultiModalSpectralGPT(nn.Module):
         Returns:
             torch.Tensor: Reconstruction loss in pixel space
         """
-        # Convert embeddings back to pixel space
-        reconstructed_pixels = self.unpatchify(pred_embeddings, original_input.shape)
-
         # Convert token mask to pixel mask
         pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)
 
@@ -1048,22 +988,22 @@ class MultiModalSpectralGPT(nn.Module):
             combined_mask = pixel_mask * thickness_mask
 
             # Compute MSE only on pixels that are both masked and in valid regions
-            pixel_mse = ((reconstructed_pixels - original_input) ** 2) * combined_mask
+            pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
 
             # Sum loss and normalize by the number of pixels that contribute
             valid_pixel_count = combined_mask.sum() + 1e-6  # Add small epsilon to avoid division by zero
             return pixel_mse.sum() / valid_pixel_count
         else:
             # No thickness mask, just use MAE mask
-            pixel_mse = ((reconstructed_pixels - original_input) ** 2) * pixel_mask
+            pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
 
             # Sum loss and normalize by the number of masked pixels
             masked_pixel_count = pixel_mask.sum() + 1e-6
             return pixel_mse.sum() / masked_pixel_count
 
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
-        """Forward pass through the full model with configurable contrastive loss mode."""
-        # Apply spatial registration to ensure all modalities have the same dimensions
+        """Forward pass through the full model with direct pixel prediction."""
+        # Apply spatial registration
         hsi_img, aux_data, thickness_mask = self.spatial_registration(hsi_img, aux_data)
 
         # Store original input for pixel-level loss calculation
@@ -1073,7 +1013,7 @@ class MultiModalSpectralGPT(nn.Module):
         if not self.use_thickness_mask:
             thickness_mask = None
 
-        # Dynamically set up patch embedding based on preprocessed image
+        # Setup patch embedding
         self._setup_patch_embedding(hsi_img)
 
         # Create unmasked embeddings for contrastive learning
@@ -1094,8 +1034,7 @@ class MultiModalSpectralGPT(nn.Module):
         if thickness_mask is not None:
             thickness_mask = thickness_mask.to(device)
 
-        # Store original tokens for target in loss calculation
-        # First, get original patch tokens (without masking)
+        # Store original tokens for token-level loss if needed
         original_tokens = self.patch_embed(hsi_img)
         B, T, HW, D = original_tokens.shape
         original_tokens = original_tokens.reshape(B, T * HW, D)
@@ -1104,13 +1043,20 @@ class MultiModalSpectralGPT(nn.Module):
         # Encode with masking for reconstruction
         latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
 
-        # Decode and reconstruct
-        pred = self.forward_decoder(latent, ids_restore)
+        # Decode and reconstruct (now directly to pixels)
+        pred_tokens = self.forward_decoder(latent, ids_restore)
 
-        # Calculate reconstruction loss in pixel space instead of embedding space
+        # Reshape for unpatchify (from flat token sequence to organized patches)
+        pred_tokens_reshaped = pred_tokens.reshape(
+            B, self.spectral_patches, self.spatial_patches, -1
+        )
+
+        # Unpatchify to pixel space directly
+        reconstructed_pixels = self.unpatchify(pred_tokens_reshaped, original_input.shape)
+
+        # Calculate reconstruction loss directly in pixel space
         loss_recon = self.forward_loss_in_pixel_space(
-            pred,
-            original_tokens,
+            reconstructed_pixels,
             original_input,
             mask,
             thickness_mask
@@ -1127,7 +1073,6 @@ class MultiModalSpectralGPT(nn.Module):
             if num_available > 0:
                 if self.contrastive_mode == 'global':
                     aux_embeddings = self.encode_auxiliary(aux_data)
-                    # Pass thickness_mask to global contrastive loss
                     loss_contrast = self.contrastive_loss_global(unmasked_features, aux_embeddings, batch_idx,
                                                                  thickness_mask)
                 else:
@@ -1143,10 +1088,11 @@ class MultiModalSpectralGPT(nn.Module):
             'loss_recon': loss_recon,
             'loss_contrast': loss_contrast,
             'num_modalities': torch.tensor(num_available, device=device),
-            'pred': pred,
+            'pred': pred_tokens,
             'mask': mask,
             'thickness_mask': thickness_mask,
             'contrastive_mode': self.contrastive_mode,
-            'original_tokens': original_tokens,  # Include original tokens for visualization
-            'original_input': original_input  # Include original input for pixel-level visualization
+            'original_tokens': original_tokens,
+            'original_input': original_input,
+            'reconstructed_pixels': reconstructed_pixels  # Add reconstructed pixels to output
         }

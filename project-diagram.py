@@ -36,7 +36,7 @@ Overarching Model Architecture Diagram:
 |  - Random Masking (75%)         |  | Path (Unmasked)         |<-+
 |  - Cross-Attention Conditioning |  | - Global or Spatial Mode|
 |  - Transformer Processing       |  +-------------------------+
-|  - Decoding & Reconstruction    |          |
+|  - Direct Pixel Prediction      |          |
 +---------------------------------+          v
      |                          +-------------------------+
      |                          | Mode Selection:         |
@@ -273,6 +273,34 @@ model = MultiModalSpectralGPT(
     contrastive_mode='global'   # or 'spatial' - Contrastive learning mode
 )
 
+Updated Reconstruction Path Flow:
+-----------------------------
+1. Encoder and Conditioning (same as before)
+   - Apply random masking (75%)
+   - Process with transformer blocks and cross-attention
+   - Output encoded latent features
+
+2. Decoder Path (Updated)
+   - Project latent to decoder dimension: decoder_embed
+   - Add mask tokens for masked positions
+   - Process through decoder transformer blocks
+   - Previously: Predict embeddings, then convert to pixels via pixel_projection
+   - Now: Directly predict pixels with decoder_pred
+   - Shape: [B, L, patch_pixels] (patch_pixels = patch_h * patch_w * t_patch * in_chans)
+
+3. Unpatchify (Updated)
+   - Take predicted patch pixels (no separate projection needed)
+   - Reshape to organize patches: [B, spectral_patches, spatial_patches, patch_pixels]
+   - Further reshape to separate dimensions: [B, spectral_patches, spatial_h, spatial_w, t_patch, patch_h, patch_w, C]
+   - Permute dimensions to align with original format
+   - Final shape: [B, C, T, H, W]
+
+4. Loss Calculation (Same)
+   - Apply token mask to pixel mask
+   - Only compute loss on masked pixels
+   - If thickness mask is used, combine with MAE mask
+   - Normalize by count of valid pixels
+
 Training Process Flow (with Rim Masking):
 --------------------
 1. Registration & Preprocessing
@@ -288,7 +316,8 @@ Training Process Flow (with Rim Masking):
    a. MAE Reconstruction Path:
       - Apply random masking (75%)
       - Apply cross-attention conditioning
-      - Reconstruct masked tokens
+      - Transformer processing of latent features
+      - Decoder directly predicts pixels (updated)
       - Only compute loss on valid regions (not in rim)
 
    b. Contrastive Path with Rim Masking:
@@ -301,25 +330,22 @@ Training Process Flow (with Rim Masking):
    - Total Loss = Reconstruction Loss + Contrastive Loss
    - Both losses exclude rim areas
 
-Advantages of Rim Masking:
------------------------
-1. Focused Learning
-   - Model focuses on learning patterns in actual data regions
-   - Prevents "wasting" model capacity on uninformative black areas
+Advantages of Direct Pixel Prediction:
+----------------------------------
+1. Simplified Architecture
+   - Removes an intermediate transformation layer (pixel_projection)
+   - More direct learning signal from loss to decoder
 
-2. Improved Reconstruction Quality
-   - Loss is normalized by count of valid tokens
-   - More accurate assessment of performance in areas that matter
+2. More Efficient Training
+   - Fewer parameters to train
+   - More direct gradient flow
 
-3. Better Contrastive Learning
-   - Aligns features from valid regions across modalities
-   - Creates more meaningful cross-modal representations
+3. Better Reconstructions
+   - Decoder learns to directly predict the pixel values
+   - No need to learn a separate embedding-to-pixel mapping
 
-4. Resource Efficiency
-   - Computational resources focus on informative regions
-   - More efficient learning process
-
-5. Consistent Evaluation
-   - Performance metrics reflect reconstruction of meaningful areas
-   - More reliable comparison between models
+4. Compatible with Existing Benefits
+   - Maintains all advantages of rim masking
+   - Preserves both global and spatial contrastive learning modes
+   - Still supports cross-modal conditioning
 """
