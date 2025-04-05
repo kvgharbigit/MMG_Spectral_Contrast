@@ -17,6 +17,41 @@ def find_patient_dirs(parent_dir):
     return patient_dirs
 
 
+def normalize_hsi_data(img):
+    """
+    Robust normalization for HSI data with percentile-based approach.
+
+    Args:
+        img (np.ndarray): Input HSI data
+
+    Returns:
+        np.ndarray: Normalized HSI data
+    """
+    # Convert to float32
+    img = img.astype(np.float32)
+
+    # Handle different input types
+    if img.dtype == np.uint8:
+        return img.astype(np.float32) / 255.0
+    elif img.dtype == np.uint16:
+        return img.astype(np.float32) / 65535.0
+
+    # Percentile-based normalization
+    p1, p99 = np.percentile(img, [1, 99])
+
+    # Clip to remove extreme outliers
+    img_clipped = np.clip(img, p1, p99)
+
+    # Normalize to [0, 1] range
+    img_norm = (img_clipped - p1) / (p99 - p1 + 1e-8)
+
+    # Optional: print normalization details for debugging
+    print(
+        f"HSI Normalization: Original range [{img.min():.4f}, {img.max():.4f}] → [{img_norm.min():.4f}, {img_norm.max():.4f}]")
+
+    return img_norm
+
+
 def load_hsi_data(patient_dir):
     """Load HSI data from .h5 file with detailed error handling and shape logging."""
     h5_files = glob.glob(os.path.join(patient_dir, '*.h5'))
@@ -64,6 +99,9 @@ def load_hsi_data(patient_dir):
             if 'hsi_data' not in locals():
                 print(f"Could not find HSI data in {h5_path}")
                 return torch.zeros((1, 1, 30, 500, 500), dtype=torch.float32)
+
+            # Normalize the data
+            hsi_data = normalize_hsi_data(hsi_data)
 
             # Format the data properly
             print(f"Raw HSI data shape: {hsi_data.shape}, dtype: {hsi_data.dtype}")

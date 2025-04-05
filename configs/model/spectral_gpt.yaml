@@ -3,10 +3,10 @@
 # Model architecture parameters
 analysis_dim: 500
 patch_size: [25, 25]
-embed_dim: 1020
+embed_dim: 2304
 depth: 16
 num_heads: 12
-decoder_embed_dim: 512
+decoder_embed_dim: 2304
 decoder_depth: 4
 decoder_num_heads: 16
 mlp_ratio: 4.0
