@@ -204,12 +204,7 @@ def calculate_metrics(outputs, embedding_metrics_list=None, optimizer=None):
         'num_modalities': 0.0,
     }
 
-    # Add embedding metrics if available
-    if embedding_metrics_list and len(embedding_metrics_list) > 0:
-        # Initialize embedding metrics
-        metrics['mean_embedding_distance'] = 0.0
-        metrics['mean_cosine_similarity'] = 0.0
-        metrics['mean_token_mse'] = 0.0
+
 
     # Add current learning rate if optimizer is provided
     if optimizer is not None:
@@ -620,6 +615,69 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
         print(f"Saved new best model with validation loss: {val_loss:.10f}")
 
 
+# Add this function to train.py to visualize reconstructions during training
+def visualize_reconstruction_during_training(model, val_loader, device, epoch, output_dir):
+    """
+    Generate and save reconstruction visualizations during training.
+
+    Args:
+        model: The model
+        val_loader: Validation dataloader
+        device: Device to run inference on
+        epoch: Current epoch number
+        output_dir: Output directory for saving visualizations
+    """
+    # Create visualization directory if it doesn't exist
+    viz_dir = os.path.join(output_dir, 'visualizations')
+    os.makedirs(viz_dir, exist_ok=True)
+
+    model.eval()
+
+    try:
+        # Get a single batch from the dataloader
+        batch = next(iter(val_loader))
+
+        # Move data to device
+        hsi = batch['hsi'].to(device)
+        aux_data = {k: v.to(device) if v is not None else None for k, v in batch['aux_data'].items()}
+        batch_idx = batch['batch_idx'].to(device)
+
+        # Get thickness mask if available
+        thickness_mask = batch.get('thickness_mask', None)
+        if thickness_mask is not None:
+            thickness_mask = thickness_mask.to(device)
+
+        # Forward pass without gradient computation
+        with torch.no_grad():
+            output = model(hsi, aux_data, batch_idx)
+
+        # Get the reconstructed pixels and mask
+        reconstructed_pixels = output['reconstructed_pixels']
+        mask = output['mask']
+
+        # Define save path
+        save_path = os.path.join(viz_dir, f'reconstruction_epoch_{epoch}.png')
+
+        # Visualize the reconstruction
+        from visualisation import visualize_pixel_reconstruction
+        visualize_pixel_reconstruction(
+            model=model,
+            original_input=hsi,
+            reconstructed_pixels=reconstructed_pixels,
+            mask=mask,
+            thickness_mask=thickness_mask,
+            save_path=save_path
+        )
+
+        # Log the visualization to TensorBoard and MLFlow
+        return save_path
+
+    except Exception as e:
+        print(f"Error generating reconstruction visualization: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 @hydra.main(config_path="configs", config_name="train", version_base="1.1")
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
@@ -879,6 +937,17 @@ def main(cfg: DictConfig):
             contrastive_mode=cfg.model.contrastive_mode
         )
         val_metrics = calculate_metrics(val_outputs, val_embedding_metrics)
+
+        #Visualise
+        if (epoch + 1) % cfg.visualization.viz_frequency == 0 or epoch == cfg.training.epochs - 1:
+            print("Generating reconstruction visualization...")
+            recon_path = visualize_reconstruction_during_training(
+                model, val_loader, device, epoch, output_dir
+            )
+
+            # Log reconstruction to TensorBoard and MLflow
+            if recon_path:
+                log_reconstruction(recon_path, epoch, writer, cfg.logging.use_mlflow)
 
         # Update learning rate scheduler - only for epoch-based schedulers
         if scheduler is not None and scheduler_step_frequency == "epoch":

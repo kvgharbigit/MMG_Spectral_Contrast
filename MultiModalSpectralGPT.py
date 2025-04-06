@@ -1055,11 +1055,6 @@ class MultiModalSpectralGPT(nn.Module):
         if thickness_mask is not None:
             thickness_mask = thickness_mask.to(device)
 
-        # Store original tokens for token-level loss if needed
-        original_tokens = self.patch_embed(hsi_img)
-        B, T, HW, D = original_tokens.shape
-        original_tokens = original_tokens.reshape(B, T * HW, D)
-        original_tokens = original_tokens + self.pos_embed
 
         # Print shape of original tokens
         print(f"Original tokens shape: {original_tokens.shape}")
@@ -1123,7 +1118,6 @@ class MultiModalSpectralGPT(nn.Module):
             'mask': mask,
             'thickness_mask': thickness_mask,
             'contrastive_mode': self.contrastive_mode,
-            'original_tokens': original_tokens,
             'original_input': original_input,
             'reconstructed_pixels': reconstructed_pixels  # Add reconstructed pixels to output
         }

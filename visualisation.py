@@ -291,23 +291,39 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
 
     # Convert patch mask to pixel mask for visualization
     if mask is not None:
+        # Get original dimensions
         B, L = mask.shape
         H, W = original.shape[-2], original.shape[-1]
-        patch_h, patch_w = model.patch_size
+
+        # Estimate patch sizes based on image dimensions and mask length
+        # This avoids referencing the undefined 'model' variable
+        # Assuming square patches, typical values might be 25x25 spatial patches
+        total_patches = L
+        spectral_patches = original.shape[2] // 5  # Assuming t_patch_size=5
+        spatial_patches = total_patches // spectral_patches
+        spatial_size = int(np.sqrt(spatial_patches))
+        patch_h = H // spatial_size
+        patch_w = W // spatial_size
 
         # Create a pixel-level mask visualization
         pixel_mask = torch.zeros((H, W), device='cpu')
 
         # Reshape mask to match spectral and spatial patches
-        mask_reshaped = mask[0].reshape(-1, H // patch_h, W // patch_w)
+        try:
+            mask_reshaped = mask[0].reshape(spectral_patches, spatial_size, spatial_size)
 
-        for t_idx in range(mask_reshaped.shape[0]):
-            for h_idx in range(mask_reshaped.shape[1]):
-                for w_idx in range(mask_reshaped.shape[2]):
-                    h_start = h_idx * patch_h
-                    w_start = w_idx * patch_w
-                    if mask_reshaped[t_idx, h_idx, w_idx] > 0.5:
-                        pixel_mask[h_start:h_start + patch_h, w_start:w_start + patch_w] = 1.0
+            # Fill in the pixel mask
+            for t_idx in range(spectral_patches):
+                for h_idx in range(spatial_size):
+                    for w_idx in range(spatial_size):
+                        h_start = h_idx * patch_h
+                        w_start = w_idx * patch_w
+                        if mask_reshaped[t_idx, h_idx, w_idx] > 0.5:
+                            pixel_mask[h_start:h_start + patch_h, w_start:w_start + patch_w] = 1.0
+        except Exception as e:
+            print(f"Could not reshape mask properly: {e}")
+            # Fallback: create a simple visualization of the raw mask
+            pixel_mask = mask[0].reshape(-1, 1).repeat(1, H // L).reshape(H, W)
 
         # Plot mask
         axes[1, 0].imshow(pixel_mask.numpy(), cmap='gray')
@@ -334,11 +350,10 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
 
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved reconstruction visualization to {save_path}")
 
+    plt.close()
     return fig
-
-
-
 
 
 def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, mask,
@@ -346,18 +361,6 @@ def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, 
     """
     Visualize the reconstruction quality in pixel space comparing RGB visualization
     and selected wavelength bands.
-
-    Args:
-        model: The model
-        original_input: Original HSI data tensor [B, C, T, H, W]
-        reconstructed_pixels: Reconstructed pixel values [B, C, T, H, W]
-        mask: Binary mask indicating masked tokens [B, L]
-        thickness_mask: Optional thickness mask [B, 1, H, W]
-        save_path: Path to save the visualization
-        num_wavelengths: Number of wavelength bands to visualize (default=5)
-
-    Returns:
-        matplotlib.figure.Figure: The created figure
     """
     import torch
     import numpy as np
@@ -403,8 +406,10 @@ def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, 
             orig_rgb_np = orig_rgb.permute(1, 2, 0).numpy()
             recon_rgb_np = recon_rgb.permute(1, 2, 0).numpy()
         else:
-            raise ValueError(
-                f"Unexpected RGB shape: {orig_rgb.shape}. Expected first dimension to be 3 (RGB channels).")
+            print(f"Warning: Unexpected RGB shape: {orig_rgb.shape}. Expected first dimension to be 3 (RGB channels).")
+            # Fallback to creating a blank image
+            orig_rgb_np = np.zeros((orig_input.shape[-2], orig_input.shape[-1], 3))
+            recon_rgb_np = np.zeros((reconstructed.shape[-2], reconstructed.shape[-1], 3))
 
         # Print RGB stats for debugging
         print(
@@ -417,8 +422,57 @@ def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, 
     # Create a simplified error map
     error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1) if reconstructed.dim() > 3 else 0).numpy()
 
-    # Rest of the function remains the same...
-    # (Continue with existing code for wavelength visualization)
+    # Create the main figure
+    fig = plt.figure(figsize=(18, 12))
+
+    # Create a grid layout
+    gs = plt.GridSpec(3, 4, figure=fig)
+
+    # Top row - RGB and error comparisons
+    ax_orig_rgb = fig.add_subplot(gs[0, 0])
+    ax_recon_rgb = fig.add_subplot(gs[0, 1])
+    ax_error = fig.add_subplot(gs[0, 2:])
+
+    # Display RGB images
+    ax_orig_rgb.imshow(orig_rgb_np)
+    ax_orig_rgb.set_title("Original (RGB)")
+    ax_orig_rgb.axis('off')
+
+    ax_recon_rgb.imshow(recon_rgb_np)
+    ax_recon_rgb.set_title("Reconstructed (RGB)")
+    ax_recon_rgb.axis('off')
+
+    # Display error map
+    error_img = ax_error.imshow(error_map, cmap='hot')
+    ax_error.set_title("Reconstruction Error")
+    ax_error.axis('off')
+    fig.colorbar(error_img, ax=ax_error)
+
+    # Select wavelength bands to display
+    num_bands = orig_input_hsi.shape[0]
+    band_indices = np.linspace(0, num_bands - 1, num_wavelengths, dtype=int)
+
+    # Middle row - original wavelength bands
+    for i, band_idx in enumerate(band_indices):
+        if i < 4:  # Only show up to 4 bands in this row
+            ax = fig.add_subplot(gs[1, i])
+            ax.imshow(orig_input_hsi[band_idx].numpy(), cmap='viridis')
+            ax.set_title(f"Original λ{band_idx}")
+            ax.axis('off')
+
+    # Bottom row - reconstructed wavelength bands
+    for i, band_idx in enumerate(band_indices):
+        if i < 4:  # Only show up to 4 bands in this row
+            ax = fig.add_subplot(gs[2, i])
+            ax.imshow(recon_input_hsi[band_idx].numpy(), cmap='viridis')
+            ax.set_title(f"Recon λ{band_idx}")
+            ax.axis('off')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved pixel reconstruction visualization to {save_path}")
 
     # Clean up memory
     del orig_input, reconstructed
