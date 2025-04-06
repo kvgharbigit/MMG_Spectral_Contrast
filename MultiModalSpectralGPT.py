@@ -1056,8 +1056,6 @@ class MultiModalSpectralGPT(nn.Module):
             thickness_mask = thickness_mask.to(device)
 
 
-        # Print shape of original tokens
-        print(f"Original tokens shape: {original_tokens.shape}")
 
         # Encode with masking for reconstruction
         latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)

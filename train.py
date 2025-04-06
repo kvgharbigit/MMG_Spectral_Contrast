@@ -195,7 +195,7 @@ def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, bas
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def calculate_metrics(outputs, embedding_metrics_list=None, optimizer=None):
+def calculate_metrics(outputs, optimizer=None):
     """Calculate aggregate metrics from a list of model outputs."""
     metrics = {
         'loss': 0.0,
@@ -223,21 +223,7 @@ def calculate_metrics(outputs, embedding_metrics_list=None, optimizer=None):
         metrics['loss_contrast'] += output['loss_contrast'].item()
         metrics['num_modalities'] += output['num_modalities'].item()
 
-    # Process embedding metrics if available
-    if embedding_metrics_list and len(embedding_metrics_list) > 0:
-        embed_count = len(embedding_metrics_list)
-        for embed_metrics in embedding_metrics_list:
-            if 'mean_embedding_distance' in embed_metrics:
-                metrics['mean_embedding_distance'] += embed_metrics['mean_embedding_distance']
-            if 'mean_cosine_similarity' in embed_metrics:
-                metrics['mean_cosine_similarity'] += embed_metrics['mean_cosine_similarity']
-            if 'mean_token_mse' in embed_metrics:
-                metrics['mean_token_mse'] += embed_metrics['mean_token_mse']
 
-        # Calculate averages for embedding metrics
-        metrics['mean_embedding_distance'] /= embed_count
-        metrics['mean_cosine_similarity'] /= embed_count
-        metrics['mean_token_mse'] /= embed_count
 
     # Calculate the average for normal metrics
     for key in ['loss', 'loss_recon', 'loss_contrast', 'num_modalities']:
@@ -469,7 +455,7 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
     """Train the model for one epoch."""
     model.train()
     outputs = []
-    embedding_metrics_list = []
+
     scaler = torch.amp.GradScaler()  # Create gradient scaler for mixed precision
 
     # Set contrastive mode if specified
@@ -528,14 +514,14 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         # Force garbage collection every iteration
         gc.collect()
 
-    return outputs, embedding_metrics_list
+    return outputs
 
 
 def validate_epoch(model, dataloader, device, contrastive_mode=None):
     """Validate the model on the validation set."""
     model.eval()
     outputs = []
-    embedding_metrics_list = []
+
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:
@@ -582,7 +568,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             # Force garbage collection
             gc.collect()
 
-    return outputs, embedding_metrics_list
+    return outputs
 
 def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False):
     """
@@ -925,18 +911,18 @@ def main(cfg: DictConfig):
         gc.collect()
 
         # Training phase
-        train_outputs, train_embedding_metrics = train_epoch(
+        train_outputs = train_epoch(
             model, train_loader, optimizer, device,
             contrastive_mode=cfg.model.contrastive_mode
         )
-        train_metrics = calculate_metrics(train_outputs, train_embedding_metrics, optimizer)
+        train_metrics = calculate_metrics(train_outputs, optimizer)
 
         # Validation phase
-        val_outputs, val_embedding_metrics = validate_epoch(
+        val_outputs = validate_epoch(
             model, val_loader, device,
             contrastive_mode=cfg.model.contrastive_mode
         )
-        val_metrics = calculate_metrics(val_outputs, val_embedding_metrics)
+        val_metrics = calculate_metrics(val_outputs)
 
         #Visualise
         if (epoch + 1) % cfg.visualization.viz_frequency == 0 or epoch == cfg.training.epochs - 1:
@@ -959,11 +945,9 @@ def main(cfg: DictConfig):
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
 
-        # Print metrics summary including the new embedding metrics
+        # Print metrics summary
         print(f"Train Loss: {train_metrics['loss']:.10f}, "
               f"Val Loss: {val_metrics['loss']:.10f}, "
-              f"Embed Dist: {val_metrics['mean_embedding_distance']:.6f}, "
-              f"Cos Sim: {val_metrics['mean_cosine_similarity']:.6f}, "
               f"LR: {train_metrics.get('learning_rate', 0):.8f}, "
               f"Time: {epoch_time:.2f}s")
 
