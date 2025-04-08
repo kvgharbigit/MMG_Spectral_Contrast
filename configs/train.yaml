@@ -47,5 +47,6 @@ logging:
 # Visualization settings
 visualization:
   viz_frequency: 1
+  add_numerical_viz: true  # Enable numerical visualization
   num_samples: 2
   include_aux: true

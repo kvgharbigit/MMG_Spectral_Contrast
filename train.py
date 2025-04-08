@@ -602,16 +602,12 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
 
 
 # Add this function to train.py to visualize reconstructions during training
+# Add this function to train.py to visualize reconstructions during training
+# Update the function in train.py to use the simplified visualization
+
 def visualize_reconstruction_during_training(model, val_loader, device, epoch, output_dir):
     """
-    Generate and save reconstruction visualizations during training.
-
-    Args:
-        model: The model
-        val_loader: Validation dataloader
-        device: Device to run inference on
-        epoch: Current epoch number
-        output_dir: Output directory for saving visualizations
+    Generate and save reconstruction visualizations during training with diversity analysis.
     """
     # Create visualization directory if it doesn't exist
     viz_dir = os.path.join(output_dir, 'visualizations')
@@ -644,7 +640,7 @@ def visualize_reconstruction_during_training(model, val_loader, device, epoch, o
         # Define save path
         save_path = os.path.join(viz_dir, f'reconstruction_epoch_{epoch}.png')
 
-        # Visualize the reconstruction
+        # Visualize the reconstruction with numerical visualization and diversity analysis
         from visualisation import visualize_pixel_reconstruction
         visualize_pixel_reconstruction(
             model=model,
@@ -652,7 +648,9 @@ def visualize_reconstruction_during_training(model, val_loader, device, epoch, o
             reconstructed_pixels=reconstructed_pixels,
             mask=mask,
             thickness_mask=thickness_mask,
-            save_path=save_path
+            save_path=save_path,
+            add_numerical_viz=True,  # Always include numerical visualization
+            sample_size=8  # 8x8 grid of numerical values
         )
 
         # Log the visualization to TensorBoard and MLFlow
@@ -926,7 +924,7 @@ def main(cfg: DictConfig):
 
         #Visualise
         if (epoch + 1) % cfg.visualization.viz_frequency == 0 or epoch == cfg.training.epochs - 1:
-            print("Generating reconstruction visualization...")
+            print("Generating reconstruction visualization with diversity analysis...")
             recon_path = visualize_reconstruction_during_training(
                 model, val_loader, device, epoch, output_dir
             )
