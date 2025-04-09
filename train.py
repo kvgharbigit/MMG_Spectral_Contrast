@@ -607,7 +607,8 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
 
 def visualize_reconstruction_during_training(model, val_loader, device, epoch, output_dir):
     """
-    Generate and save reconstruction visualizations during training with diversity analysis.
+    Generate and save reconstruction visualizations during training with diversity analysis
+    using the original model patches.
     """
     # Create visualization directory if it doesn't exist
     viz_dir = os.path.join(output_dir, 'visualizations')
@@ -640,17 +641,17 @@ def visualize_reconstruction_during_training(model, val_loader, device, epoch, o
         # Define save path
         save_path = os.path.join(viz_dir, f'reconstruction_epoch_{epoch}.png')
 
-        # Visualize the reconstruction with numerical visualization and diversity analysis
+        # Visualize the reconstruction with numerical visualization and patch diversity analysis
         from visualisation import visualize_pixel_reconstruction
         visualize_pixel_reconstruction(
             model=model,
             original_input=hsi,
             reconstructed_pixels=reconstructed_pixels,
             mask=mask,
+            output=output,  # Pass the complete output dictionary containing pred
             thickness_mask=thickness_mask,
             save_path=save_path,
-            add_numerical_viz=True,  # Always include numerical visualization
-            sample_size=8  # 8x8 grid of numerical values
+            add_numerical_viz=True
         )
 
         # Log the visualization to TensorBoard and MLFlow

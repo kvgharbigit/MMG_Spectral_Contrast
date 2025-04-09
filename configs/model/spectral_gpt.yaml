@@ -3,10 +3,10 @@
 # Model architecture parameters
 analysis_dim: 500
 patch_size: [25, 25]
-embed_dim: 2304
+embed_dim: 1536
 depth: 16
 num_heads: 12
-decoder_embed_dim: 2304
+decoder_embed_dim: 1536
 decoder_depth: 4
 decoder_num_heads: 16
 mlp_ratio: 4.0
@@ -16,7 +16,7 @@ in_chans: 1
 aux_chans: 1
 aux_embed_dim: 256
 temperature: 0.07
-mask_ratio: 0.3
+mask_ratio: 0.5
 
 # Contrastive learning mode: 'global' or 'spatial'
 contrastive_mode: global

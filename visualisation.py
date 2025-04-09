@@ -356,12 +356,23 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
     return fig
 
 
-def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, mask,
+def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, mask, output=None,
                                    thickness_mask=None, save_path=None, num_wavelengths=5,
                                    add_numerical_viz=True, sample_size=8):
     """
-    Visualize the reconstruction quality in pixel space comparing RGB visualization
-    and selected wavelength bands. Includes numerical visualization and diversity analysis.
+    Visualize the reconstruction quality with diversity analysis using the original patches from the model output.
+
+    Parameters:
+        model: The model
+        original_input: Original HSI tensor
+        reconstructed_pixels: Reconstructed HSI tensor
+        mask: MAE mask tensor
+        output: Complete model output dictionary, containing the original pred patches
+        thickness_mask: Optional mask for valid regions
+        save_path: Path to save the visualization
+        num_wavelengths: Number of wavelength bands to display
+        add_numerical_viz: Whether to add numerical visualization
+        sample_size: Size of the numerical sample grid
     """
     import torch
     import numpy as np
@@ -507,11 +518,12 @@ def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, 
 
                 # Display as tables with colored backgrounds
                 # For original values
+                max_val = orig_values.max()
+                norm_values = orig_values / max_val if max_val > 0 else orig_values
                 table_orig = ax_orig_num.table(
                     cellText=np.around(orig_values, 3).astype(str),
                     loc='center',
-                    cellColours=plt.cm.viridis(
-                        orig_values / orig_values.max() if orig_values.max() > 0 else orig_values)
+                    cellColours=plt.cm.viridis(norm_values)
                 )
                 table_orig.scale(1, 1.5)
                 table_orig.set_fontsize(8)
@@ -534,79 +546,105 @@ def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, 
         # Update current row
         current_row += 1
 
-    # Add simplified patch diversity analysis
-    # Create a patch representation based on image regions
-    H, W = recon_input_hsi.shape[1], recon_input_hsi.shape[2]
-    T = recon_input_hsi.shape[0]
+    # Add patch diversity analysis using the original model patches
+    # Get the original predicted patches from the model output
+    if output is not None and 'pred' in output:
+        try:
+            # Get the predicted patches from the model output
+            pred_patches = output['pred'][0].detach().cpu()  # First batch item
 
-    # Use 10x10 grid of patches for diversity analysis
-    grid_size = 10
-    patch_h = H // grid_size
-    patch_w = W // grid_size
+            print(f"Original patch predictions shape: {pred_patches.shape}")
 
-    # Create patches from the reconstructed image
-    patches = []
-    for h_idx in range(0, H - patch_h + 1, patch_h):
-        for w_idx in range(0, W - patch_w + 1, patch_w):
-            # Take the middle wavelength for simplicity
-            mid_band = T // 2
-            patch = recon_input_hsi[mid_band, h_idx:h_idx + patch_h, w_idx:w_idx + patch_w]
-            patches.append(patch.flatten())
+            # Calculate basic statistics
+            patch_mean = torch.mean(pred_patches).item()
+            patch_std = torch.std(pred_patches).item()
+            patch_min = torch.min(pred_patches).item()
+            patch_max = torch.max(pred_patches).item()
+            patch_variance = torch.var(pred_patches, dim=0).mean().item()
 
-    if patches:
-        patch_tensor = torch.stack(patches)
+            # Plot histogram of all patch values
+            ax_hist = fig.add_subplot(gs[current_row, :2])
+            all_values = pred_patches.flatten().numpy()
+            sns.histplot(all_values, bins=50, kde=True, ax=ax_hist)
+            ax_hist.set_title('Distribution of Patch Prediction Values')
+            ax_hist.set_xlabel('Value')
+            ax_hist.set_ylabel('Frequency')
 
-        # 1. Calculate basic statistics
-        patch_mean = torch.mean(patch_tensor).item()
-        patch_std = torch.std(patch_tensor).item()
-        patch_min = torch.min(patch_tensor).item()
-        patch_max = torch.max(patch_tensor).item()
+            # Plot select patch values
+            ax_patches = fig.add_subplot(gs[current_row, 2:])
 
-        # 2. Plot histogram of all patch values
-        ax_hist = fig.add_subplot(gs[current_row, :2])
-        all_values = patch_tensor.flatten().numpy()
-        sns.histplot(all_values, bins=50, kde=True, ax=ax_hist)
-        ax_hist.set_title('Distribution of Reconstruction Values')
-        ax_hist.set_xlabel('Value')
-        ax_hist.set_ylabel('Frequency')
+            # Sample up to 5 patches
+            num_to_show = min(5, len(pred_patches))
+            for i in range(num_to_show):
+                # Take a small subset of values for clarity in visualization
+                max_display = min(30, pred_patches.shape[1])
+                patch_idx = i * len(pred_patches) // num_to_show
+                patch_values = pred_patches[patch_idx, :max_display].numpy()
 
-        # 3. Calculate patch-to-patch variance
-        patch_variance = torch.var(patch_tensor, dim=0).mean().item()
+                ax_patches.plot(patch_values, label=f'Patch {patch_idx}', alpha=0.7)
 
-        # 4. Plot select patch values (a subset for clarity)
-        ax_patches = fig.add_subplot(gs[current_row, 2:])
+            ax_patches.set_title('Sample Patch Predictions (first 30 values)')
+            ax_patches.set_xlabel('Value Index')
+            ax_patches.set_ylabel('Prediction Value')
+            ax_patches.legend()
 
-        # Sample up to 5 patches
-        num_to_show = min(5, len(patches))
-        for i in range(num_to_show):
-            ax_patches.plot(patches[i * len(patches) // num_to_show][:30].numpy(),
-                            label=f'Patch {i + 1}', alpha=0.7)
+            # Add a text box with diversity analysis
+            diversity_text = (
+                f"Patch Statistics:\n"
+                f"  Mean: {patch_mean:.4f}\n"
+                f"  Std Dev: {patch_std:.4f}\n"
+                f"  Range: [{patch_min:.4f}, {patch_max:.4f}]\n"
+                f"  Patch Variance: {patch_variance:.6f}\n\n"
+            )
 
-        ax_patches.set_title('Sample Patch Values (first 30 pixels)')
-        ax_patches.set_xlabel('Pixel Index')
-        ax_patches.set_ylabel('Value')
-        ax_patches.legend()
+            # Add interpretation
+            if patch_std < 0.01:
+                diversity_text += "ALERT: Very low variation across patches!"
+            elif patch_std < 0.05:
+                diversity_text += "Low variation - patches may be too similar"
+            else:
+                diversity_text += "Good variation across patches"
 
-        # Add a text box with diversity analysis
-        diversity_text = (
-            f"Statistics:\n"
-            f"  Mean: {patch_mean:.4f}\n"
-            f"  Std Dev: {patch_std:.4f}\n"
-            f"  Range: [{patch_min:.4f}, {patch_max:.4f}]\n"
-            f"  Patch Variance: {patch_variance:.6f}\n\n"
-        )
+            # Calculate similarity between patches
+            # Select a subset of patches for computation efficiency
+            max_patches = min(100, pred_patches.shape[0])
+            subset_patches = pred_patches[:max_patches]
 
-        # Interpretation
-        if patch_std < 0.01:
-            diversity_text += "ALERT: Very low variation across patches!"
-        elif patch_std < 0.05:
-            diversity_text += "Low variation - patches may be too similar"
-        else:
-            diversity_text += "Good variation across patches"
+            # Normalize patches for cosine similarity
+            norms = torch.norm(subset_patches, dim=1, keepdim=True)
+            normalized_patches = subset_patches / (norms + 1e-8)
 
-        # Add text box
-        plt.figtext(0.5, 0.01, diversity_text, ha='center', fontsize=10,
-                    bbox=dict(facecolor='yellow', alpha=0.2))
+            # Compute similarity matrix
+            similarity = torch.mm(normalized_patches, normalized_patches.t())
+
+            # Get average similarity (excluding self-similarity)
+            mask = torch.ones_like(similarity) - torch.eye(similarity.shape[0])
+            avg_similarity = (similarity * mask).sum() / (mask.sum())
+
+            diversity_text += f"\nAvg Patch Similarity: {avg_similarity.item():.4f}"
+
+            # Add text box
+            plt.figtext(0.5, 0.01, diversity_text, ha='center', fontsize=10,
+                        bbox=dict(facecolor='yellow', alpha=0.2))
+
+        except Exception as e:
+            print(f"Error analyzing original patches: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Fallback: Display a message explaining the issue
+            ax_msg = fig.add_subplot(gs[current_row, :])
+            ax_msg.text(0.5, 0.5,
+                        "Could not analyze original patches.\nEnsure 'output' contains the original 'pred' tensor from model.",
+                        ha='center', va='center', fontsize=12)
+            ax_msg.axis('off')
+    else:
+        # Display a message explaining what's missing
+        ax_msg = fig.add_subplot(gs[current_row, :])
+        ax_msg.text(0.5, 0.5,
+                    "Original model patches not available.\nPass the complete model output dictionary with 'pred' to analyze original patches.",
+                    ha='center', va='center', fontsize=12)
+        ax_msg.axis('off')
 
     plt.tight_layout()
 
@@ -614,8 +652,8 @@ def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, 
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Saved visualization to {save_path}")
 
-        # Also save a CSV file with the numerical values for more detailed analysis
-        if add_numerical_viz:
+        # Save numerical values if requested
+        if add_numerical_viz and 'numerical_band_indices' in locals():
             # Save numerical values to CSV
             csv_dir = os.path.dirname(save_path)
             base_name = os.path.splitext(os.path.basename(save_path))[0]
