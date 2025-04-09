@@ -311,13 +311,12 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
         if thickness_mask.dim() == 4 and thickness_mask.shape[1] == 1:  # [B, 1, H, W]
             expanded_thickness = thickness_mask[0, 0].cpu().numpy()  # Get first batch item
 
-            # Get the first batch item of the 3D pixel mask and sum across spectral dimension
+            # Get percentage of spectral bands masked at each spatial location
             pixel_mask_2d = pixel_mask_3d[0].cpu().numpy()  # [T, H, W]
+            spectral_mask_percentage = pixel_mask_2d.mean(axis=0)  # Average across spectral dimension [H, W]
 
-            # Calculate which pixels are used in loss calculation (both masked and in valid region)
-            # For visualization, just show if ANY spectral band at this location is used
-            pixel_mask_any = (pixel_mask_2d.max(axis=0) > 0).astype(float)  # [H, W]
-            combined_mask_heatmap = pixel_mask_any * expanded_thickness
+            # Multiply by thickness mask to only show valid regions
+            combined_mask_heatmap = spectral_mask_percentage * expanded_thickness
 
     # Create figure with more detailed layout
     fig = plt.figure(figsize=(20, 20))
