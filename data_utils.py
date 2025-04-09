@@ -251,6 +251,36 @@ def detect_mask(image):
         return (image > threshold).float()
 
 
+def derive_mask_from_hsi(hsi_img, threshold=0.02):
+    """
+    Derives a simple mask from HSI data to identify valid regions vs. black rim areas
+    using only a threshold.
+
+    Args:
+        hsi_img (torch.Tensor): HSI image tensor of shape [B, C, T, H, W]
+        threshold (float): Intensity threshold for valid regions
+
+    Returns:
+        torch.Tensor: Binary mask of shape [B, 1, H, W] (1 for valid regions, 0 for black rim)
+    """
+    # Get dimensions
+    B, C, T, H, W = hsi_img.shape
+
+    # Calculate mean across spectral dimension
+    mean_intensity = torch.mean(hsi_img, dim=2)  # [B, C, H, W]
+
+    # Apply threshold to create binary mask
+    binary_mask = (mean_intensity > threshold).float()
+
+    # Convert to [B, 1, H, W] format
+    if C > 1:
+        # Take max across channels if multiple channels
+        binary_mask = binary_mask.max(dim=1, keepdim=True)[0]
+
+    print(f"Generated HSI-derived mask with range: {binary_mask.min().item():.3f} to {binary_mask.max().item():.3f}")
+
+    return binary_mask
+
 def apply_spatial_registration(hsi_img, aux_data, analysis_dim, target_bands):
     """Apply spatial registration to HSI and auxiliary data."""
     # Log original shape before any processing
@@ -301,8 +331,8 @@ def apply_spatial_registration(hsi_img, aux_data, analysis_dim, target_bands):
         else:
             aux_registered[modality] = None
 
-    # Create thickness mask if available
-    if 'thickness' in aux_registered and aux_registered['thickness'] is not None:
-        thickness_mask = detect_mask(aux_registered['thickness'])
+    # Derive thickness mask directly from HSI data rather than from the thickness modality
+    thickness_mask = derive_mask_from_hsi(hsi_registered, threshold=0.02)
+    print("Using HSI-derived rim mask instead of thickness-based mask")
 
     return hsi_registered, aux_registered, thickness_mask

@@ -227,152 +227,232 @@ def visualize_augmentation(original_batch, augmented_batch, save_dir='visualizat
     print(f"All visualizations saved to {save_dir}")
 
 
-def visualize_reconstruction_quality(original, reconstruction, mask, thickness_mask=None, save_path=None):
+def visualize_reconstruction_quality(original, reconstruction, mask, thickness_mask=None,
+                                     save_path=None, model=None, num_wavelengths=5):
     """
-    Visualize the reconstruction quality with special focus on areas that contribute to the loss.
+    Comprehensive visualization of reconstruction quality with advanced masking analysis.
 
-    Now handles direct pixel reconstruction rather than embedding reconstruction.
+    Args:
+        original (torch.Tensor): Original input tensor of shape [B, C, T, H, W]
+        reconstruction (torch.Tensor): Reconstructed input tensor of shape [B, C, T, H, W]
+        mask (torch.Tensor): Token-level mask of shape [B, L]
+        thickness_mask (torch.Tensor, optional): Mask indicating valid image regions
+        save_path (str, optional): Path to save the visualization
+        model (MultiModalSpectralGPT, optional): Model used for mask conversion
+        num_wavelengths (int, optional): Number of wavelength bands to visualize
+
+    Returns:
+        matplotlib.figure.Figure: Visualization figure
     """
-    import matplotlib.pyplot as plt
+    import torch
     import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from hsi_to_rgb import simple_hsi_to_rgb
 
-    # Select first batch item for visualization
-    orig = original[0].detach().cpu()
-    recon = reconstruction[0].detach().cpu()  # Now directly in pixel space
+    # Input validation
+    if model is None:
+        raise ValueError("Model must be provided to convert token mask to pixel mask")
+
+    # Use only the first batch item for visualization
+    orig_input = original[0].detach().cpu()
+    reconstructed = reconstruction[0].detach().cpu()
 
     # Convert HSI to RGB for visualization
-    orig_rgb = simple_hsi_to_rgb(orig)
-    recon_rgb = simple_hsi_to_rgb(recon)
-
-    # Calculate error map
-    error = ((recon - orig) ** 2).mean(dim=(0, 1))  # Mean across channels and spectral dimension
-    error = error.numpy()
-
-    # Create a figure with subplots
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-
-    # Handle different possible shapes of RGB tensor
-    # Print shape for debugging
-    print(f"Original RGB shape: {orig_rgb.shape}")
-
-    # Convert to numpy and properly reshape for matplotlib
-    if len(orig_rgb.shape) == 5:  # [B, C, 3, H, W]
-        orig_rgb_np = orig_rgb[0, 0].permute(1, 2, 0).cpu().numpy()
-        recon_rgb_np = recon_rgb[0, 0].permute(1, 2, 0).cpu().numpy()
-    elif len(orig_rgb.shape) == 4:  # [B, 3, H, W]
-        orig_rgb_np = orig_rgb[0].permute(1, 2, 0).cpu().numpy()
-        recon_rgb_np = recon_rgb[0].permute(1, 2, 0).cpu().numpy()
-    elif len(orig_rgb.shape) == 3 and orig_rgb.shape[0] == 3:  # [3, H, W]
-        orig_rgb_np = orig_rgb.permute(1, 2, 0).cpu().numpy()
-        recon_rgb_np = recon_rgb.permute(1, 2, 0).cpu().numpy()
-    else:  # Already in [H, W, 3] format or other
-        orig_rgb_np = orig_rgb.cpu().numpy()
-        recon_rgb_np = recon_rgb.cpu().numpy()
-
-    # Ensure we have a proper RGB image with values in [0, 1]
-    orig_rgb_np = np.clip(orig_rgb_np, 0, 1)
-    recon_rgb_np = np.clip(recon_rgb_np, 0, 1)
-
-    # Plot original RGB
-    axes[0, 0].imshow(orig_rgb_np)
-    axes[0, 0].set_title("Original HSI (RGB)")
-    axes[0, 0].axis('off')
-
-    # Plot reconstructed RGB
-    axes[0, 1].imshow(recon_rgb_np)
-    axes[0, 1].set_title("Reconstructed HSI (RGB)")
-    axes[0, 1].axis('off')
-
-    # Plot error map
-    error_img = axes[0, 2].imshow(error, cmap='hot')
-    axes[0, 2].set_title("Reconstruction Error")
-    axes[0, 2].axis('off')
-    fig.colorbar(error_img, ax=axes[0, 2])
-
-    # Convert patch mask to pixel mask for visualization
-    if mask is not None:
-        # Get original dimensions
-        B, L = mask.shape
-        H, W = original.shape[-2], original.shape[-1]
-
-        # Estimate patch sizes based on image dimensions and mask length
-        # This avoids referencing the undefined 'model' variable
-        # Assuming square patches, typical values might be 25x25 spatial patches
-        total_patches = L
-        spectral_patches = original.shape[2] // 5  # Assuming t_patch_size=5
-        spatial_patches = total_patches // spectral_patches
-        spatial_size = int(np.sqrt(spatial_patches))
-        patch_h = H // spatial_size
-        patch_w = W // spatial_size
-
-        # Create a pixel-level mask visualization
-        pixel_mask = torch.zeros((H, W), device='cpu')
-
-        # Reshape mask to match spectral and spatial patches
-        try:
-            mask_reshaped = mask[0].reshape(spectral_patches, spatial_size, spatial_size)
-
-            # Fill in the pixel mask
-            for t_idx in range(spectral_patches):
-                for h_idx in range(spatial_size):
-                    for w_idx in range(spatial_size):
-                        h_start = h_idx * patch_h
-                        w_start = w_idx * patch_w
-                        if mask_reshaped[t_idx, h_idx, w_idx] > 0.5:
-                            pixel_mask[h_start:h_start + patch_h, w_start:w_start + patch_w] = 1.0
-        except Exception as e:
-            print(f"Could not reshape mask properly: {e}")
-            # Fallback: create a simple visualization of the raw mask
-            pixel_mask = mask[0].reshape(-1, 1).repeat(1, H // L).reshape(H, W)
-
-        # Plot mask
-        axes[1, 0].imshow(pixel_mask.numpy(), cmap='gray')
-        axes[1, 0].set_title("MAE Mask (White = Masked)")
-        axes[1, 0].axis('off')
-
-        # Plot valid regions (thickness mask)
-        if thickness_mask is not None:
-            thick_mask = thickness_mask[0, 0].detach().cpu().numpy()
-            axes[1, 1].imshow(thick_mask, cmap='gray')
-            axes[1, 1].set_title("Valid Regions (White = Valid)")
-            axes[1, 1].axis('off')
-
-            # Plot combined mask (areas that contribute to loss)
-            combined = pixel_mask.numpy() * thick_mask
-            axes[1, 2].imshow(combined, cmap='gray')
-            axes[1, 2].set_title("Areas Contributing to Loss")
-            axes[1, 2].axis('off')
+    def convert_to_rgb(hsi_tensor):
+        # Ensure tensor is 3D [T, H, W] for visualization
+        if hsi_tensor.dim() == 4 and hsi_tensor.shape[0] == 1:
+            hsi_data = hsi_tensor[0]
+        elif hsi_tensor.dim() == 5 and hsi_tensor.shape[0] == 1 and hsi_tensor.shape[1] == 1:
+            hsi_data = hsi_tensor[0, 0]
         else:
-            axes[1, 1].axis('off')
-            axes[1, 2].axis('off')
+            hsi_data = hsi_tensor
+
+        # Ensure tensor is 3D [T, H, W]
+        if hsi_data.dim() == 2:
+            hsi_data = hsi_data.unsqueeze(0)
+
+        return simple_hsi_to_rgb(hsi_data.unsqueeze(0))
+
+    # Convert to RGB
+    orig_rgb = convert_to_rgb(orig_input)
+    recon_rgb = convert_to_rgb(reconstructed)
+
+    # Normalize RGB images
+    def normalize_rgb(rgb_tensor):
+        if rgb_tensor.dim() == 4 and rgb_tensor.shape[0] == 1:
+            rgb_img = rgb_tensor[0]
+        elif rgb_tensor.dim() == 3:
+            rgb_img = rgb_tensor
+
+        # Permute to [H, W, 3] if needed
+        if rgb_img.shape[0] == 3:
+            rgb_img = rgb_img.permute(1, 2, 0)
+
+        # Clip and normalize
+        return np.clip(rgb_img.numpy(), 0, 1)
+
+    orig_rgb_np = normalize_rgb(orig_rgb)
+    recon_rgb_np = normalize_rgb(recon_rgb)
+
+    # Create error map
+    error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1) if reconstructed.dim() > 3 else 0).numpy()
+
+    # Convert token mask to 3D pixel mask
+    pixel_mask_3d = model.token_mask_to_pixel_mask(mask, original.shape)
+
+    # Create masking heatmap
+    mask_heatmap = pixel_mask_3d.sum(dim=1)[0].cpu().numpy()
+
+    # Create figure with more detailed layout
+    fig = plt.figure(figsize=(20, 15))
+    gs = fig.add_gridspec(4, 4)
+
+    # Top row: RGB and error comparisons
+    ax_orig_rgb = fig.add_subplot(gs[0, 0])
+    ax_recon_rgb = fig.add_subplot(gs[0, 1])
+    ax_error = fig.add_subplot(gs[0, 2:])
+
+    # Display RGB images
+    ax_orig_rgb.imshow(orig_rgb_np)
+    ax_orig_rgb.set_title("Original (RGB)")
+    ax_orig_rgb.axis('off')
+
+    ax_recon_rgb.imshow(recon_rgb_np)
+    ax_recon_rgb.set_title("Reconstructed (RGB)")
+    ax_recon_rgb.axis('off')
+
+    # Display error map
+    error_img = ax_error.imshow(error_map, cmap='hot')
+    ax_error.set_title("Reconstruction Error")
+    ax_error.axis('off')
+    fig.colorbar(error_img, ax=ax_error, shrink=0.8)
+
+    # Select wavelength bands to display
+    num_bands = orig_input.shape[0] if orig_input.dim() == 3 else orig_input.shape[1]
+    band_indices = np.linspace(0, num_bands - 1, min(num_wavelengths, num_bands), dtype=int)
+
+    # Wavelength bands visualization - Original
+    ax_orig_bands = [fig.add_subplot(gs[1, i]) for i in range(min(num_wavelengths, 4))]
+    for i, band_idx in enumerate(band_indices[:4]):
+        # Handle different input dimensions
+        if orig_input.dim() == 4 and orig_input.shape[0] == 1:
+            band_data = orig_input[0, band_idx].numpy()
+        elif orig_input.dim() == 5 and orig_input.shape[0] == 1 and orig_input.shape[1] == 1:
+            band_data = orig_input[0, 0, band_idx].numpy()
+        elif orig_input.dim() == 3:
+            band_data = orig_input[band_idx].numpy()
+        else:
+            band_data = orig_input[band_idx].numpy()
+
+        ax_orig_bands[i].imshow(band_data, cmap='viridis')
+        ax_orig_bands[i].set_title(f"Original λ{band_idx}")
+        ax_orig_bands[i].axis('off')
+
+    # Reconstructed wavelength bands
+    ax_recon_bands = [fig.add_subplot(gs[2, i]) for i in range(min(num_wavelengths, 4))]
+    for i, band_idx in enumerate(band_indices[:4]):
+        # Handle different input dimensions
+        if reconstructed.dim() == 4 and reconstructed.shape[0] == 1:
+            band_data = reconstructed[0, band_idx].numpy()
+        elif reconstructed.dim() == 5 and reconstructed.shape[0] == 1 and reconstructed.shape[1] == 1:
+            band_data = reconstructed[0, 0, band_idx].numpy()
+        elif reconstructed.dim() == 3:
+            band_data = reconstructed[band_idx].numpy()
+        else:
+            band_data = reconstructed[band_idx].numpy()
+
+        ax_recon_bands[i].imshow(band_data, cmap='viridis')
+        ax_recon_bands[i].set_title(f"Reconstructed λ{band_idx}")
+        ax_recon_bands[i].axis('off')
+
+    # Masking and analysis visualizations
+    # Masking Intensity Heatmap
+    ax_mask_heatmap = fig.add_subplot(gs[3, 0:2])
+    mask_im = ax_mask_heatmap.imshow(mask_heatmap, cmap='hot', interpolation='nearest')
+    ax_mask_heatmap.set_title("Masking Intensity Heatmap")
+    ax_mask_heatmap.axis('off')
+    fig.colorbar(mask_im, ax=ax_mask_heatmap, shrink=0.8, label='Masking Intensity')
+
+    # Thickness Mask (if available)
+    ax_thickness_mask = fig.add_subplot(gs[3, 2])
+    if thickness_mask is not None:
+        # Ensure 2D numpy array
+        if thickness_mask.dim() == 4 and thickness_mask.shape[0] == 1 and thickness_mask.shape[1] == 1:
+            thickness_mask_np = thickness_mask[0, 0].detach().cpu().numpy()
+        elif thickness_mask.dim() == 3 and thickness_mask.shape[0] == 1:
+            thickness_mask_np = thickness_mask[0].detach().cpu().numpy()
+        elif thickness_mask.dim() == 2:
+            thickness_mask_np = thickness_mask.detach().cpu().numpy()
+        else:
+            raise ValueError(f"Unexpected thickness mask shape: {thickness_mask.shape}")
+
+        ax_thickness_mask.imshow(thickness_mask_np, cmap='gray')
+        ax_thickness_mask.set_title("Thickness Mask")
+    else:
+        ax_thickness_mask.text(0.5, 0.5, "No Thickness Mask",
+                               horizontalalignment='center',
+                               verticalalignment='center')
+        ax_thickness_mask.axis('off')
+
+    # Additional Statistics Subplot
+    ax_stats = fig.add_subplot(gs[3, 3])
+    ax_stats.axis('off')
+
+    # Compute and display statistics
+    stats_text = [
+        f"Reconstruction Error:",
+        f"  Mean: {error_map.mean():.4f}",
+        f"  Max: {error_map.max():.4f}",
+        f"  Std: {error_map.std():.4f}",
+        f"\nMasking Statistics:",
+        f"  Masked Pixels: {(mask_heatmap > 0).mean() * 100:.2f}%",
+        f"  Max Mask Intensity: {mask_heatmap.max():.4f}",
+        f"  Mean Mask Intensity: {mask_heatmap.mean():.4f}"
+    ]
+
+    ax_stats.text(0, 1, '\n'.join(stats_text),
+                  verticalalignment='top',
+                  fontsize=10,
+                  fontfamily='monospace')
 
     plt.tight_layout()
 
+    # Save figure if path provided
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved reconstruction visualization to {save_path}")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved visualization to {save_path}")
 
-    plt.close()
+    # Close the figure to free memory
+    plt.close(fig)
+
     return fig
 
+def visualize_mask_heatmap(pixel_mask):
+    """
+    Create a heatmap showing the masking intensity across spatial regions.
+
+    Args:
+        pixel_mask (torch.Tensor): 3D pixel mask of shape [B, T, H, W]
+
+    Returns:
+        torch.Tensor: 2D heatmap of masking intensity with shape [H, W]
+    """
+    # Ensure we're working with the first batch item
+    if pixel_mask.dim() == 4 and pixel_mask.shape[0] == 1:
+        pixel_mask = pixel_mask[0]
+
+    # Sum across spectral dimension to get spatial masking intensity
+    # This creates a 2D heatmap where higher values indicate more masking
+    spatial_mask_intensity = pixel_mask.sum(dim=0)
+
+    return spatial_mask_intensity
 
 def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, mask, output=None,
                                    thickness_mask=None, save_path=None, num_wavelengths=5,
                                    add_numerical_viz=True, sample_size=8):
     """
     Visualize the reconstruction quality with diversity analysis using the original patches from the model output.
-
-    Parameters:
-        model: The model
-        original_input: Original HSI tensor
-        reconstructed_pixels: Reconstructed HSI tensor
-        mask: MAE mask tensor
-        output: Complete model output dictionary, containing the original pred patches
-        thickness_mask: Optional mask for valid regions
-        save_path: Path to save the visualization
-        num_wavelengths: Number of wavelength bands to display
-        add_numerical_viz: Whether to add numerical visualization
-        sample_size: Size of the numerical sample grid
     """
     import torch
     import numpy as np
@@ -383,59 +463,71 @@ def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, 
     import os
     import seaborn as sns
 
+    # Check inputs
+    if original_input is None or reconstructed_pixels is None:
+        print("Error: Input tensors cannot be None")
+        return None
+
     # Use only the first batch item for visualization
     orig_input = original_input[0].detach().cpu()
     reconstructed = reconstructed_pixels[0].detach().cpu()
 
-    # Print statistics for debugging
-    print(
-        f"Original stats: min={orig_input.min().item():.4f}, max={orig_input.max().item():.4f}, mean={orig_input.mean().item():.4f}")
-    print(
-        f"Reconstructed stats: min={reconstructed.min().item():.4f}, max={reconstructed.max().item():.4f}, mean={reconstructed.mean().item():.4f}")
-
-    # Convert to RGB for visualization
-    if orig_input.dim() >= 3:
-        # Extract HSI data, handling different possible shapes
-        if orig_input.dim() == 4 and orig_input.shape[0] == 1:  # [1, T, H, W]
-            orig_input_hsi = orig_input[0]  # Now [T, H, W]
-            recon_input_hsi = reconstructed[0]
-        elif orig_input.dim() == 5 and orig_input.shape[0] == 1 and orig_input.shape[1] == 1:  # [1, 1, T, H, W]
-            orig_input_hsi = orig_input[0, 0]  # Now [T, H, W]
-            recon_input_hsi = reconstructed[0, 0]
-        else:
-            orig_input_hsi = orig_input
-            recon_input_hsi = reconstructed
-
-        # Convert to RGB
-        orig_rgb = simple_hsi_to_rgb(orig_input_hsi.unsqueeze(0) if orig_input_hsi.dim() == 3 else orig_input_hsi)
-        recon_rgb = simple_hsi_to_rgb(recon_input_hsi.unsqueeze(0) if recon_input_hsi.dim() == 3 else recon_input_hsi)
-
-        # Remove batch dimension if present
-        if orig_rgb.dim() == 4 and orig_rgb.shape[0] == 1:
-            orig_rgb = orig_rgb[0]
-        if recon_rgb.dim() == 4 and recon_rgb.shape[0] == 1:
-            recon_rgb = recon_rgb[0]
-
-        # Convert to numpy with proper format for matplotlib (H, W, 3)
-        if orig_rgb.shape[0] == 3:  # If [3, H, W]
-            orig_rgb_np = orig_rgb.permute(1, 2, 0).numpy()
-            recon_rgb_np = recon_rgb.permute(1, 2, 0).numpy()
-        else:
-            print(f"Warning: Unexpected RGB shape: {orig_rgb.shape}. Expected first dimension to be 3 (RGB channels).")
-            # Fallback to creating a blank image
-            orig_rgb_np = np.zeros((orig_input.shape[-2], orig_input.shape[-1], 3))
-            recon_rgb_np = np.zeros((reconstructed.shape[-2], reconstructed.shape[-1], 3))
-
-    else:
+    # Validate input shapes
+    if orig_input.dim() < 3:
         raise ValueError(f"Input dimension too low: {orig_input.dim()}. Expected at least 3 dimensions.")
 
-    # Create a simplified error map
+    # Normalize input and reconstructed tensors
+    input_min, input_max = orig_input.min(), orig_input.max()
+    recon_min, recon_max = reconstructed.min(), reconstructed.max()
+
+    print(f"Original input range: [{input_min.item():.4f}, {input_max.item():.4f}]")
+    print(f"Reconstructed input range: [{recon_min.item():.4f}, {recon_max.item():.4f}]")
+
+    # Convert HSI to RGB
+    def convert_to_rgb(hsi_tensor):
+        if hsi_tensor.dim() == 4 and hsi_tensor.shape[0] == 1:  # [1, T, H, W]
+            hsi_data = hsi_tensor[0]
+        elif hsi_tensor.dim() == 5 and hsi_tensor.shape[0] == 1 and hsi_tensor.shape[1] == 1:  # [1, 1, T, H, W]
+            hsi_data = hsi_tensor[0, 0]
+        else:
+            hsi_data = hsi_tensor
+
+        # Ensure tensor is 3D [T, H, W]
+        if hsi_data.dim() == 2:
+            hsi_data = hsi_data.unsqueeze(0)
+
+        return simple_hsi_to_rgb(hsi_data.unsqueeze(0))
+
+    # Convert to RGB
+    orig_rgb = convert_to_rgb(orig_input)
+    recon_rgb = convert_to_rgb(reconstructed)
+
+    # Normalize RGB images
+    def normalize_rgb(rgb_tensor):
+        # Handle different possible shapes
+        if rgb_tensor.dim() == 4 and rgb_tensor.shape[0] == 1:
+            rgb_img = rgb_tensor[0]
+        elif rgb_tensor.dim() == 3:
+            rgb_img = rgb_tensor
+
+        # Permute to [H, W, 3] if needed
+        if rgb_img.shape[0] == 3:
+            rgb_img = rgb_img.permute(1, 2, 0)
+
+        # Clip and normalize
+        return np.clip(rgb_img.numpy(), 0, 1)
+
+    orig_rgb_np = normalize_rgb(orig_rgb)
+    recon_rgb_np = normalize_rgb(recon_rgb)
+
+    # Create error map
     error_map = ((reconstructed - orig_input) ** 2).mean(dim=(0, 1) if reconstructed.dim() > 3 else 0).numpy()
 
-    # Determine number of rows for our figure
-    num_rows = 4  # RGB, Original wavelengths, Reconstructed wavelengths, Diversity analysis
+    # Determine figure layout
+    num_rows = 4  # Base rows
     if add_numerical_viz:
-        num_rows += 1  # Add row for numerical visualization
+        num_rows += 1
+    num_rows += 1  # For masks
 
     # Create figure
     fig = plt.figure(figsize=(18, 4 * num_rows))
@@ -462,230 +554,99 @@ def visualize_pixel_reconstruction(model, original_input, reconstructed_pixels, 
     fig.colorbar(error_img, ax=ax_error)
 
     # Select wavelength bands to display
-    num_bands = orig_input_hsi.shape[0]
-    band_indices = np.linspace(0, num_bands - 1, num_wavelengths, dtype=int)
+    num_bands = orig_input.shape[0] if orig_input.dim() == 3 else orig_input.shape[1]
+    band_indices = np.linspace(0, num_bands - 1, min(num_wavelengths, num_bands), dtype=int)
 
-    # Middle row - original wavelength bands
-    for i, band_idx in enumerate(band_indices):
-        if i < 4:  # Only show up to 4 bands in this row
-            ax = fig.add_subplot(gs[1, i])
-            ax.imshow(orig_input_hsi[band_idx].numpy(), cmap='viridis')
-            ax.set_title(f"Original λ{band_idx}")
-            ax.axis('off')
-
-    # Bottom row - reconstructed wavelength bands
-    for i, band_idx in enumerate(band_indices):
-        if i < 4:  # Only show up to 4 bands in this row
-            ax = fig.add_subplot(gs[2, i])
-            ax.imshow(recon_input_hsi[band_idx].numpy(), cmap='viridis')
-            ax.set_title(f"Recon λ{band_idx}")
-            ax.axis('off')
-
-    # Add numerical visualization for selected wavelengths
-    current_row = 3
-    if add_numerical_viz:
-        # Choose two wavelengths for numerical visualization (first and third from our selection)
-        numerical_band_indices = [band_indices[0], band_indices[2]] if len(band_indices) > 2 else band_indices[:2]
-
-        # Get image dimensions
-        H, W = orig_input_hsi.shape[1], orig_input_hsi.shape[2]
-
-        # Create a sample grid (evenly spaced points)
-        step_h = H // sample_size
-        step_w = W // sample_size
-
-        # Ensure we don't have zero steps
-        step_h = max(1, step_h)
-        step_w = max(1, step_w)
-
-        # Adjust sample size if needed
-        sample_h = min(sample_size, H)
-        sample_w = min(sample_size, W)
-
-        # Generate sample indices
-        h_indices = np.linspace(0, H - 1, sample_h, dtype=int)
-        w_indices = np.linspace(0, W - 1, sample_w, dtype=int)
-
-        for idx, band_idx in enumerate(numerical_band_indices):
-            if idx < 2:  # Only show at most 2 wavelengths numerically
-                # Extract values at sample points
-                orig_values = orig_input_hsi[band_idx].numpy()[np.ix_(h_indices, w_indices)]
-                recon_values = recon_input_hsi[band_idx].numpy()[np.ix_(h_indices, w_indices)]
-
-                # Create numerical visualizations
-                ax_orig_num = fig.add_subplot(gs[current_row, idx * 2])
-                ax_recon_num = fig.add_subplot(gs[current_row, idx * 2 + 1])
-
-                # Display as tables with colored backgrounds
-                # For original values
-                max_val = orig_values.max()
-                norm_values = orig_values / max_val if max_val > 0 else orig_values
-                table_orig = ax_orig_num.table(
-                    cellText=np.around(orig_values, 3).astype(str),
-                    loc='center',
-                    cellColours=plt.cm.viridis(norm_values)
-                )
-                table_orig.scale(1, 1.5)
-                table_orig.set_fontsize(8)
-                ax_orig_num.set_title(f"Original λ{band_idx} Values")
-                ax_orig_num.axis('off')
-
-                # For reconstructed values
-                max_val = recon_values.max()
-                norm_values = recon_values / max_val if max_val > 0 else recon_values
-                table_recon = ax_recon_num.table(
-                    cellText=np.around(recon_values, 3).astype(str),
-                    loc='center',
-                    cellColours=plt.cm.viridis(norm_values)
-                )
-                table_recon.scale(1, 1.5)
-                table_recon.set_fontsize(8)
-                ax_recon_num.set_title(f"Recon λ{band_idx} Values")
-                ax_recon_num.axis('off')
-
-        # Update current row
-        current_row += 1
-
-    # Add patch diversity analysis using the original model patches
-    # Get the original predicted patches from the model output
-    if output is not None and 'pred' in output:
-        try:
-            # Get the predicted patches from the model output
-            pred_patches = output['pred'][0].detach().cpu()  # First batch item
-
-            print(f"Original patch predictions shape: {pred_patches.shape}")
-
-            # Calculate basic statistics
-            patch_mean = torch.mean(pred_patches).item()
-            patch_std = torch.std(pred_patches).item()
-            patch_min = torch.min(pred_patches).item()
-            patch_max = torch.max(pred_patches).item()
-            patch_variance = torch.var(pred_patches, dim=0).mean().item()
-
-            # Plot histogram of all patch values
-            ax_hist = fig.add_subplot(gs[current_row, :2])
-            all_values = pred_patches.flatten().numpy()
-            sns.histplot(all_values, bins=50, kde=True, ax=ax_hist)
-            ax_hist.set_title('Distribution of Patch Prediction Values')
-            ax_hist.set_xlabel('Value')
-            ax_hist.set_ylabel('Frequency')
-
-            # Plot select patch values
-            ax_patches = fig.add_subplot(gs[current_row, 2:])
-
-            # Sample up to 5 patches
-            num_to_show = min(5, len(pred_patches))
-            for i in range(num_to_show):
-                # Take a small subset of values for clarity in visualization
-                max_display = min(30, pred_patches.shape[1])
-                patch_idx = i * len(pred_patches) // num_to_show
-                patch_values = pred_patches[patch_idx, :max_display].numpy()
-
-                ax_patches.plot(patch_values, label=f'Patch {patch_idx}', alpha=0.7)
-
-            ax_patches.set_title('Sample Patch Predictions (first 30 values)')
-            ax_patches.set_xlabel('Value Index')
-            ax_patches.set_ylabel('Prediction Value')
-            ax_patches.legend()
-
-            # Add a text box with diversity analysis
-            diversity_text = (
-                f"Patch Statistics:\n"
-                f"  Mean: {patch_mean:.4f}\n"
-                f"  Std Dev: {patch_std:.4f}\n"
-                f"  Range: [{patch_min:.4f}, {patch_max:.4f}]\n"
-                f"  Patch Variance: {patch_variance:.6f}\n\n"
-            )
-
-            # Add interpretation
-            if patch_std < 0.01:
-                diversity_text += "ALERT: Very low variation across patches!"
-            elif patch_std < 0.05:
-                diversity_text += "Low variation - patches may be too similar"
+    # Wavelength bands visualization
+    wavelength_rows = [1, 2]  # Rows for original and reconstructed wavelengths
+    for row_idx, input_type in zip(wavelength_rows, [orig_input, reconstructed]):
+        for i, band_idx in enumerate(band_indices[:4]):  # Show up to 4 bands
+            ax = fig.add_subplot(gs[row_idx, i])
+            # Handle different input dimensions
+            if input_type.dim() == 4 and input_type.shape[0] == 1:
+                band_data = input_type[0, band_idx].numpy()
+            elif input_type.dim() == 5 and input_type.shape[0] == 1 and input_type.shape[1] == 1:
+                band_data = input_type[0, 0, band_idx].numpy()
+            elif input_type.dim() == 3:
+                band_data = input_type[band_idx].numpy()
             else:
-                diversity_text += "Good variation across patches"
+                band_data = input_type[band_idx].numpy()
 
-            # Calculate similarity between patches
-            # Select a subset of patches for computation efficiency
-            max_patches = min(100, pred_patches.shape[0])
-            subset_patches = pred_patches[:max_patches]
+            ax.imshow(band_data, cmap='viridis')
+            ax.set_title(f"{'Original' if row_idx == 1 else 'Recon'} λ{band_idx}")
+            ax.axis('off')
 
-            # Normalize patches for cosine similarity
-            norms = torch.norm(subset_patches, dim=1, keepdim=True)
-            normalized_patches = subset_patches / (norms + 1e-8)
+    # Mask row
+    mask_row = num_rows - 3  # Row before numerical/diversity analysis
 
-            # Compute similarity matrix
-            similarity = torch.mm(normalized_patches, normalized_patches.t())
+    # If using the 3D pixel mask
+    if mask is not None:
+        try:
+            # Convert to 3D pixel mask
+            pixel_mask_3d = model.token_mask_to_pixel_mask(mask, original_input.shape)
 
-            # Get average similarity (excluding self-similarity)
-            mask = torch.ones_like(similarity) - torch.eye(similarity.shape[0])
-            avg_similarity = (similarity * mask).sum() / (mask.sum())
+            # Create masking heatmap
+            mask_heatmap = visualize_mask_heatmap(pixel_mask_3d)
 
-            diversity_text += f"\nAvg Patch Similarity: {avg_similarity.item():.4f}"
+            # Display masking heatmap
+            ax_mask_heatmap = fig.add_subplot(gs[mask_row, 2])
+            im = ax_mask_heatmap.imshow(mask_heatmap, cmap='hot', interpolation='nearest')
+            ax_mask_heatmap.set_title("Masking Intensity Heatmap")
+            ax_mask_heatmap.axis('off')
 
-            # Add text box
-            plt.figtext(0.5, 0.01, diversity_text, ha='center', fontsize=10,
-                        bbox=dict(facecolor='yellow', alpha=0.2))
+            # Add colorbar
+            fig.colorbar(im, ax=ax_mask_heatmap,
+                         fraction=0.046, pad=0.04,
+                         label='Masking Intensity')
+
+            # Print some statistics about the masking
+            print(f"Masking Heatmap Statistics:")
+            print(f"  Mean Masking Intensity: {mask_heatmap.mean().item():.4f}")
+            print(f"  Max Masking Intensity: {mask_heatmap.max().item():.4f}")
+            print(f"  Percentage of Pixels Masked: {(mask_heatmap > 0).float().mean().item() * 100:.2f}%")
 
         except Exception as e:
-            print(f"Error analyzing original patches: {e}")
+            print(f"Error creating masking heatmap: {e}")
             import traceback
             traceback.print_exc()
 
-            # Fallback: Display a message explaining the issue
-            ax_msg = fig.add_subplot(gs[current_row, :])
-            ax_msg.text(0.5, 0.5,
-                        "Could not analyze original patches.\nEnsure 'output' contains the original 'pred' tensor from model.",
-                        ha='center', va='center', fontsize=12)
-            ax_msg.axis('off')
-    else:
-        # Display a message explaining what's missing
-        ax_msg = fig.add_subplot(gs[current_row, :])
-        ax_msg.text(0.5, 0.5,
-                    "Original model patches not available.\nPass the complete model output dictionary with 'pred' to analyze original patches.",
-                    ha='center', va='center', fontsize=12)
-        ax_msg.axis('off')
+    # Visualize thickness mask
+    if thickness_mask is not None:
+        try:
+            # Ensure 2D numpy array
+            if thickness_mask.dim() == 4 and thickness_mask.shape[0] == 1 and thickness_mask.shape[1] == 1:
+                thickness_mask_np = thickness_mask[0, 0].detach().cpu().numpy()
+            elif thickness_mask.dim() == 3 and thickness_mask.shape[0] == 1:
+                thickness_mask_np = thickness_mask[0].detach().cpu().numpy()
+            elif thickness_mask.dim() == 2:
+                thickness_mask_np = thickness_mask.detach().cpu().numpy()
+            else:
+                raise ValueError(f"Unexpected thickness mask shape: {thickness_mask.shape}")
 
+            # Display thickness mask
+            ax_thickness_mask = fig.add_subplot(gs[mask_row, 1])
+            ax_thickness_mask.imshow(thickness_mask_np, cmap='gray')
+            ax_thickness_mask.set_title("Thickness Mask (White = Valid)")
+            ax_thickness_mask.axis('off')
+
+            # Combined mask if both masks are available
+            if mask is not None:
+                combined_mask = pixel_mask.numpy() * thickness_mask_np
+                ax_combined_mask = fig.add_subplot(gs[mask_row, 2])
+                ax_combined_mask.imshow(combined_mask, cmap='gray')
+                ax_combined_mask.set_title("Combined Mask (Contributing Areas)")
+                ax_combined_mask.axis('off')
+        except Exception as e:
+            print(f"Error processing thickness mask: {e}")
+
+    # Save the figure
     plt.tight_layout()
-
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         print(f"Saved visualization to {save_path}")
 
-        # Save numerical values if requested
-        if add_numerical_viz and 'numerical_band_indices' in locals():
-            # Save numerical values to CSV
-            csv_dir = os.path.dirname(save_path)
-            base_name = os.path.splitext(os.path.basename(save_path))[0]
-
-            for idx, band_idx in enumerate(numerical_band_indices):
-                if idx < 2:  # Only save for the wavelengths we displayed
-                    # Extract values at sample points
-                    orig_values = orig_input_hsi[band_idx].numpy()[np.ix_(h_indices, w_indices)]
-                    recon_values = recon_input_hsi[band_idx].numpy()[np.ix_(h_indices, w_indices)]
-                    diff_values = orig_values - recon_values
-
-                    # Create DataFrames
-                    orig_df = pd.DataFrame(orig_values)
-                    recon_df = pd.DataFrame(recon_values)
-                    diff_df = pd.DataFrame(diff_values)
-
-                    # Save to CSV
-                    csv_path = os.path.join(csv_dir, f"{base_name}_lambda{band_idx}_values.csv")
-                    with open(csv_path, 'w') as f:
-                        f.write(f"Wavelength Band {band_idx} Values\n\n")
-                        f.write("Original Values:\n")
-                        f.write(orig_df.to_csv(index=False))
-                        f.write("\nReconstructed Values:\n")
-                        f.write(recon_df.to_csv(index=False))
-                        f.write("\nDifference (Original - Reconstructed):\n")
-                        f.write(diff_df.to_csv(index=False))
-
-    plt.close()
-
-    # Clean up memory
-    del orig_input, reconstructed
-    gc.collect()
+    # Close the figure to free memory
+    plt.close(fig)
 
     return fig
 
@@ -696,6 +657,8 @@ if __name__ == "__main__":
     import torch
     import numpy as np
     from dataset import PatientDataset, create_patient_dataloader
+    # Import the model
+    from MultiModalSpectralGPT import MultiModalSpectralGPT
 
     # Get data directory from command line or use default
     data_dir = sys.argv[1] if len(sys.argv) > 1 else "dummydata"
@@ -719,11 +682,19 @@ if __name__ == "__main__":
         reconstructed = original + 0.05 * torch.randn_like(original)
 
         # Create a mask similar to what the model would produce (1=masked, 0=visible)
-        # Using dimensions from your model: 20x20 spatial patches, 6 spectral chunks = 2400 patches
-        total_patches = 2400
+        # Assuming your model uses 500x500 image with 25x25 patches
+        spatial_patches_h = 500 // 25  # 20 patches
+        spatial_patches_w = 500 // 25  # 20 patches
+        spectral_patches = 30 // 5  # 6 spectral patches
+        total_patches = spatial_patches_h * spatial_patches_w * spectral_patches
+
         mask = torch.zeros(1, total_patches)
         mask_indices = torch.randperm(total_patches)[:int(0.75 * total_patches)]
-        mask[0, mask_indices] = 1.0
+        mask[0, mask_indices] = 1.0  # Mask 75% of patches
+
+        print(f"Total patches: {total_patches}")
+        print(f"Mask shape: {mask.shape}")
+        print(f"Percentage masked: {(mask[0] == 1).float().mean().item() * 100:.2f}%")
 
         # Get or create thickness mask
         if 'thickness_mask' in batch and batch['thickness_mask'] is not None:
@@ -744,6 +715,28 @@ if __name__ == "__main__":
         # Make sure output directory exists
         os.makedirs("debug_output", exist_ok=True)
 
+        # Initialize the model with parameters that match your dataset and masking approach
+        model = MultiModalSpectralGPT(
+            analysis_dim=500,
+            patch_size=25,
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+            decoder_embed_dim=512,
+            decoder_depth=8,
+            decoder_num_heads=16,
+            mlp_ratio=4.0,
+            num_frames=30,
+            t_patch_size=5,
+            in_chans=1,
+            aux_chans=1,
+            aux_embed_dim=64,
+            temperature=0.07,
+            mask_ratio=0.75,
+            contrastive_mode='combined',
+            use_thickness_mask=True
+        )
+
         # Test visualization function
         print("Testing visualization function...")
         print(f"Original HSI shape: {original.shape}")
@@ -753,7 +746,8 @@ if __name__ == "__main__":
             reconstruction=reconstructed,
             mask=mask,
             thickness_mask=thickness_mask,
-            save_path="debug_output/reconstruction_quality_test.png"
+            save_path="debug_output/reconstruction_quality_test.png",
+            model=model  # Use the real model
         )
 
         print(f"Visualization saved to debug_output/reconstruction_quality_test.png")
@@ -761,6 +755,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error during visualization test: {e}")
         import traceback
-
         traceback.print_exc()
-

@@ -179,9 +179,9 @@ class SpatialRegistration(nn.Module):
             else:
                 aux_registered[modality] = None
 
-        # Create mask from thickness image without applying it
-        if 'thickness' in aux_registered and aux_registered['thickness'] is not None:
-            thickness_mask = self.detect_mask(aux_registered['thickness'])
+        from data_utils import derive_mask_from_hsi
+        thickness_mask = derive_mask_from_hsi(hsi_registered)
+        print("Using HSI-derived mask for rim detection instead of thickness mask")
 
         return hsi_registered, aux_registered, thickness_mask
 
@@ -466,17 +466,18 @@ class MultiModalSpectralGPT(nn.Module):
         """Perform per-sample random masking by per-sample shuffling."""
         N, L, D = x.shape
 
-        # Add this safety check
+        # Safety check to prevent extreme masking
         if mask_ratio > 0.99:
             mask_ratio = 0.99
 
+        # Calculate the number of tokens to keep
         len_keep = int(L * (1 - mask_ratio))
-        len_keep = max(1, len_keep)  # Keep at least one token
+        len_keep = max(1, len_keep)  # Ensure at least one token is kept
 
-
-
-        # Generate random noise and use it to shuffle indices
+        # Generate random noise for shuffling
         noise = torch.rand(N, L, device=x.device)
+
+        # Sort noise to get shuffling indices
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
 
@@ -490,7 +491,14 @@ class MultiModalSpectralGPT(nn.Module):
         # Generate binary mask (1 is masked, 0 is keep)
         mask = torch.ones([N, L], device=x.device)
         mask[:, :len_keep] = 0
+        # Restore to original order
         mask = torch.gather(mask, dim=1, index=ids_restore)
+
+        # Add some debugging print statements
+        print(f"Total tokens: {L}")
+        print(f"Tokens to keep: {len_keep}")
+        print(f"Tokens masked: {L - len_keep}")
+        print(f"Masking percentage: {(L - len_keep) / L * 100:.2f}%")
 
         return x_masked, mask, ids_restore
 
@@ -934,76 +942,71 @@ class MultiModalSpectralGPT(nn.Module):
 
     def token_mask_to_pixel_mask(self, token_mask, original_shape):
         """
-        Convert a token-level mask to a pixel-level mask.
+        Convert a token-level mask to a 3D pixel-level mask [B, T, H, W].
 
         Args:
-            token_mask: Binary mask of shape [B, L] where 1 indicates masked tokens
-            original_shape: Tuple of the original input shape [B, C, T, H, W]
+            token_mask: Token-level mask of shape [B, L]
+            original_shape: Original input shape [B, C, T, H, W]
 
         Returns:
-            Binary mask of shape [B, C, T, H, W] for applying at pixel level
+            3D pixel mask of shape [B, T, H, W]
         """
         B, C, T, H, W = original_shape
 
-        # Reshape token mask to [B, spectral_patches, spatial_patches]
-        token_mask_reshaped = token_mask.reshape(B, self.spectral_patches, self.spatial_patches)
+        # Calculate patch dimensions
+        spatial_patches_h = H // self.patch_size[0]
+        spatial_patches_w = W // self.patch_size[1]
+        spectral_patches = T // self.t_patch_size
 
-        # Get patch dimensions
-        patch_h, patch_w = self.patch_size
-        t_patch = self.t_patch_size
+        total_patches = spectral_patches * spatial_patches_h * spatial_patches_w
 
-        # Initialize pixel-level mask
-        pixel_mask = torch.zeros(B, C, T, H, W, device=token_mask.device)
+        # Validate mask shape
+        if token_mask.shape[1] != total_patches:
+            raise ValueError(
+                f"Mask size incorrect. Expected {total_patches} patches, "
+                f"but got {token_mask.shape[1]} patches. "
+                f"Spatial patches: {spatial_patches_h}x{spatial_patches_w}, "
+                f"Spectral patches: {spectral_patches}"
+            )
 
-        # Calculate spatial patches in each dimension
-        spatial_h = H // patch_h
-        spatial_w = W // patch_w
+        # Create 3D pixel mask
+        pixel_mask = torch.zeros(B, T, H, W, device=token_mask.device)
 
-        # Iterate through each token and set corresponding pixel region
         for b in range(B):
-            for s in range(self.spectral_patches):
-                t_start = s * t_patch
-                t_end = min((s + 1) * t_patch, T)
+            # Reshape mask to [spectral_patches, spatial_patches_h, spatial_patches_w]
+            mask_reshaped = token_mask[b].reshape(spectral_patches, spatial_patches_h, spatial_patches_w)
 
-                for h in range(spatial_h):
-                    for w in range(spatial_w):
-                        # Calculate patch index
-                        p = h * spatial_w + w
+            for t_idx in range(spectral_patches):
+                for h_idx in range(spatial_patches_h):
+                    for w_idx in range(spatial_patches_w):
+                        # Calculate pixel coordinates for this patch
+                        h_start = h_idx * self.patch_size[0]
+                        w_start = w_idx * self.patch_size[1]
 
-                        if token_mask_reshaped[b, s, p] > 0.5:  # If token is masked
-                            # Calculate pixel coordinates
-                            h_start = h * patch_h
-                            h_end = min((h + 1) * patch_h, H)
-                            w_start = w * patch_w
-                            w_end = min((w + 1) * patch_w, W)
-
-                            # Set corresponding pixels to 1 (masked)
-                            pixel_mask[b, :, t_start:t_end, h_start:h_end, w_start:w_end] = 1.0
+                        # Is this patch masked?
+                        if mask_reshaped[t_idx, h_idx, w_idx] > 0.5:
+                            # Mark entire spectral patch as masked
+                            pixel_mask[b,
+                            t_idx * self.t_patch_size:(t_idx + 1) * self.t_patch_size,
+                            h_start:h_start + self.patch_size[0],
+                            w_start:w_start + self.patch_size[1]
+                            ] = 1.0
 
         return pixel_mask
 
     def forward_loss_in_pixel_space(self, pred_pixels, original_input, mask, thickness_mask=None):
         """
         Compute loss in pixel space by directly comparing with the original input.
-
-        Args:
-            pred_pixels: Reconstructed pixels from decoder of shape [B, C, T, H, W]
-            original_input: Original input images of shape [B, C, T, H, W]
-            mask: Binary mask indicating which tokens were masked (1=masked, 0=visible)
-            thickness_mask: Mask indicating valid image regions (optional)
-
-        Returns:
-            torch.Tensor: Reconstruction loss in pixel space
+        Updated to work with 3D pixel mask.
         """
-        # Convert token mask to pixel mask
+        # Convert token mask to 3D pixel mask
         pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)
 
-        # If thickness mask is provided, combine it with the MAE mask
+        # If thickness mask is provided and enabled, combine masks
         if thickness_mask is not None and self.use_thickness_mask:
-            # Ensure thickness mask has the same dimensions as pixel_mask
+            # Ensure thickness mask has the same shape as pixel_mask
             if thickness_mask.ndim == 4:  # [B, 1, H, W]
-                # Expand to match [B, C, T, H, W]
-                thickness_mask = thickness_mask.unsqueeze(2).expand_as(pixel_mask)
+                thickness_mask = thickness_mask.unsqueeze(1).expand_as(pixel_mask)
 
             # Combine masks - both must be 1 for a pixel to be used
             combined_mask = pixel_mask * thickness_mask
@@ -1012,7 +1015,7 @@ class MultiModalSpectralGPT(nn.Module):
             pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
 
             # Sum loss and normalize by the number of pixels that contribute
-            valid_pixel_count = combined_mask.sum() + 1e-6  # Add small epsilon to avoid division by zero
+            valid_pixel_count = combined_mask.sum() + 1e-6
             return pixel_mse.sum() / valid_pixel_count
         else:
             # No thickness mask, just use MAE mask

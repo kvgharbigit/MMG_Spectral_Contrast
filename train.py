@@ -1,6 +1,6 @@
 import os
 
-#tw
+# tw
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.putenv('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import sys
@@ -27,7 +27,6 @@ from sklearn.manifold import TSNE
 from matplotlib.colors import LinearSegmentedColormap
 import gc
 
-
 # Import custom modules
 from MultiModalSpectralGPT import MultiModalSpectralGPT
 from dataset import PatientDataset, custom_collate_fn, create_patient_dataloader
@@ -41,7 +40,6 @@ import matplotlib.cm as cm
 
 # Configure matplotlib for non-GUI environments
 plt.switch_backend('agg')
-
 
 import torch
 import os
@@ -166,7 +164,6 @@ def release_reserved_memory():
     return allocated
 
 
-
 def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr):
     """
     Creates a learning rate schedule with linear warmup and cosine decay.
@@ -204,8 +201,6 @@ def calculate_metrics(outputs, optimizer=None):
         'num_modalities': 0.0,
     }
 
-
-
     # Add current learning rate if optimizer is provided
     if optimizer is not None:
         for param_group in optimizer.param_groups:
@@ -223,8 +218,6 @@ def calculate_metrics(outputs, optimizer=None):
         metrics['loss_contrast'] += output['loss_contrast'].item()
         metrics['num_modalities'] += output['num_modalities'].item()
 
-
-
     # Calculate the average for normal metrics
     for key in ['loss', 'loss_recon', 'loss_contrast', 'num_modalities']:
         metrics[key] /= batch_count
@@ -235,7 +228,7 @@ def calculate_metrics(outputs, optimizer=None):
 def log_metrics(split, metrics, epoch, writer, mlflow_logging=True):
     """
     Log metrics to both TensorBoard and MLflow.
-    
+
     Args:
         split: String indicating 'train' or 'val'
         metrics: Dictionary of metric values
@@ -246,7 +239,7 @@ def log_metrics(split, metrics, epoch, writer, mlflow_logging=True):
     # Log to TensorBoard
     for key, value in metrics.items():
         writer.add_scalar(f"{split}/{key}", value, epoch)
-    
+
     # Log to MLflow
     if mlflow_logging:
         for key, value in metrics.items():
@@ -292,7 +285,7 @@ def log_reconstruction(recon_path, epoch, writer, mlflow_logging=True):
 def save_metrics_to_csv(metrics_dict, output_dir, epoch, split='train'):
     """
     Save metrics to a CSV file.
-    
+
     Args:
         metrics_dict: Dictionary of metric values
         output_dir: Directory to save the CSV file
@@ -302,24 +295,22 @@ def save_metrics_to_csv(metrics_dict, output_dir, epoch, split='train'):
     # Create metrics directory if it doesn't exist
     metrics_dir = os.path.join(output_dir, 'metrics')
     os.makedirs(metrics_dir, exist_ok=True)
-    
+
     # Prepare metrics data
     metrics_data = {key: [value] for key, value in metrics_dict.items()}
     metrics_data['epoch'] = [epoch]
     metrics_df = pd.DataFrame(metrics_data)
-    
+
     # Define file path
     csv_path = os.path.join(metrics_dir, f"{split}_metrics.csv")
-    
+
     # If file exists, append to it; otherwise, create a new file
     if os.path.exists(csv_path):
         existing_df = pd.read_csv(csv_path)
         metrics_df = pd.concat([existing_df, metrics_df], ignore_index=True)
-    
+
     # Save to CSV
     metrics_df.to_csv(csv_path, index=False)
-
-
 
 
 def update_best_metrics(val_metrics, epoch, summaries_dir, current_lr=None):
@@ -431,22 +422,22 @@ def save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, total_time
 def check_early_stopping(val_losses, patience, min_delta=0.0):
     """
     Check if training should be stopped based on validation loss.
-    
+
     Args:
         val_losses: List of validation losses
         patience: Number of epochs to wait for improvement
         min_delta: Minimum change to qualify as improvement
-        
+
     Returns:
         Boolean indicating whether to stop training
     """
     if len(val_losses) <= patience:
         return False
-    
+
     # Check if validation loss hasn't improved for 'patience' epochs
     best_loss = min(val_losses[:-patience])
     recent_best = min(val_losses[-patience:])
-    
+
     # Return True if there's been no improvement
     return (best_loss - recent_best) < min_delta
 
@@ -495,8 +486,6 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         }
         outputs.append(output_dict)
 
-
-
         # Get current learning rate for progress bar
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -521,7 +510,6 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
     """Validate the model on the validation set."""
     model.eval()
     outputs = []
-
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:
@@ -553,8 +541,6 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             }
             outputs.append(output_dict)
 
-
-
             # Update progress bar
             pbar.set_postfix({
                 'loss': f"{output['loss'].item():.10f}",
@@ -569,6 +555,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             gc.collect()
 
     return outputs
+
 
 def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False):
     """
@@ -607,8 +594,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
 
 def visualize_reconstruction_during_training(model, val_loader, device, epoch, output_dir):
     """
-    Generate and save reconstruction visualizations during training with diversity analysis
-    using the original model patches.
+    Updated to work with new 3D pixel mask visualization
     """
     # Create visualization directory if it doesn't exist
     viz_dir = os.path.join(output_dir, 'visualizations')
@@ -634,24 +620,19 @@ def visualize_reconstruction_during_training(model, val_loader, device, epoch, o
         with torch.no_grad():
             output = model(hsi, aux_data, batch_idx)
 
-        # Get the reconstructed pixels and mask
-        reconstructed_pixels = output['reconstructed_pixels']
-        mask = output['mask']
-
         # Define save path
         save_path = os.path.join(viz_dir, f'reconstruction_epoch_{epoch}.png')
 
-        # Visualize the reconstruction with numerical visualization and patch diversity analysis
-        from visualisation import visualize_pixel_reconstruction
-        visualize_pixel_reconstruction(
-            model=model,
-            original_input=hsi,
-            reconstructed_pixels=reconstructed_pixels,
-            mask=mask,
-            output=output,  # Pass the complete output dictionary containing pred
+        # Visualize the reconstruction
+        # Pass the model to allow conversion of token mask to pixel mask
+        from visualisation import visualize_reconstruction_quality
+        fig = visualize_reconstruction_quality(
+            original=hsi,
+            reconstruction=output['reconstructed_pixels'],
+            mask=output['mask'],
             thickness_mask=thickness_mask,
             save_path=save_path,
-            add_numerical_viz=True
+            model=model  # Pass the model to convert token mask
         )
 
         # Log the visualization to TensorBoard and MLFlow
@@ -753,7 +734,6 @@ def main(cfg: DictConfig):
                 rotation_degrees=cfg.data.augmentation.rotation_degrees,
                 scale_range=cfg.data.augmentation.scale_range
             )
-
 
         val_loader = DataLoader(
             val_dataset,
@@ -923,7 +903,7 @@ def main(cfg: DictConfig):
         )
         val_metrics = calculate_metrics(val_outputs)
 
-        #Visualise
+        # Visualise
         if (epoch + 1) % cfg.visualization.viz_frequency == 0 or epoch == cfg.training.epochs - 1:
             print("Generating reconstruction visualization with diversity analysis...")
             recon_path = visualize_reconstruction_during_training(
@@ -963,7 +943,6 @@ def main(cfg: DictConfig):
 
         # Keep track of validation losses for early stopping
         val_losses.append(val_metrics['loss'])
-
 
         # Save checkpoint
         is_best = val_metrics['loss'] < best_val_loss
@@ -1010,6 +989,7 @@ def main(cfg: DictConfig):
 
     # Close TensorBoard writer
     writer.close()
+
 
 def save_training_summary(cfg, output_dir):
     """
