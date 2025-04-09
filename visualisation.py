@@ -227,10 +227,12 @@ def visualize_augmentation(original_batch, augmented_batch, save_dir='visualizat
     print(f"All visualizations saved to {save_dir}")
 
 
+# Update this function in visualisation.py
 def visualize_reconstruction_quality(original, reconstruction, mask, thickness_mask=None,
                                      save_path=None, model=None, num_wavelengths=5):
     """
     Comprehensive visualization of reconstruction quality with advanced masking analysis.
+    Modified to handle batch size by always using the first item in the batch.
 
     Args:
         original (torch.Tensor): Original input tensor of shape [B, C, T, H, W]
@@ -254,7 +256,24 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
     if model is None:
         raise ValueError("Model must be provided to convert token mask to pixel mask")
 
-    # Use only the first batch item for visualization
+    # Handle batch size by always using just the first item
+    # For original tensor
+    if original.shape[0] > 1:
+        original = original[0:1]  # Keep first batch item only
+
+    # For reconstruction tensor
+    if reconstruction.shape[0] > 1:
+        reconstruction = reconstruction[0:1]  # Keep first batch item only
+
+    # For mask tensor
+    if mask.shape[0] > 1:
+        mask = mask[0:1]  # Keep first batch item only
+
+    # For thickness mask
+    if thickness_mask is not None and thickness_mask.shape[0] > 1:
+        thickness_mask = thickness_mask[0:1]  # Keep first batch item only
+
+    # Now proceed with single-batch tensors
     orig_input = original[0].detach().cpu()
     reconstructed = reconstruction[0].detach().cpu()
 
@@ -307,16 +326,27 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
     # Create combined mask heatmap (pixels used in loss calculation)
     combined_mask_heatmap = None
     if thickness_mask is not None and model.use_thickness_mask:
-        # Ensure thickness mask has the right shape
-        if thickness_mask.dim() == 4 and thickness_mask.shape[1] == 1:  # [B, 1, H, W]
-            expanded_thickness = thickness_mask[0, 0].cpu().numpy()  # Get first batch item
+        # Always just use the first item in the batch for visualization
+        if thickness_mask.dim() == 4:  # [B, 1, H, W]
+            thickness_mask = thickness_mask[0:1]  # Keep only first batch item but preserve dimensions
 
-            # Get percentage of spectral bands masked at each spatial location
-            pixel_mask_2d = pixel_mask_3d[0].cpu().numpy()  # [T, H, W]
-            spectral_mask_percentage = pixel_mask_2d.mean(axis=0)  # Average across spectral dimension [H, W]
+        # Now validate with original expectations
+        if thickness_mask.dim() == 4 and thickness_mask.shape[0] == 1 and thickness_mask.shape[1] == 1:  # [1, 1, H, W]
+            expanded_thickness = thickness_mask[0, 0].cpu().numpy()
+        elif thickness_mask.dim() == 3 and thickness_mask.shape[0] == 1:  # [1, H, W]
+            expanded_thickness = thickness_mask[0].cpu().numpy()
+        elif thickness_mask.dim() == 2:  # [H, W]
+            expanded_thickness = thickness_mask.cpu().numpy()
+        else:
+            raise ValueError(f"Unexpected thickness mask shape: {thickness_mask.shape}. " +
+                             "Expected [1, 1, H, W], [1, H, W], or [H, W].")
 
-            # Multiply by thickness mask to only show valid regions
-            combined_mask_heatmap = spectral_mask_percentage * expanded_thickness
+        # Get percentage of spectral bands masked at each spatial location
+        pixel_mask_2d = pixel_mask_3d[0].cpu().numpy()  # [T, H, W]
+        spectral_mask_percentage = pixel_mask_2d.mean(axis=0)  # Average across spectral dimension [H, W]
+
+        # Multiply by thickness mask to only show valid regions
+        combined_mask_heatmap = spectral_mask_percentage * expanded_thickness
 
     # Create figure with more detailed layout
     fig = plt.figure(figsize=(20, 20))
@@ -391,7 +421,11 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
     # Thickness Mask (if available)
     ax_thickness_mask = fig.add_subplot(gs[3, 1])
     if thickness_mask is not None:
-        # Ensure 2D numpy array
+        # Always just use the first item in the batch for visualization
+        if thickness_mask.dim() == 4 and thickness_mask.shape[0] > 1:
+            thickness_mask = thickness_mask[0:1]  # Keep only first batch item
+
+        # Now validate with original expectations
         if thickness_mask.dim() == 4 and thickness_mask.shape[0] == 1 and thickness_mask.shape[1] == 1:
             thickness_mask_np = thickness_mask[0, 0].detach().cpu().numpy()
         elif thickness_mask.dim() == 3 and thickness_mask.shape[0] == 1:
@@ -399,7 +433,8 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
         elif thickness_mask.dim() == 2:
             thickness_mask_np = thickness_mask.detach().cpu().numpy()
         else:
-            raise ValueError(f"Unexpected thickness mask shape: {thickness_mask.shape}")
+            raise ValueError(f"Unexpected thickness mask shape: {thickness_mask.shape}. " +
+                             "Expected [1, 1, H, W], [1, H, W], or [H, W].")
 
         ax_thickness_mask.imshow(thickness_mask_np, cmap='gray')
         ax_thickness_mask.set_title("Thickness Mask")
@@ -727,7 +762,7 @@ if __name__ == "__main__":
     # Create dataloader to get a batch of real data
     dataloader = create_patient_dataloader(
         data_dir,
-        batch_size=1,  # Just load one sample for testing
+        batch_size=2,  # Just load one sample for testing
         analysis_dim=500,
         target_bands=30
     )
