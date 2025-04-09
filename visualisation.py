@@ -304,9 +304,24 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
     # Create masking heatmap
     mask_heatmap = pixel_mask_3d.sum(dim=1)[0].cpu().numpy()
 
+    # Create combined mask heatmap (pixels used in loss calculation)
+    combined_mask_heatmap = None
+    if thickness_mask is not None and model.use_thickness_mask:
+        # Ensure thickness mask has the right shape
+        if thickness_mask.dim() == 4 and thickness_mask.shape[1] == 1:  # [B, 1, H, W]
+            expanded_thickness = thickness_mask[0, 0].cpu().numpy()  # Get first batch item
+
+            # Get the first batch item of the 3D pixel mask and sum across spectral dimension
+            pixel_mask_2d = pixel_mask_3d[0].cpu().numpy()  # [T, H, W]
+
+            # Calculate which pixels are used in loss calculation (both masked and in valid region)
+            # For visualization, just show if ANY spectral band at this location is used
+            pixel_mask_any = (pixel_mask_2d.max(axis=0) > 0).astype(float)  # [H, W]
+            combined_mask_heatmap = pixel_mask_any * expanded_thickness
+
     # Create figure with more detailed layout
-    fig = plt.figure(figsize=(20, 15))
-    gs = fig.add_gridspec(4, 4)
+    fig = plt.figure(figsize=(20, 20))
+    gs = fig.add_gridspec(5, 4)  # Added an extra row for the new visualization
 
     # Top row: RGB and error comparisons
     ax_orig_rgb = fig.add_subplot(gs[0, 0])
@@ -368,14 +383,14 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
 
     # Masking and analysis visualizations
     # Masking Intensity Heatmap
-    ax_mask_heatmap = fig.add_subplot(gs[3, 0:2])
+    ax_mask_heatmap = fig.add_subplot(gs[3, 0])
     mask_im = ax_mask_heatmap.imshow(mask_heatmap, cmap='hot', interpolation='nearest')
     ax_mask_heatmap.set_title("Masking Intensity Heatmap")
     ax_mask_heatmap.axis('off')
     fig.colorbar(mask_im, ax=ax_mask_heatmap, shrink=0.8, label='Masking Intensity')
 
     # Thickness Mask (if available)
-    ax_thickness_mask = fig.add_subplot(gs[3, 2])
+    ax_thickness_mask = fig.add_subplot(gs[3, 1])
     if thickness_mask is not None:
         # Ensure 2D numpy array
         if thickness_mask.dim() == 4 and thickness_mask.shape[0] == 1 and thickness_mask.shape[1] == 1:
@@ -393,7 +408,20 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
         ax_thickness_mask.text(0.5, 0.5, "No Thickness Mask",
                                horizontalalignment='center',
                                verticalalignment='center')
-        ax_thickness_mask.axis('off')
+    ax_thickness_mask.axis('off')
+
+    # Combined Mask (pixels used in loss calculation)
+    ax_combined_mask = fig.add_subplot(gs[3, 2])
+    if combined_mask_heatmap is not None:
+        combined_im = ax_combined_mask.imshow(combined_mask_heatmap, cmap='hot', interpolation='nearest')
+        ax_combined_mask.set_title("Pixels Used in Loss")
+        ax_combined_mask.axis('off')
+        fig.colorbar(combined_im, ax=ax_combined_mask, shrink=0.8, label='Contribution')
+    else:
+        ax_combined_mask.text(0.5, 0.5, "No Combined Mask Available",
+                              horizontalalignment='center',
+                              verticalalignment='center')
+        ax_combined_mask.axis('off')
 
     # Additional Statistics Subplot
     ax_stats = fig.add_subplot(gs[3, 3])
@@ -411,10 +439,43 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
         f"  Mean Mask Intensity: {mask_heatmap.mean():.4f}"
     ]
 
+    # Add combined mask statistics if available
+    if combined_mask_heatmap is not None:
+        stats_text.extend([
+            f"\nLoss Contribution Statistics:",
+            f"  Pixels Used in Loss: {(combined_mask_heatmap > 0).mean() * 100:.2f}%",
+            f"  Mean Contribution: {combined_mask_heatmap.mean():.4f}"
+        ])
+
     ax_stats.text(0, 1, '\n'.join(stats_text),
                   verticalalignment='top',
                   fontsize=10,
                   fontfamily='monospace')
+
+    # Add spectral-spatial analysis in bottom row
+    # Average error per spectral band
+    if reconstructed.dim() > 3:
+        ax_spectral_error = fig.add_subplot(gs[4, 0:2])
+        spectral_error = ((reconstructed - orig_input) ** 2).mean(dim=(2, 3) if reconstructed.dim() == 4 else (3, 4))
+        if spectral_error.dim() > 1:
+            spectral_error = spectral_error.mean(dim=0)
+
+        x_values = range(len(spectral_error))
+        ax_spectral_error.bar(x_values, spectral_error.numpy())
+        ax_spectral_error.set_xlabel('Spectral Band')
+        ax_spectral_error.set_ylabel('MSE')
+        ax_spectral_error.set_title('Error Distribution Across Spectral Bands')
+
+        # Spatial distribution of masking
+        ax_spatial_analysis = fig.add_subplot(gs[4, 2:])
+
+        # Calculate percentage of spectral bands masked per spatial location
+        if pixel_mask_3d is not None:
+            spatial_mask_percentage = pixel_mask_3d[0].float().mean(dim=0).cpu().numpy() * 100
+            spatial_im = ax_spatial_analysis.imshow(spatial_mask_percentage, cmap='viridis')
+            ax_spatial_analysis.set_title("Percentage of Bands Masked per Location")
+            ax_spatial_analysis.axis('off')
+            fig.colorbar(spatial_im, ax=ax_spatial_analysis, shrink=0.8, label='% Bands Masked')
 
     plt.tight_layout()
 
@@ -423,8 +484,8 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Saved visualization to {save_path}")
 
-    # Close the figure to free memory
-    plt.close(fig)
+    # Return figure but don't display (to avoid showing in non-interactive environments)
+    plt.close(fig)  # Close the figure to free memory
 
     return fig
 
