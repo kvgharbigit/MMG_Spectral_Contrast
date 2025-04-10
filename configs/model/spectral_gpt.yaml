@@ -1,8 +1,8 @@
 # @package _global_.model
 
 # Model architecture parameters
-analysis_dim: 500
-patch_size: [10, 10]
+analysis_dim: 224
+patch_size: [4, 4]
 embed_dim: 768
 depth: 12
 num_heads: 12
@@ -11,7 +11,7 @@ decoder_depth: 8
 decoder_num_heads: 16
 mlp_ratio: 4.0
 num_frames: 30
-t_patch_size: 5
+t_patch_size: 3
 in_chans: 1
 aux_chans: 1
 aux_embed_dim: 256

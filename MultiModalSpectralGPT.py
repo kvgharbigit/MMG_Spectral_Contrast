@@ -997,26 +997,67 @@ class MultiModalSpectralGPT(nn.Module):
     def forward_loss_in_pixel_space(self, pred_pixels, original_input, mask, thickness_mask=None):
         """
         Compute loss in pixel space by directly comparing with the original input.
-        Updated to work with 3D pixel mask.
         """
         # Convert token mask to 3D pixel mask
-        pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)
+        pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)  # [B, T, H, W]
+        print(f"Pixel mask shape: {pixel_mask.shape}")
 
         # If thickness mask is provided and enabled, combine masks
         if thickness_mask is not None and self.use_thickness_mask:
-            # Ensure thickness mask has the same shape as pixel_mask
-            if thickness_mask.ndim == 4:  # [B, 1, H, W]
-                thickness_mask = thickness_mask.unsqueeze(1).expand_as(pixel_mask)
+            # Print details about the thickness mask
+            print(f"Original thickness mask shape: {thickness_mask.shape}")
+            print(f"Thickness mask dimensions: {thickness_mask.dim()}")
 
-            # Combine masks - both must be 1 for a pixel to be used
-            combined_mask = pixel_mask * thickness_mask
+            # Examine the thickness mask shape in detail
+            if thickness_mask.dim() == 5:
+                print(
+                    f"Shape details: [B={thickness_mask.shape[0]}, D1={thickness_mask.shape[1]}, D2={thickness_mask.shape[2]}, H={thickness_mask.shape[3]}, W={thickness_mask.shape[4]}]")
 
-            # Compute MSE only on pixels that are both masked and in valid regions
-            pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
+                # Try to reshape the thickness mask to [B, 1, H, W]
+                try:
+                    # Remove the extra dimension (D2) directly
+                    reshaped_thickness = thickness_mask[:, :, 0, :, :]
+                    print(f"After removing D2: {reshaped_thickness.shape}")
 
-            # Sum loss and normalize by the number of pixels that contribute
-            valid_pixel_count = combined_mask.sum() + 1e-6
-            return pixel_mse.sum() / valid_pixel_count
+                    # Now expand across wavelength dimension
+                    expanded_thickness = reshaped_thickness.expand(-1, pixel_mask.shape[1], -1, -1)
+                    print(f"After expansion: {expanded_thickness.shape}")
+
+                    # Combine masks
+                    combined_mask = pixel_mask * expanded_thickness
+
+                    # Compute loss
+                    pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
+                    valid_pixel_count = combined_mask.sum() + 1e-6
+                    return pixel_mse.sum() / valid_pixel_count
+
+                except Exception as e:
+                    print(f"Error reshaping thickness mask: {e}")
+                    # Fall back to just using pixel mask
+                    pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
+                    masked_pixel_count = pixel_mask.sum() + 1e-6
+                    return pixel_mse.sum() / masked_pixel_count
+
+            elif thickness_mask.dim() == 4:
+                try:
+                    # Expand across wavelength dimension
+                    expanded_thickness = thickness_mask.expand(-1, pixel_mask.shape[1], -1, -1)
+                    print(f"After expansion: {expanded_thickness.shape}")
+
+                    # Combine masks
+                    combined_mask = pixel_mask * expanded_thickness
+
+                    # Compute loss
+                    pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
+                    valid_pixel_count = combined_mask.sum() + 1e-6
+                    return pixel_mse.sum() / valid_pixel_count
+
+                except Exception as e:
+                    print(f"Error expanding thickness mask: {e}")
+                    # Fall back to just using pixel mask
+                    pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
+                    masked_pixel_count = pixel_mask.sum() + 1e-6
+                    return pixel_mse.sum() / masked_pixel_count
         else:
             # No thickness mask, just use MAE mask
             pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
