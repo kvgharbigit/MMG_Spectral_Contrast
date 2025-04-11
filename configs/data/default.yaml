@@ -7,7 +7,7 @@ parent_dir: "dummydata"
 train_dir: "dummydata/train"  # Used when auto_split is false
 val_dir: "dummydata/val"  # Used when auto_split is false
 #dummydata
-
+#
 # Data splitting
 use_auto_split: true
 auto_split_ratio: 0.5  # Percentage for validation
