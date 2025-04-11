@@ -361,7 +361,6 @@ class MultiModalSpectralGPT(nn.Module):
         spatial_patches_w = self.analysis_dim // self.patch_size[1]
         spectral_patches = num_frames // self.t_patch_size
 
-
         print(f"  Spatial Patches: {spatial_patches_h} x {spatial_patches_w}")
         print(f"  Spectral Patches: {spectral_patches}")
         print(f"  Total Patches: {spatial_patches_h * spatial_patches_w * spectral_patches}")
@@ -504,91 +503,93 @@ class MultiModalSpectralGPT(nn.Module):
 
     def forward_encoder(self, hsi_img, aux_data=None):
         """Forward pass through encoder with masking and auxiliary conditioning."""
-        # Convert input to sequence of embedded patches
-        x = self.patch_embed(hsi_img)  # Shape: [B, T, HW, D]
+        with torch.cuda.amp.autocast(enabled=True):
+            # Convert input to sequence of embedded patches
+            x = self.patch_embed(hsi_img)  # Shape: [B, T, HW, D]
 
-        # Reshape from [B, T, HW, D] to [B, T*HW, D]
-        B, T, HW, D = x.shape
-        x = x.reshape(B, T * HW, D)  # Shape: [B, T*HW, D]
+            # Reshape from [B, T, HW, D] to [B, T*HW, D]
+            B, T, HW, D = x.shape
+            x = x.reshape(B, T * HW, D)  # Shape: [B, T*HW, D]
 
-        # Add positional embeddings
-        x = x + self.pos_embed  # Shape: [B, T*HW, D]
+            # Add positional embeddings
+            x = x + self.pos_embed  # Shape: [B, T*HW, D]
 
-        # Apply random masking
-        x, mask, ids_restore = self.random_masking(x, self.mask_ratio)
+            # Apply random masking
+            x, mask, ids_restore = self.random_masking(x, self.mask_ratio)
 
-        # Process auxiliary modalities if present
-        if aux_data is not None:
-            aux_embeddings = self.encode_auxiliary(aux_data)
-            # Apply cross-attention for each modality
-            for modality, embedding in aux_embeddings.items():
-                if embedding is not None:
-                    cond_tokens = self.modality_proj(embedding).unsqueeze(1)
-                    for block in self.cross_attn:
-                        # Use gradient checkpointing for cross-attention blocks
-                        def create_custom_forward(mod):
-                            def custom_forward(*inputs):
-                                return mod(torch.cat(inputs, dim=1))[:, :-1, :]
+            # Process auxiliary modalities if present
+            if aux_data is not None:
+                aux_embeddings = self.encode_auxiliary(aux_data)
+                # Apply cross-attention for each modality
+                for modality, embedding in aux_embeddings.items():
+                    if embedding is not None:
+                        cond_tokens = self.modality_proj(embedding).unsqueeze(1)
+                        for block in self.cross_attn:
+                            # Use gradient checkpointing for cross-attention blocks
+                            def create_custom_forward(mod):
+                                def custom_forward(*inputs):
+                                    return mod(torch.cat(inputs, dim=1))[:, :-1, :]
 
-                            return custom_forward
+                                return custom_forward
 
-                        if self.training:
-                            # Use checkpointing during training
-                            x = x + checkpoint(
-                                create_custom_forward(block),
-                                x, cond_tokens
-                            )
-                        else:
-                            # Regular forward pass during evaluation
-                            x = x + block(torch.cat([x, cond_tokens], dim=1))[:, :-1, :]
+                            if self.training:
+                                # Use checkpointing during training
+                                x = x + checkpoint(
+                                    create_custom_forward(block),
+                                    x, cond_tokens
+                                )
+                            else:
+                                # Regular forward pass during evaluation
+                                x = x + block(torch.cat([x, cond_tokens], dim=1))[:, :-1, :]
 
-        # Apply main transformer blocks with gradient checkpointing
-        for i, block in enumerate(self.blocks):
-            if self.training:
-                # Use gradient checkpointing during training
-                x = checkpoint(block, x)
-            else:
-                # Regular forward pass during evaluation
-                x = block(x)
+            # Apply main transformer blocks with gradient checkpointing
+            for i, block in enumerate(self.blocks):
+                if self.training:
+                    # Use gradient checkpointing during training
+                    x = checkpoint(block, x)
+                else:
+                    # Regular forward pass during evaluation
+                    x = block(x)
 
-        x = self.norm(x)
+            x = self.norm(x)
 
         return x, mask, ids_restore
 
     def forward_decoder(self, x, ids_restore):
         """Decoder to reconstruct masked tokens in embedding space."""
-        # Project to decoder dimension
-        x = self.decoder_embed(x)
+        with torch.cuda.amp.autocast(enabled=True):
+            # Project to decoder dimension
+            x = self.decoder_embed(x)
 
-        # Create and append mask tokens
-        mask_tokens = self.mask_token.repeat(
-            x.shape[0],
-            ids_restore.shape[1] - x.shape[1],
-            1
-        )
-        x_ = torch.cat([x, mask_tokens], dim=1)
+            # Create and append mask tokens
+            mask_tokens = self.mask_token.repeat(
+                x.shape[0],
+                ids_restore.shape[1] - x.shape[1],
+                1
+            )
+            x_ = torch.cat([x, mask_tokens], dim=1)
 
-        # Restore original sequence order
-        x_ = torch.gather(
-            x_, dim=1,
-            index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2])
-        )
+            # Restore original sequence order
+            x_ = torch.gather(
+                x_, dim=1,
+                index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2])
+            )
 
-        # Add position embeddings and apply decoder with gradient checkpointing
-        x = x_ + self.decoder_pos_embed
+            # Add position embeddings and apply decoder with gradient checkpointing
+            x = x_ + self.decoder_pos_embed
 
-        for block in self.decoder_blocks:
-            if self.training:
-                # Use gradient checkpointing during training
-                x = checkpoint(block, x)
-            else:
-                # Regular forward pass during evaluation
-                x = block(x)
+            for block in self.decoder_blocks:
+                if self.training:
+                    # Use gradient checkpointing during training
+                    x = checkpoint(block, x)
+                else:
+                    # Regular forward pass during evaluation
+                    x = block(x)
 
-        x = self.decoder_norm(x)
+            x = self.decoder_norm(x)
 
-        # Predict original embeddings
-        x = self.decoder_pred(x)
+            # Predict original embeddings
+            x = self.decoder_pred(x)
 
         return x
 
@@ -622,39 +623,25 @@ class MultiModalSpectralGPT(nn.Module):
 
         return features
 
-    def encode_auxiliary_patches(self, aux_data):
-        """
-        Encode auxiliary modalities into patch-level features for spatial contrastive learning.
+    def encode_auxiliary(self, aux_data):
+        """Encode auxiliary modalities.
+
+        Processes each auxiliary modality through its respective encoder
+        and applies normalization.
 
         Args:
             aux_data: Dictionary of auxiliary images
 
         Returns:
-            dict: Dictionary of encoded auxiliary patch embeddings
+            dict: Encoded and normalized auxiliary embeddings
         """
-        aux_patch_embeddings = {}
-
-        for modality, data in aux_data.items():
-            if data is not None:
-                # Patch embed using the auxiliary encoder's patch_embed
-                x = self.aux_encoder[modality].patch_embed(data)
-
-                # Flatten spatial dimensions
-                B, C, H, W = x.shape
-                x = x.flatten(2)  # Output: [B, embed_dim, H*W]
-                x = x.transpose(1, 2)  # Output: [B, H*W, embed_dim]
-
-                # Process through transformer blocks
-                for blk in self.aux_encoder[modality].blocks:
-                    x = blk(x)
-
-                # Apply normalization
-                x = self.aux_encoder[modality].norm(x)
-
-                # Skip the global pooling step to keep patch tokens
-                aux_patch_embeddings[modality] = x
-
-        return aux_patch_embeddings
+        with torch.cuda.amp.autocast(enabled=True):
+            aux_embeddings = {}
+            for modality, data in aux_data.items():
+                if data is not None:
+                    aux_embeddings[modality] = self.aux_encoder[modality](data)
+                    aux_embeddings[modality] = self.aux_norm(aux_embeddings[modality])
+            return aux_embeddings
 
     def contrastive_loss_spatial(self, hsi_features, aux_embeddings, batch_idx, thickness_mask=None):
         """
@@ -663,166 +650,164 @@ class MultiModalSpectralGPT(nn.Module):
         Only applies thickness mask when processing the 'thickness' modality if use_thickness_mask is True.
         For other modalities (IR, AF), the thickness mask is not applied.
         """
-        device = hsi_features.device
-        B = hsi_features.shape[0]
+        with torch.cuda.amp.autocast(enabled=True):
+            device = hsi_features.device
+            B = hsi_features.shape[0]
 
-        # Group HSI patches by spatial location
-        hsi_spatial = self.group_hsi_patches_by_spatial_location(hsi_features)
+            # Group HSI patches by spatial location
+            hsi_spatial = self.group_hsi_patches_by_spatial_location(hsi_features)
 
-        # Project with spatial-specific head
-        z_hsi = self.proj_head_spatial(hsi_spatial)  # [B, HW, T*D] -> [B, HW, D]
+            # Project with spatial-specific head
+            z_hsi = self.proj_head_spatial(hsi_spatial)  # [B, HW, T*D] -> [B, HW, D]
 
-        # Convert thickness mask to patch level if provided
-        patch_thickness_mask = None
-        if thickness_mask is not None:
-            patch_thickness_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)
-            # Reshape to match spatial structure
-            patch_thickness_mask = patch_thickness_mask.reshape(B, self.spatial_patches * self.spectral_patches)
-            # Group by spatial location (take average of all spectral patches at each location)
-            patch_thickness_mask = patch_thickness_mask.reshape(B, self.spatial_patches, self.spectral_patches)
-            patch_thickness_mask = patch_thickness_mask.mean(dim=2)  # [B, spatial_patches]
+            # Convert thickness mask to patch level if provided
+            patch_thickness_mask = None
+            if thickness_mask is not None:
+                patch_thickness_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)
+                # Reshape to match spatial structure
+                patch_thickness_mask = patch_thickness_mask.reshape(B, self.spatial_patches * self.spectral_patches)
+                # Group by spatial location (take average of all spectral patches at each location)
+                patch_thickness_mask = patch_thickness_mask.reshape(B, self.spatial_patches, self.spectral_patches)
+                patch_thickness_mask = patch_thickness_mask.mean(dim=2)  # [B, spatial_patches]
 
-        # Calculate individual losses for available modalities
-        individual_losses = []
+            # Calculate individual losses for available modalities
+            individual_losses = []
 
-        for modality, embeddings in aux_embeddings.items():
-            if embeddings is not None:
-                # Project auxiliary embeddings
-                projected_aux = self.aux_spatial_proj(embeddings)
-                z_aux = self.proj_head_global(projected_aux)
+            for modality, embeddings in aux_embeddings.items():
+                if embeddings is not None:
+                    # Project auxiliary embeddings
+                    projected_aux = self.aux_spatial_proj(embeddings)
+                    z_aux = self.proj_head_global(projected_aux)
 
-                # Selectively apply mask only for thickness modality
-                if modality == 'thickness' and patch_thickness_mask is not None:
-                    # Collect valid patches across all batches
-                    valid_hsi_features = []
-                    valid_aux_features = []
-                    valid_batch_indices = []
+                    # Selectively apply mask only for thickness modality
+                    if modality == 'thickness' and patch_thickness_mask is not None:
+                        # Collect valid patches across all batches
+                        valid_hsi_features = []
+                        valid_aux_features = []
+                        valid_batch_indices = []
 
-                    for b in range(B):
-                        # Get indices of valid patches (where mask > 0.5)
-                        valid_indices = torch.where(patch_thickness_mask[b] > 0.5)[0]
+                        for b in range(B):
+                            # Get indices of valid patches (where mask > 0.5)
+                            valid_indices = torch.where(patch_thickness_mask[b] > 0.5)[0]
 
-                        if len(valid_indices) == 0:
-                            continue  # Skip if no valid patches in this batch
+                            if len(valid_indices) == 0:
+                                continue  # Skip if no valid patches in this batch
 
-                        # Extract valid features
-                        valid_hsi_features.append(z_hsi[b, valid_indices])
-                        valid_aux_features.append(z_aux[b, valid_indices])
+                            # Extract valid features
+                            valid_hsi_features.append(z_hsi[b, valid_indices])
+                            valid_aux_features.append(z_aux[b, valid_indices])
 
-                        # Keep track of which batch each patch came from
-                        valid_batch_indices.extend([b] * len(valid_indices))
+                            # Keep track of which batch each patch came from
+                            valid_batch_indices.extend([b] * len(valid_indices))
 
-                    # Skip modality if no valid patches
-                    if len(valid_hsi_features) == 0:
-                        continue
+                        # Skip modality if no valid patches
+                        if len(valid_hsi_features) == 0:
+                            continue
 
-                    # Stack features from all batches
-                    valid_hsi = torch.cat(valid_hsi_features, dim=0)
-                    valid_aux = torch.cat(valid_aux_features, dim=0)
-                    valid_batch_tensor = torch.tensor(valid_batch_indices, device=device)
+                        # Stack features from all batches
+                        valid_hsi = torch.cat(valid_hsi_features, dim=0)
+                        valid_aux = torch.cat(valid_aux_features, dim=0)
+                        valid_batch_tensor = torch.tensor(valid_batch_indices, device=device)
 
-                    # Calculate similarity matrix for valid patches only
-                    sim_matrix = torch.matmul(valid_hsi, valid_aux.T) / self.temperature
+                        # Calculate similarity matrix for valid patches only
+                        sim_matrix = torch.matmul(valid_hsi, valid_aux.T) / self.temperature
 
-                    # For each patch, the matching patch is at the same index
-                    # (since we've concatenated them in the same order)
-                    labels = torch.arange(valid_hsi.shape[0], device=device)
+                        # For each patch, the matching patch is at the same index
+                        # (since we've concatenated them in the same order)
+                        labels = torch.arange(valid_hsi.shape[0], device=device)
 
-                    # Calculate loss on valid patches only
-                    loss = nn.CrossEntropyLoss()(sim_matrix, labels)
-                else:
-                    # For non-thickness modalities, use all patches without masking
-                    z_hsi_flat = z_hsi.reshape(B * self.spatial_patches, -1)
-                    z_aux_flat = z_aux.reshape(B * self.spatial_patches, -1)
+                        # Calculate loss on valid patches only
+                        loss = nn.CrossEntropyLoss()(sim_matrix, labels)
+                    else:
+                        # For non-thickness modalities, use all patches without masking
+                        z_hsi_flat = z_hsi.reshape(B * self.spatial_patches, -1)
+                        z_aux_flat = z_aux.reshape(B * self.spatial_patches, -1)
 
-                    sim_matrix = torch.matmul(z_hsi_flat, z_aux_flat.T) / self.temperature
-                    labels = torch.arange(B * self.spatial_patches, device=device)
-                    loss = nn.CrossEntropyLoss()(sim_matrix, labels)
+                        sim_matrix = torch.matmul(z_hsi_flat, z_aux_flat.T) / self.temperature
+                        labels = torch.arange(B * self.spatial_patches, device=device)
+                        loss = nn.CrossEntropyLoss()(sim_matrix, labels)
 
-                individual_losses.append(loss)
+                    individual_losses.append(loss)
 
-        # If no modalities available, return zero loss
-        if not individual_losses:
-            return torch.tensor(0.0, device=device)
+            # If no modalities available, return zero loss
+            if not individual_losses:
+                return torch.tensor(0.0, device=device)
 
-        # Average the available losses and scale
-        avg_loss = torch.stack(individual_losses).mean()
-        scaling_factor = self.num_expected_modalities / len(individual_losses)
-        scaled_loss = avg_loss * scaling_factor
+            # Average the available losses and scale
+            avg_loss = torch.stack(individual_losses).mean()
+            scaling_factor = self.num_expected_modalities / len(individual_losses)
+            scaled_loss = avg_loss * scaling_factor
 
-        return scaled_loss
+            return scaled_loss
 
     def contrastive_loss_global(self, hsi_features, aux_embeddings, batch_idx, thickness_mask=None):
-        """Calculate contrastive loss with global representations, selectively applying thickness mask.
+        """Calculate contrastive loss with global representations, selectively applying thickness mask."""
+        with torch.cuda.amp.autocast(enabled=True):
+            device = hsi_features.device
+            B = hsi_features.shape[0]
 
-        Only applies thickness mask when processing the 'thickness' modality if use_thickness_mask is True.
-        For other modalities (IR, AF), the thickness mask is not applied.
-        """
-        device = hsi_features.device
-        B = hsi_features.shape[0]
+            # Skip contrastive loss for batch size of 1
+            if B <= 1:
+                return torch.tensor(0.0, device=device)
 
-        # Skip contrastive loss for batch size of 1
-        if B <= 1:
-            return torch.tensor(0.0, device=device)
+            # Create new batch indices relative to this batch (0 to B-1)
+            # This replaces the absolute indices with relative ones
+            relative_batch_idx = torch.arange(B, device=device)
 
-        # Create new batch indices relative to this batch (0 to B-1)
-        # This replaces the absolute indices with relative ones
-        relative_batch_idx = torch.arange(B, device=device)
+            # Get global HSI representation (unmasked for all modalities except thickness)
+            global_hsi_unmasked = hsi_features.mean(dim=1)
 
-        # Get global HSI representation (unmasked for all modalities except thickness)
-        global_hsi_unmasked = hsi_features.mean(dim=1)
+            # Calculate global HSI representation with mask (only for thickness modality)
+            global_hsi_masked = None
+            if thickness_mask is not None:
+                # Convert pixel-level mask to patch-level mask
+                patch_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)
 
-        # Calculate global HSI representation with mask (only for thickness modality)
-        global_hsi_masked = None
-        if thickness_mask is not None:
-            # Convert pixel-level mask to patch-level mask
-            patch_mask = self.create_patch_mask_from_pixel_mask(thickness_mask)
+                # Apply mask to features (multiply by mask and then average)
+                # Expand mask to match feature dimensions
+                expanded_mask = patch_mask.unsqueeze(-1)  # [B, num_patches, 1]
 
-            # Apply mask to features (multiply by mask and then average)
-            # Expand mask to match feature dimensions
-            expanded_mask = patch_mask.unsqueeze(-1)  # [B, num_patches, 1]
+                # Apply mask
+                masked_features = hsi_features * expanded_mask
 
-            # Apply mask
-            masked_features = hsi_features * expanded_mask
+                # Sum valid mask values for proper normalization
+                mask_sum = patch_mask.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6
 
-            # Sum valid mask values for proper normalization
-            mask_sum = patch_mask.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6
+                # Get weighted average (sum of masked features / sum of mask)
+                global_hsi_masked = (masked_features.sum(dim=1) / mask_sum.squeeze(-1))
 
-            # Get weighted average (sum of masked features / sum of mask)
-            global_hsi_masked = (masked_features.sum(dim=1) / mask_sum.squeeze(-1))
+            # Calculate individual losses for available modalities
+            individual_losses = []
 
-        # Calculate individual losses for available modalities
-        individual_losses = []
+            for modality, embeddings in aux_embeddings.items():
+                if embeddings is not None:
+                    # Project embeddings
+                    embeddings = self.modality_proj(embeddings)
+                    z_aux = self.proj_head_global(embeddings)
 
-        for modality, embeddings in aux_embeddings.items():
-            if embeddings is not None:
-                # Project embeddings
-                embeddings = self.modality_proj(embeddings)
-                z_aux = self.proj_head_global(embeddings)
+                    # Selectively use masked HSI features only for thickness modality
+                    if modality == 'thickness' and global_hsi_masked is not None:
+                        z_hsi = self.proj_head_global(global_hsi_masked)
+                    else:
+                        z_hsi = self.proj_head_global(global_hsi_unmasked)
 
-                # Selectively use masked HSI features only for thickness modality
-                if modality == 'thickness' and global_hsi_masked is not None:
-                    z_hsi = self.proj_head_global(global_hsi_masked)
-                else:
-                    z_hsi = self.proj_head_global(global_hsi_unmasked)
+                    # Calculate similarity and loss
+                    sim_matrix = torch.matmul(z_hsi, z_aux.T) / self.temperature
 
-                # Calculate similarity and loss
-                sim_matrix = torch.matmul(z_hsi, z_aux.T) / self.temperature
+                    # Use relative indices for loss calculation
+                    loss = nn.CrossEntropyLoss()(sim_matrix, relative_batch_idx)
+                    individual_losses.append(loss)
 
-                # Use relative indices for loss calculation
-                loss = nn.CrossEntropyLoss()(sim_matrix, relative_batch_idx)
-                individual_losses.append(loss)
+            # Handle case with no modalities
+            if not individual_losses:
+                return torch.tensor(0.0, device=device)
 
-        # Handle case with no modalities
-        if not individual_losses:
-            return torch.tensor(0.0, device=device)
+            # Average and scale losses
+            avg_loss = torch.stack(individual_losses).mean()
+            scaling_factor = self.num_expected_modalities / len(individual_losses)
+            scaled_loss = avg_loss * scaling_factor
 
-        # Average and scale losses
-        avg_loss = torch.stack(individual_losses).mean()
-        scaling_factor = self.num_expected_modalities / len(individual_losses)
-        scaled_loss = avg_loss * scaling_factor
-
-        return scaled_loss
+            return scaled_loss
 
     def encode_auxiliary(self, aux_data):
         """Encode auxiliary modalities.
@@ -998,73 +983,74 @@ class MultiModalSpectralGPT(nn.Module):
         """
         Compute loss in pixel space by directly comparing with the original input.
         """
-        # Convert token mask to 3D pixel mask
-        pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)  # [B, T, H, W]
-        print(f"Pixel mask shape: {pixel_mask.shape}")
+        with torch.cuda.amp.autocast(enabled=True):
+            # Convert token mask to 3D pixel mask
+            pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)  # [B, T, H, W]
+            print(f"Pixel mask shape: {pixel_mask.shape}")
 
-        # If thickness mask is provided and enabled, combine masks
-        if thickness_mask is not None and self.use_thickness_mask:
-            # Print details about the thickness mask
-            print(f"Original thickness mask shape: {thickness_mask.shape}")
-            print(f"Thickness mask dimensions: {thickness_mask.dim()}")
+            # If thickness mask is provided and enabled, combine masks
+            if thickness_mask is not None and self.use_thickness_mask:
+                # Print details about the thickness mask
+                print(f"Original thickness mask shape: {thickness_mask.shape}")
+                print(f"Thickness mask dimensions: {thickness_mask.dim()}")
 
-            # Examine the thickness mask shape in detail
-            if thickness_mask.dim() == 5:
-                print(
-                    f"Shape details: [B={thickness_mask.shape[0]}, D1={thickness_mask.shape[1]}, D2={thickness_mask.shape[2]}, H={thickness_mask.shape[3]}, W={thickness_mask.shape[4]}]")
+                # Examine the thickness mask shape in detail
+                if thickness_mask.dim() == 5:
+                    print(
+                        f"Shape details: [B={thickness_mask.shape[0]}, D1={thickness_mask.shape[1]}, D2={thickness_mask.shape[2]}, H={thickness_mask.shape[3]}, W={thickness_mask.shape[4]}]")
 
-                # Try to reshape the thickness mask to [B, 1, H, W]
-                try:
-                    # Remove the extra dimension (D2) directly
-                    reshaped_thickness = thickness_mask[:, :, 0, :, :]
-                    print(f"After removing D2: {reshaped_thickness.shape}")
+                    # Try to reshape the thickness mask to [B, 1, H, W]
+                    try:
+                        # Remove the extra dimension (D2) directly
+                        reshaped_thickness = thickness_mask[:, :, 0, :, :]
+                        print(f"After removing D2: {reshaped_thickness.shape}")
 
-                    # Now expand across wavelength dimension
-                    expanded_thickness = reshaped_thickness.expand(-1, pixel_mask.shape[1], -1, -1)
-                    print(f"After expansion: {expanded_thickness.shape}")
+                        # Now expand across wavelength dimension
+                        expanded_thickness = reshaped_thickness.expand(-1, pixel_mask.shape[1], -1, -1)
+                        print(f"After expansion: {expanded_thickness.shape}")
 
-                    # Combine masks
-                    combined_mask = pixel_mask * expanded_thickness
+                        # Combine masks
+                        combined_mask = pixel_mask * expanded_thickness
 
-                    # Compute loss
-                    pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
-                    valid_pixel_count = combined_mask.sum() + 1e-6
-                    return pixel_mse.sum() / valid_pixel_count
+                        # Compute loss
+                        pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
+                        valid_pixel_count = combined_mask.sum() + 1e-6
+                        return pixel_mse.sum() / valid_pixel_count
 
-                except Exception as e:
-                    print(f"Error reshaping thickness mask: {e}")
-                    # Fall back to just using pixel mask
-                    pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
-                    masked_pixel_count = pixel_mask.sum() + 1e-6
-                    return pixel_mse.sum() / masked_pixel_count
+                    except Exception as e:
+                        print(f"Error reshaping thickness mask: {e}")
+                        # Fall back to just using pixel mask
+                        pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
+                        masked_pixel_count = pixel_mask.sum() + 1e-6
+                        return pixel_mse.sum() / masked_pixel_count
 
-            elif thickness_mask.dim() == 4:
-                try:
-                    # Expand across wavelength dimension
-                    expanded_thickness = thickness_mask.expand(-1, pixel_mask.shape[1], -1, -1)
-                    print(f"After expansion: {expanded_thickness.shape}")
+                elif thickness_mask.dim() == 4:
+                    try:
+                        # Expand across wavelength dimension
+                        expanded_thickness = thickness_mask.expand(-1, pixel_mask.shape[1], -1, -1)
+                        print(f"After expansion: {expanded_thickness.shape}")
 
-                    # Combine masks
-                    combined_mask = pixel_mask * expanded_thickness
+                        # Combine masks
+                        combined_mask = pixel_mask * expanded_thickness
 
-                    # Compute loss
-                    pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
-                    valid_pixel_count = combined_mask.sum() + 1e-6
-                    return pixel_mse.sum() / valid_pixel_count
+                        # Compute loss
+                        pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
+                        valid_pixel_count = combined_mask.sum() + 1e-6
+                        return pixel_mse.sum() / valid_pixel_count
 
-                except Exception as e:
-                    print(f"Error expanding thickness mask: {e}")
-                    # Fall back to just using pixel mask
-                    pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
-                    masked_pixel_count = pixel_mask.sum() + 1e-6
-                    return pixel_mse.sum() / masked_pixel_count
-        else:
-            # No thickness mask, just use MAE mask
-            pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
+                    except Exception as e:
+                        print(f"Error expanding thickness mask: {e}")
+                        # Fall back to just using pixel mask
+                        pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
+                        masked_pixel_count = pixel_mask.sum() + 1e-6
+                        return pixel_mse.sum() / masked_pixel_count
+            else:
+                # No thickness mask, just use MAE mask
+                pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
 
-            # Sum loss and normalize by the number of masked pixels
-            masked_pixel_count = pixel_mask.sum() + 1e-6
-            return pixel_mse.sum() / masked_pixel_count
+                # Sum loss and normalize by the number of masked pixels
+                masked_pixel_count = pixel_mask.sum() + 1e-6
+                return pixel_mse.sum() / masked_pixel_count
 
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
         """Forward pass through the full model with direct pixel prediction."""
@@ -1084,10 +1070,11 @@ class MultiModalSpectralGPT(nn.Module):
         # Create unmasked embeddings for contrastive learning
         unmasked_features = None
         if aux_data is not None and batch_idx is not None:
-            unmasked_features = self.patch_embed(hsi_img)
-            B, T, HW, D = unmasked_features.shape
-            unmasked_features = unmasked_features.reshape(B, T * HW, D)
-            unmasked_features = unmasked_features + self.pos_embed
+            with torch.cuda.amp.autocast(enabled=True):
+                unmasked_features = self.patch_embed(hsi_img)
+                B, T, HW, D = unmasked_features.shape
+                unmasked_features = unmasked_features.reshape(B, T * HW, D)
+                unmasked_features = unmasked_features + self.pos_embed
 
         # Move auxiliary data to correct device
         device = hsi_img.device
@@ -1099,35 +1086,34 @@ class MultiModalSpectralGPT(nn.Module):
         if thickness_mask is not None:
             thickness_mask = thickness_mask.to(device)
 
-
-
         # Encode with masking for reconstruction
-        latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
+        with torch.cuda.amp.autocast(enabled=True):
+            latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
 
-        # Print shape of latent embeddings
-        print(f"Latent embeddings shape: {latent.shape}")
+            # Print shape of latent embeddings
+            print(f"Latent embeddings shape: {latent.shape}")
 
-        # Decode and reconstruct
-        pred_tokens = self.forward_decoder(latent, ids_restore)
+            # Decode and reconstruct
+            pred_tokens = self.forward_decoder(latent, ids_restore)
 
-        # Print shape of predicted tokens
-        print(f"Predicted tokens shape: {pred_tokens.shape}")
+            # Print shape of predicted tokens
+            print(f"Predicted tokens shape: {pred_tokens.shape}")
 
-        # Reshape for unpatchify (from flat token sequence to organized patches)
-        pred_tokens_reshaped = pred_tokens.reshape(
-            B, self.spectral_patches, self.spatial_patches, -1
-        )
+            # Reshape for unpatchify (from flat token sequence to organized patches)
+            pred_tokens_reshaped = pred_tokens.reshape(
+                B, self.spectral_patches, self.spatial_patches, -1
+            )
 
-        # Unpatchify to pixel space directly
-        reconstructed_pixels = self.unpatchify(pred_tokens_reshaped, original_input.shape)
+            # Unpatchify to pixel space directly
+            reconstructed_pixels = self.unpatchify(pred_tokens_reshaped, original_input.shape)
 
-        # Calculate reconstruction loss directly in pixel space
-        loss_recon = self.forward_loss_in_pixel_space(
-            reconstructed_pixels,
-            original_input,
-            mask,
-            thickness_mask
-        )
+            # Calculate reconstruction loss directly in pixel space
+            loss_recon = self.forward_loss_in_pixel_space(
+                reconstructed_pixels,
+                original_input,
+                mask,
+                thickness_mask
+            )
 
         # Calculate contrastive loss if auxiliary data present
         loss_contrast = torch.tensor(0.0, device=device)
@@ -1138,18 +1124,19 @@ class MultiModalSpectralGPT(nn.Module):
 
             # Only compute contrastive loss if at least one modality is available
             if num_available > 0:
-                if self.contrastive_mode == 'global':
-                    aux_embeddings = self.encode_auxiliary(aux_data)
-                    loss_contrast = self.contrastive_loss_global(unmasked_features, aux_embeddings, batch_idx,
-                                                                 thickness_mask)
-                else:
-                    aux_patch_embeddings = self.encode_auxiliary_patches(aux_data)
-                    loss_contrast = self.contrastive_loss_spatial(unmasked_features, aux_patch_embeddings, batch_idx,
-                                                                  thickness_mask)
+                with torch.cuda.amp.autocast(enabled=True):
+                    if self.contrastive_mode == 'global':
+                        aux_embeddings = self.encode_auxiliary(aux_data)
+                        loss_contrast = self.contrastive_loss_global(unmasked_features, aux_embeddings, batch_idx,
+                                                                     thickness_mask)
+                    else:
+                        aux_patch_embeddings = self.encode_auxiliary_patches(aux_data)
+                        loss_contrast = self.contrastive_loss_spatial(unmasked_features, aux_patch_embeddings,
+                                                                      batch_idx,
+                                                                      thickness_mask)
 
         # Calculate total loss
         loss = loss_recon + loss_contrast
-
 
         return {
             'loss': loss,
