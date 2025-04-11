@@ -47,121 +47,13 @@ import os
 # Optional: only necessary if you want to lock to GPU 0
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-# Global variables to track memory reservation status and store tensors
-_MEMORY_RESERVED = False
-_RESERVED_TENSORS = []
 
 
-def reserve_gpu_memory(device_id=0, target_gb=10, chunk_size_mb=512):
-    """
-    Allocates memory to effectively reserve the GPU, but with more conservative allocation.
-
-    Args:
-        device_id (int): CUDA device ID to use
-        target_gb (float): Target amount of memory to reserve in GB
-        chunk_size_mb (int): Size of individual memory chunks to allocate in MB
-
-    Returns:
-        float: Amount of memory actually reserved in GB, or 0 if reservation failed
-    """
-    global _MEMORY_RESERVED, _RESERVED_TENSORS
-
-    # If memory is already reserved, skip allocation
-    if _MEMORY_RESERVED:
-        print(f"GPU memory already reserved ({len(_RESERVED_TENSORS)} tensors). Skipping.")
-        # Calculate and return current allocation
-        if _RESERVED_TENSORS:
-            allocated = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
-            return allocated
-        return 0
-
-    # Clear any previous reservations (shouldn't happen, but as a safeguard)
-    _RESERVED_TENSORS.clear()
-
-    # Get available memory on GPU
-    torch.cuda.empty_cache()  # Clear any unused memory first
-    total_memory = torch.cuda.get_device_properties(device_id).total_memory / (1024 ** 3)
-    allocated_memory = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
-    available_memory = total_memory - allocated_memory
-
-    # Calculate safe target (use only 50% of available memory)
-    safe_target = min(target_gb, available_memory * 0.5)  # Half of available to be safer
-    print(f"[GPU {device_id}] Total memory: {total_memory:.2f} GB")
-    print(f"[GPU {device_id}] Already allocated: {allocated_memory:.2f} GB")
-    print(f"[GPU {device_id}] Target allocation: {safe_target:.2f} GB")
-
-    device = torch.device(f"cuda:{device_id}")
-
-    try:
-        # Try allocating chunks to fill up the GPU
-        allocated_gb = 0
-        max_chunks = int(safe_target / (chunk_size_mb / 1024))
-        print(f"Allocating up to {max_chunks} chunks of {chunk_size_mb} MB each")
-
-        for i in range(max_chunks):
-            # Each float32 element is 4 bytes
-            tensor_size = chunk_size_mb * 1024 * 1024 // 4
-            tensor = torch.empty((tensor_size,), dtype=torch.float32, device=device)
-            _RESERVED_TENSORS.append(tensor)
-
-            # Check how much we've allocated so far
-            allocated = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
-            allocated_gb = allocated - allocated_memory  # How much we've added
-
-            if i % 5 == 0:  # Print status every 5 chunks
-                print(f"[GPU {device_id}] Reserved ~{allocated_gb:.2f} GB with {len(_RESERVED_TENSORS)} tensors")
-
-            # Stop when we reach the target
-            if allocated_gb >= safe_target:
-                break
-
-    except RuntimeError as e:
-        print(f"[!] Stopped allocating: {e}")
-        # If we hit an error but still allocated some tensors, consider it partially successful
-        if _RESERVED_TENSORS:
-            allocated = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
-            allocated_gb = allocated - allocated_memory
-            print(f"[GPU {device_id}] Partially reserved ~{allocated_gb:.2f} GB")
-            _MEMORY_RESERVED = True
-            return allocated_gb
-        return 0
-
-    # Calculate final allocation
-    final_allocated = torch.cuda.memory_allocated(device_id) / (1024 ** 3)
-    allocated_gb = final_allocated - allocated_memory
-    print(f"[GPU {device_id}] Successfully reserved {allocated_gb:.2f} GB with {len(_RESERVED_TENSORS)} tensors")
-
-    # Set the flag to indicate memory has been reserved
-    _MEMORY_RESERVED = True
-
-    return allocated_gb
 
 
-def release_reserved_memory():
-    """
-    Release any memory that was reserved by reserve_gpu_memory.
-    """
-    global _MEMORY_RESERVED, _RESERVED_TENSORS
 
-    if not _MEMORY_RESERVED:
-        print("No GPU memory was reserved. Nothing to release.")
-        return
 
-    tensor_count = len(_RESERVED_TENSORS)
-    _RESERVED_TENSORS.clear()
 
-    # Force garbage collection to ensure tensors are freed
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    _MEMORY_RESERVED = False
-    print(f"Released memory from {tensor_count} reserved tensors.")
-
-    # Return current allocation for verification
-    allocated = torch.cuda.memory_allocated(0) / (1024 ** 3)
-    print(f"Current GPU memory allocation: {allocated:.2f} GB")
-    return allocated
 
 
 def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr):
@@ -212,11 +104,12 @@ def calculate_metrics(outputs, optimizer=None):
         return metrics
 
     # Sum the metrics across all batches
+    # Note: our optimized train_epoch now returns scalar values, not tensors
     for output in outputs:
-        metrics['loss'] += output['loss'].item()
-        metrics['loss_recon'] += output['loss_recon'].item()
-        metrics['loss_contrast'] += output['loss_contrast'].item()
-        metrics['num_modalities'] += output['num_modalities'].item()
+        metrics['loss'] += output['loss']
+        metrics['loss_recon'] += output['loss_recon']
+        metrics['loss_contrast'] += output['loss_contrast']
+        metrics['num_modalities'] += output['num_modalities']
 
     # Calculate the average for normal metrics
     for key in ['loss', 'loss_recon', 'loss_contrast', 'num_modalities']:
@@ -443,10 +336,9 @@ def check_early_stopping(val_losses, patience, min_delta=0.0):
 
 
 def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
-    """Train the model for one epoch."""
+    """Train the model for one epoch with optimized AMP."""
     model.train()
     outputs = []
-
     scaler = torch.amp.GradScaler()  # Create gradient scaler for mixed precision
 
     # Set contrastive mode if specified
@@ -457,57 +349,61 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
     pbar = tqdm(dataloader, desc="Training")
 
     for batch_idx, batch in enumerate(pbar):
-        # Clear CUDA cache between iterations if not the first batch
-        if torch.cuda.is_available() and batch_idx > 0:
-            torch.cuda.empty_cache()
+        # Move data to device - use non_blocking for potential speedup
+        hsi = batch['hsi'].to(device, non_blocking=True)
+        aux_data = {k: v.to(device, non_blocking=True) if v is not None else None
+                    for k, v in batch['aux_data'].items()}
+        batch_idx_tensor = batch['batch_idx'].to(device, non_blocking=True)
 
-        # Move data to device
-        hsi = batch['hsi'].to(device)
-        aux_data = {k: v.to(device) if v is not None else None for k, v in batch['aux_data'].items()}
-        batch_idx = batch['batch_idx'].to(device)
+        # Clear gradients - more efficiently
+        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
 
-        # Forward pass with mixed precision
-        optimizer.zero_grad()
-        with autocast():
-            output = model(hsi, aux_data, batch_idx)
+        # Forward pass with AMP
+        with torch.cuda.amp.autocast():
+            output = model(hsi, aux_data, batch_idx_tensor)
             loss = output['loss']
 
-        # Backward pass and optimization with scaling for mixed precision
+        # Backward pass with gradient scaling
         scaler.scale(loss).backward()
+
+        # Unscale gradients before potential clipping
+        scaler.unscale_(optimizer)
+
+        # Update weights with scaler
         scaler.step(optimizer)
         scaler.update()
 
-        # Store only necessary data from output with detach
-        output_dict = {
-            'loss': output['loss'].detach(),
-            'loss_recon': output['loss_recon'].detach(),
-            'loss_contrast': output['loss_contrast'].detach(),
-            'num_modalities': output['num_modalities'].detach()
-        }
-        outputs.append(output_dict)
+        # Store only required outputs as scalars (not tensors) to save memory
+        outputs.append({
+            'loss': output['loss'].detach().item(),
+            'loss_recon': output['loss_recon'].detach().item(),
+            'loss_contrast': output['loss_contrast'].detach().item(),
+            'num_modalities': output['num_modalities'].detach().item()
+        })
 
         # Get current learning rate for progress bar
         current_lr = optimizer.param_groups[0]['lr']
 
         # Update progress bar
         pbar.set_postfix({
-            'loss': f"{loss.item():.10f}",
-            'recon_loss': f"{output['loss_recon'].item():.10f}",
-            'contrast_loss': f"{output['loss_contrast'].item():.10f}",
-            'lr': f"{current_lr}\n"
+            'loss': f"{loss.item():.6f}",
+            'recon': f"{output['loss_recon'].item():.6f}",
+            'contrast': f"{output['loss_contrast'].item():.6f}",
+            'lr': f"{current_lr:.6f}"
         })
 
-        # Delete intermediate tensors
-        del hsi, aux_data, batch_idx, output
+        # Delete intermediate tensors to free memory
+        del hsi, aux_data, batch_idx_tensor, output, loss
 
-        # Force garbage collection every iteration
-        gc.collect()
+        # Clear cache occasionally (not every batch to avoid overhead)
+        if batch_idx % 10 == 0:
+            torch.cuda.empty_cache()
 
     return outputs
 
 
 def validate_epoch(model, dataloader, device, contrastive_mode=None):
-    """Validate the model on the validation set."""
+    """Validate the model on the validation set with memory optimizations."""
     model.eval()
     outputs = []
 
@@ -520,39 +416,37 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(pbar):
-            # Clear CUDA cache between iterations
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Move data to device with non_blocking for potential speedup
+            hsi = batch['hsi'].to(device, non_blocking=True)
+            aux_data = {k: v.to(device, non_blocking=True) if v is not None else None
+                       for k, v in batch['aux_data'].items()}
+            batch_idx_tensor = batch['batch_idx'].to(device, non_blocking=True)
 
-            # Move data to device
-            hsi = batch['hsi'].to(device)
-            aux_data = {k: v.to(device) if v is not None else None for k, v in batch['aux_data'].items()}
-            batch_idx = batch['batch_idx'].to(device)
+            # Forward pass with AMP
+            with torch.cuda.amp.autocast():
+                output = model(hsi, aux_data, batch_idx_tensor)
 
-            # Forward pass
-            output = model(hsi, aux_data, batch_idx)
-
-            # Store only necessary data with detach
-            output_dict = {
-                'loss': output['loss'].detach(),
-                'loss_recon': output['loss_recon'].detach(),
-                'loss_contrast': output['loss_contrast'].detach(),
-                'num_modalities': output['num_modalities'].detach()
-            }
-            outputs.append(output_dict)
+            # Store only required outputs as scalars (not tensors) to save memory
+            outputs.append({
+                'loss': output['loss'].detach().item(),
+                'loss_recon': output['loss_recon'].detach().item(),
+                'loss_contrast': output['loss_contrast'].detach().item(),
+                'num_modalities': output['num_modalities'].detach().item()
+            })
 
             # Update progress bar
             pbar.set_postfix({
-                'loss': f"{output['loss'].item():.10f}",
-                'recon_loss': f"{output['loss_recon'].item():.10f}",
-                'contrast_loss': f"{output['loss_contrast'].item():.10f}"
+                'loss': f"{output['loss'].item():.6f}",
+                'recon': f"{output['loss_recon'].item():.6f}",
+                'contrast': f"{output['loss_contrast'].item():.6f}"
             })
 
-            # Delete intermediate tensors
-            del hsi, aux_data, batch_idx, output
+            # Delete intermediate tensors to free memory
+            del hsi, aux_data, batch_idx_tensor, output
 
-            # Force garbage collection
-            gc.collect()
+            # Clear cache occasionally
+            if batch_idx % 10 == 0:
+                torch.cuda.empty_cache()
 
     return outputs
 
@@ -670,9 +564,9 @@ def main(cfg: DictConfig):
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Run it
+    # Clear CUDA cache at the beginning
     if torch.cuda.is_available():
-        reserve_gpu_memory(device_id=0)
+        torch.cuda.empty_cache()
 
     # Create output directory
     output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
@@ -905,10 +799,16 @@ def main(cfg: DictConfig):
 
         # Visualise
         if (epoch + 1) % cfg.visualization.viz_frequency == 0 or epoch == cfg.training.epochs - 1:
-            print("Generating reconstruction visualization with diversity analysis...")
+            # Clear cache before visualization
+            torch.cuda.empty_cache()
+
+            print("Generating reconstruction visualization...")
             recon_path = visualize_reconstruction_during_training(
                 model, val_loader, device, epoch, output_dir
             )
+
+            # Clear cache after visualization
+            torch.cuda.empty_cache()
 
             # Log reconstruction to TensorBoard and MLflow
             if recon_path:

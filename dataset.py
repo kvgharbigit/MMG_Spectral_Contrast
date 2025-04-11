@@ -252,7 +252,7 @@ def custom_collate_fn(batch):
 def create_patient_dataloader(parent_dir, analysis_dim=500, target_bands=30,
                               batch_size=4, num_workers=4, shuffle=True, augment=False):
     """
-    Create a DataLoader for the PatientDataset with integrated spatial registration.
+    Create a DataLoader for the PatientDataset with integrated spatial registration and memory optimizations.
     """
     dataset = PatientDataset(
         parent_dir,
@@ -266,9 +266,10 @@ def create_patient_dataloader(parent_dir, analysis_dim=500, target_bands=30,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=False,  # Changed from True to reduce memory usage
+        pin_memory=True,  # Enable pinned memory for faster transfers
         drop_last=False,
-        collate_fn=custom_collate_fn
+        collate_fn=custom_collate_fn,
+        persistent_workers=True if num_workers > 0 else False  # Keep workers alive between epochs
     )
 
 

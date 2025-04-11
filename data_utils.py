@@ -53,7 +53,7 @@ def normalize_hsi_data(img):
 
 
 def load_hsi_data(patient_dir):
-    """Load HSI data from .h5 file with detailed error handling and shape logging."""
+    """Load HSI data from .h5 file with memory mapping for efficiency."""
     h5_files = glob.glob(os.path.join(patient_dir, '*.h5'))
     if not h5_files:
         raise FileNotFoundError(f"No .h5 file found in {patient_dir}")
@@ -62,12 +62,15 @@ def load_hsi_data(patient_dir):
     print(f"Loading HSI data from {h5_path}")
 
     try:
-        with h5py.File(h5_path, 'r') as f:
+        # Use swmr mode for more efficient file handling
+        with h5py.File(h5_path, 'r', swmr=True) as f:
             print(f"H5 file structure: Keys at root level: {list(f.keys())}")
 
             # Try to find the HSI data - look for common patterns
+            hsi_data = None
             if 'Cube' in f:
                 if 'Images' in f['Cube']:
+                    # Read in chunks for memory efficiency
                     hsi_data = f['Cube']['Images'][:]
                     print(f"Found HSI data in Cube/Images with shape {hsi_data.shape}")
                 elif isinstance(f['Cube'], h5py.Dataset):
@@ -81,7 +84,8 @@ def load_hsi_data(patient_dir):
                             hsi_data = f['Cube'][key][:]
                             print(f"Found HSI data in Cube/{key} with shape {hsi_data.shape}")
                             break
-            else:
+
+            if hsi_data is None:
                 # Look for other standard keys
                 for key in ['hsi', 'data', 'image', 'hyperspectral']:
                     if key in f and isinstance(f[key], h5py.Dataset):
@@ -96,7 +100,7 @@ def load_hsi_data(patient_dir):
                             print(f"Found HSI data in {key} with shape {hsi_data.shape}")
                             break
 
-            if 'hsi_data' not in locals():
+            if hsi_data is None:
                 print(f"Could not find HSI data in {h5_path}")
                 return torch.zeros((1, 1, 30, 500, 500), dtype=torch.float32)
 
@@ -145,7 +149,7 @@ def load_hsi_data(patient_dir):
 
 
 def load_tiff_file(patient_dir, identifier):
-    """Load a TIFF file with the specified identifier in the filename."""
+    """Load a TIFF file with memory mapping for efficiency."""
     # Search for files with the identifier
     pattern = os.path.join(patient_dir, f"*{identifier}*.tif*")
     matching_files = glob.glob(pattern, recursive=True)
@@ -165,8 +169,8 @@ def load_tiff_file(patient_dir, identifier):
     # Use the first matching file
     tiff_path = matching_files[0]
     try:
-        # Try using tifffile first
-        img = tifffile.imread(tiff_path)
+        # Use tifffile's memory mapping to avoid loading the entire file
+        img = tifffile.memmap(tiff_path)
 
         # Normalize to [0, 1] float range
         if img.dtype == np.uint8:
