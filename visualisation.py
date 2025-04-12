@@ -233,6 +233,7 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
     """
     Comprehensive visualization of reconstruction quality with advanced masking analysis.
     Modified to handle batch size by always using the first item in the batch.
+    Includes numerical pixel value map display.
 
     Args:
         original (torch.Tensor): Original input tensor of shape [B, C, T, H, W]
@@ -250,7 +251,10 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
     import numpy as np
     import matplotlib.pyplot as plt
     import seaborn as sns
+    import pandas as pd
+    from matplotlib.colors import LinearSegmentedColormap
     from hsi_to_rgb import simple_hsi_to_rgb
+    import os
 
     # Input validation
     if model is None:
@@ -348,9 +352,13 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
         # Multiply by thickness mask to only show valid regions
         combined_mask_heatmap = spectral_mask_percentage * expanded_thickness
 
-    # Create figure with more detailed layout
-    fig = plt.figure(figsize=(20, 20))
-    gs = fig.add_gridspec(5, 4)  # Added an extra row for the new visualization
+    # Create figure with more detailed layout - added extra rows for numerical pixel maps
+    num_wavelengths_for_numerical = min(3, num_wavelengths)  # Limit numerical display to 3 wavelengths
+    fig = plt.figure(figsize=(20, 24 + 4 * num_wavelengths_for_numerical))  # Increased height for numerical section
+
+    # Create grid - added extra rows for numerical pixel maps
+    grid_rows = 5 + num_wavelengths_for_numerical  # 5 original rows + numerical map rows
+    gs = fig.add_gridspec(grid_rows, 4)
 
     # Top row: RGB and error comparisons
     ax_orig_rgb = fig.add_subplot(gs[0, 0])
@@ -511,12 +519,120 @@ def visualize_reconstruction_quality(original, reconstruction, mask, thickness_m
             ax_spatial_analysis.axis('off')
             fig.colorbar(spatial_im, ax=ax_spatial_analysis, shrink=0.8, label='% Bands Masked')
 
+    # NUMERICAL PIXEL MAPS SECTION
+    # Parameters for numerical pixel visualization
+    grid_size = 8  # Size of the grid for sampling pixels
+
+    # Create a custom colormap from white to red for the tables
+    cmap = LinearSegmentedColormap.from_list('white_to_red', ['white', 'red'])
+
+    # Select a subset of wavelengths for numerical visualization
+    numerical_band_indices = band_indices[:num_wavelengths_for_numerical]
+
+    # Create sample points for pixel grid
+    if orig_input.dim() == 3:  # [T, H, W]
+        H, W = orig_input.shape[1], orig_input.shape[2]
+    elif orig_input.dim() == 4:  # [C, T, H, W]
+        H, W = orig_input.shape[2], orig_input.shape[3]
+    elif orig_input.dim() == 5:  # [B, C, T, H, W]
+        H, W = orig_input.shape[3], orig_input.shape[4]
+    else:
+        raise ValueError(f"Unexpected input shape: {orig_input.shape}")
+
+    sample_rows = np.linspace(0, H - 1, grid_size, dtype=int)
+    sample_cols = np.linspace(0, W - 1, grid_size, dtype=int)
+
+    # Create numerical pixel maps for each wavelength
+    for idx, band_idx in enumerate(numerical_band_indices):
+        row_pos = 5 + idx  # Start after the existing 5 rows
+
+        # Get original band data
+        if orig_input.dim() == 3:  # [T, H, W]
+            orig_band_data = orig_input[band_idx].numpy()
+        elif orig_input.dim() == 4 and orig_input.shape[0] == 1:  # [1, T, H, W]
+            orig_band_data = orig_input[0, band_idx].numpy()
+        elif orig_input.dim() == 5 and orig_input.shape[0] == 1 and orig_input.shape[1] == 1:  # [1, 1, T, H, W]
+            orig_band_data = orig_input[0, 0, band_idx].numpy()
+        else:
+            orig_band_data = orig_input[band_idx].numpy()
+
+        # Get reconstructed band data
+        if reconstructed.dim() == 3:  # [T, H, W]
+            recon_band_data = reconstructed[band_idx].numpy()
+        elif reconstructed.dim() == 4 and reconstructed.shape[0] == 1:  # [1, T, H, W]
+            recon_band_data = reconstructed[0, band_idx].numpy()
+        elif reconstructed.dim() == 5 and reconstructed.shape[0] == 1 and reconstructed.shape[
+            1] == 1:  # [1, 1, T, H, W]
+            recon_band_data = reconstructed[0, 0, band_idx].numpy()
+        else:
+            recon_band_data = reconstructed[band_idx].numpy()
+
+        # Create subplots for this wavelength
+        ax_orig_numerical = fig.add_subplot(gs[row_pos, 0:2])
+        ax_recon_numerical = fig.add_subplot(gs[row_pos, 2:4])
+
+        # Original data numerical pixel map
+        ax_orig_numerical.axis('tight')
+        ax_orig_numerical.axis('off')
+
+        # Sample pixel values
+        orig_sampled_values = orig_band_data[np.ix_(sample_rows, sample_cols)]
+
+        # Get value range for normalization
+        orig_vmin, orig_vmax = np.min(orig_sampled_values), np.max(orig_sampled_values)
+        orig_norm = plt.Normalize(orig_vmin, orig_vmax)
+
+        # Create table with colored cells
+        orig_table = ax_orig_numerical.table(
+            cellText=np.round(orig_sampled_values, 4),
+            cellColours=cmap(orig_norm(orig_sampled_values)),
+            colLabels=[f"Col {c}" for c in sample_cols],
+            rowLabels=[f"Row {r}" for r in sample_rows],
+            loc='center',
+            cellLoc='center'
+        )
+
+        # Adjust table style
+        orig_table.auto_set_font_size(False)
+        orig_table.set_fontsize(8)
+        orig_table.scale(1.2, 1.5)
+
+        ax_orig_numerical.set_title(f"Original Numerical Pixel Values (Band {band_idx})")
+
+        # Reconstructed data numerical pixel map
+        ax_recon_numerical.axis('tight')
+        ax_recon_numerical.axis('off')
+
+        # Sample pixel values
+        recon_sampled_values = recon_band_data[np.ix_(sample_rows, sample_cols)]
+
+        # Get value range for normalization
+        recon_vmin, recon_vmax = np.min(recon_sampled_values), np.max(recon_sampled_values)
+        recon_norm = plt.Normalize(recon_vmin, recon_vmax)
+
+        # Create table with colored cells
+        recon_table = ax_recon_numerical.table(
+            cellText=np.round(recon_sampled_values, 4),
+            cellColours=cmap(recon_norm(recon_sampled_values)),
+            colLabels=[f"Col {c}" for c in sample_cols],
+            rowLabels=[f"Row {r}" for r in sample_rows],
+            loc='center',
+            cellLoc='center'
+        )
+
+        # Adjust table style
+        recon_table.auto_set_font_size(False)
+        recon_table.set_fontsize(8)
+        recon_table.scale(1.2, 1.5)
+
+        ax_recon_numerical.set_title(f"Reconstructed Numerical Pixel Values (Band {band_idx})")
+
     plt.tight_layout()
 
     # Save figure if path provided
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Saved visualization to {save_path}")
+        print(f"Saved visualization with numerical pixel maps to {save_path}")
 
     # Return figure but don't display (to avoid showing in non-interactive environments)
     plt.close(fig)  # Close the figure to free memory

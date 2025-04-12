@@ -488,7 +488,7 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
 
 def visualize_reconstruction_during_training(model, val_loader, device, epoch, output_dir):
     """
-    Updated to work with new 3D pixel mask visualization
+    Visualizes reconstruction quality during training with integrated numerical pixel maps.
     """
     # Create visualization directory if it doesn't exist
     viz_dir = os.path.join(output_dir, 'visualizations')
@@ -529,7 +529,10 @@ def visualize_reconstruction_during_training(model, val_loader, device, epoch, o
             model=model  # Pass the model to convert token mask
         )
 
-        # Log the visualization to TensorBoard and MLFlow
+        print(f"Generated visualization with numerical pixel maps for epoch {epoch}")
+        print(f"  - Saved to: {save_path}")
+
+        # Return the main reconstruction path for logging in TensorBoard
         return save_path
 
     except Exception as e:
