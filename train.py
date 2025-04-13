@@ -732,7 +732,9 @@ def main(cfg: DictConfig):
         temperature=cfg.model.temperature,
         mask_ratio=cfg.model.mask_ratio,
         contrastive_mode=cfg.model.contrastive_mode,
-        use_thickness_mask=cfg.model.use_thickness_mask
+        use_thickness_mask=cfg.model.use_thickness_mask,
+        intra_div_weight= cfg.model.intra_div_weight,
+        inter_div_weight=cfg.model.inter_div_weight,
     )
 
     # Move model to device

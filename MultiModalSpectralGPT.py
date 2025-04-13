@@ -1189,12 +1189,32 @@ class MultiModalSpectralGPT(nn.Module):
                 unmasked_patches = 1.0 - patch_mask
 
                 # Safe calculation of reference variance (avoid division by zero)
-                # Sum variance of unmasked patches and count
-                sum_unmasked_var = torch.sum(orig_var * unmasked_patches, dim=2, keepdim=True)
-                count_unmasked = torch.sum(unmasked_patches, dim=2, keepdim=True) + 1e-6
+                # Use sampling approach:
+                max_samples = 100  # Number of samples to use
+                reference_variances = []
 
-                # Calculate mean variance of unmasked patches per batch
-                reference_variance = sum_unmasked_var / count_unmasked  # [B, C, 1]
+                for b in range(B):
+                    # Get indices of unmasked patches for this batch
+                    unmasked_indices = torch.where(unmasked_patches[b, 0] > 0.5)[0]
+
+                    # Skip if we don't have enough unmasked patches
+                    if len(unmasked_indices) < 5:  # Need some minimum number
+                        # Fallback to using all available unmasked patches
+                        batch_vars = orig_var[b, :, unmasked_indices]
+                        batch_ref_var = batch_vars.mean(dim=1, keepdim=True)
+                    else:
+                        # Sample subset of unmasked patches
+                        num_samples = min(max_samples, len(unmasked_indices))
+                        sampled_indices = unmasked_indices[torch.randperm(len(unmasked_indices))[:num_samples]]
+
+                        # Calculate mean variance of sampled patches
+                        batch_vars = orig_var[b, :, sampled_indices]
+                        batch_ref_var = batch_vars.mean(dim=1, keepdim=True)
+
+                    reference_variances.append(batch_ref_var)
+
+                # Stack the reference variances for all batches
+                reference_variance = torch.stack(reference_variances, dim=0)  # [B, C, 1]
 
                 # Set adaptive threshold as percentage of reference variance
                 # Allow natural uniformity but catch suspicious uniformity
