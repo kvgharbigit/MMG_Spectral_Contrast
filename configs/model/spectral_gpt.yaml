@@ -24,6 +24,10 @@ contrastive_mode: global
 # Whether to use thickness mask for excluding black rim regions
 use_thickness_mask: true
 
+# Diversity loss weights
+intra_div_weight: 0.1  # Weight for intra-patch diversity loss
+inter_div_weight: 0.1  # Weight for inter-patch diversity loss
+
 # Loss weights
 loss_weights:
   recon: 1.0

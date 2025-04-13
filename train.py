@@ -90,6 +90,9 @@ def calculate_metrics(outputs, optimizer=None):
         'loss': 0.0,
         'loss_recon': 0.0,
         'loss_contrast': 0.0,
+        'mse_loss': 0.0,
+        'intra_patch_div_loss': 0.0,
+        'inter_patch_div_loss': 0.0,
         'num_modalities': 0.0,
     }
 
@@ -104,15 +107,22 @@ def calculate_metrics(outputs, optimizer=None):
         return metrics
 
     # Sum the metrics across all batches
-    # Note: our optimized train_epoch now returns scalar values, not tensors
     for output in outputs:
         metrics['loss'] += output['loss']
         metrics['loss_recon'] += output['loss_recon']
         metrics['loss_contrast'] += output['loss_contrast']
         metrics['num_modalities'] += output['num_modalities']
 
+        # Add the new loss components
+        if 'mse_loss' in output:
+            metrics['mse_loss'] += output['mse_loss']
+        if 'intra_patch_div_loss' in output:
+            metrics['intra_patch_div_loss'] += output['intra_patch_div_loss']
+        if 'inter_patch_div_loss' in output:
+            metrics['inter_patch_div_loss'] += output['inter_patch_div_loss']
+
     # Calculate the average for normal metrics
-    for key in ['loss', 'loss_recon', 'loss_contrast', 'num_modalities']:
+    for key in metrics.keys():
         metrics[key] /= batch_count
 
     return metrics
@@ -374,23 +384,41 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         scaler.update()
 
         # Store only required outputs as scalars (not tensors) to save memory
-        outputs.append({
+        batch_output = {
             'loss': output['loss'].detach().item(),
             'loss_recon': output['loss_recon'].detach().item(),
             'loss_contrast': output['loss_contrast'].detach().item(),
             'num_modalities': output['num_modalities'].detach().item()
-        })
+        }
+
+        # Add the new loss components if available
+        if 'mse_loss' in output:
+            batch_output['mse_loss'] = output['mse_loss'].detach().item()
+        if 'intra_patch_div_loss' in output:
+            batch_output['intra_patch_div_loss'] = output['intra_patch_div_loss'].detach().item()
+        if 'inter_patch_div_loss' in output:
+            batch_output['inter_patch_div_loss'] = output['inter_patch_div_loss'].detach().item()
+
+        outputs.append(batch_output)
 
         # Get current learning rate for progress bar
         current_lr = optimizer.param_groups[0]['lr']
 
-        # Update progress bar
-        pbar.set_postfix({
+        # Update progress bar with more detailed loss information
+        pbar_info = {
             'loss': f"{loss.item():.6f}",
             'recon': f"{output['loss_recon'].item():.6f}",
             'contrast': f"{output['loss_contrast'].item():.6f}",
             'lr': f"{current_lr:.6f}"
-        })
+        }
+
+        # Add diversity losses to progress bar if available
+        if 'intra_patch_div_loss' in output:
+            pbar_info['intra_div'] = f"{output['intra_patch_div_loss'].item():.6f}"
+        if 'inter_patch_div_loss' in output:
+            pbar_info['inter_div'] = f"{output['inter_patch_div_loss'].item():.6f}"
+
+        pbar.set_postfix(pbar_info)
 
         # Delete intermediate tensors to free memory
         del hsi, aux_data, batch_idx_tensor, output, loss
@@ -419,7 +447,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             # Move data to device with non_blocking for potential speedup
             hsi = batch['hsi'].to(device, non_blocking=True)
             aux_data = {k: v.to(device, non_blocking=True) if v is not None else None
-                       for k, v in batch['aux_data'].items()}
+                        for k, v in batch['aux_data'].items()}
             batch_idx_tensor = batch['batch_idx'].to(device, non_blocking=True)
 
             # Forward pass with AMP
@@ -427,19 +455,37 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
                 output = model(hsi, aux_data, batch_idx_tensor)
 
             # Store only required outputs as scalars (not tensors) to save memory
-            outputs.append({
+            batch_output = {
                 'loss': output['loss'].detach().item(),
                 'loss_recon': output['loss_recon'].detach().item(),
                 'loss_contrast': output['loss_contrast'].detach().item(),
                 'num_modalities': output['num_modalities'].detach().item()
-            })
+            }
 
-            # Update progress bar
-            pbar.set_postfix({
+            # Add the new loss components if available
+            if 'mse_loss' in output:
+                batch_output['mse_loss'] = output['mse_loss'].detach().item()
+            if 'intra_patch_div_loss' in output:
+                batch_output['intra_patch_div_loss'] = output['intra_patch_div_loss'].detach().item()
+            if 'inter_patch_div_loss' in output:
+                batch_output['inter_patch_div_loss'] = output['inter_patch_div_loss'].detach().item()
+
+            outputs.append(batch_output)
+
+            # Update progress bar with more detailed information
+            pbar_info = {
                 'loss': f"{output['loss'].item():.6f}",
                 'recon': f"{output['loss_recon'].item():.6f}",
                 'contrast': f"{output['loss_contrast'].item():.6f}"
-            })
+            }
+
+            # Add diversity losses to progress bar if available
+            if 'intra_patch_div_loss' in output:
+                pbar_info['intra_div'] = f"{output['intra_patch_div_loss'].item():.6f}"
+            if 'inter_patch_div_loss' in output:
+                pbar_info['inter_div'] = f"{output['inter_patch_div_loss'].item():.6f}"
+
+            pbar.set_postfix(pbar_info)
 
             # Delete intermediate tensors to free memory
             del hsi, aux_data, batch_idx_tensor, output
