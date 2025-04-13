@@ -981,76 +981,138 @@ class MultiModalSpectralGPT(nn.Module):
 
     def forward_loss_in_pixel_space(self, pred_pixels, original_input, mask, thickness_mask=None):
         """
-        Compute loss in pixel space by directly comparing with the original input.
+        Compute loss in pixel space with adaptive variance penalty to discourage uniform predictions
+        where appropriate while allowing naturally uniform regions.
         """
         with torch.cuda.amp.autocast(enabled=True):
             # Convert token mask to 3D pixel mask
             pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)  # [B, T, H, W]
-            print(f"Pixel mask shape: {pixel_mask.shape}")
 
-            # If thickness mask is provided and enabled, combine masks
+            # Standard MSE calculation
+            pixel_mse = ((pred_pixels - original_input) ** 2)
+
+            # Apply thickness mask if provided
             if thickness_mask is not None and self.use_thickness_mask:
-                # Print details about the thickness mask
-                print(f"Original thickness mask shape: {thickness_mask.shape}")
-                print(f"Thickness mask dimensions: {thickness_mask.dim()}")
+                # Expand thickness mask to match dimensions
+                if thickness_mask.dim() == 4:  # [B, 1, H, W]
+                    expanded_thickness = thickness_mask.expand(-1, pixel_mask.shape[1], -1, -1)
+                else:
+                    expanded_thickness = thickness_mask
 
-                # Examine the thickness mask shape in detail
-                if thickness_mask.dim() == 5:
-                    print(
-                        f"Shape details: [B={thickness_mask.shape[0]}, D1={thickness_mask.shape[1]}, D2={thickness_mask.shape[2]}, H={thickness_mask.shape[3]}, W={thickness_mask.shape[4]}]")
+                # Combine masks
+                combined_mask = pixel_mask * expanded_thickness
+                valid_pixel_count = combined_mask.sum() + 1e-6
+                mse_loss = (pixel_mse * combined_mask).sum() / valid_pixel_count
 
-                    # Try to reshape the thickness mask to [B, 1, H, W]
-                    try:
-                        # Remove the extra dimension (D2) directly
-                        reshaped_thickness = thickness_mask[:, :, 0, :, :]
-                        print(f"After removing D2: {reshaped_thickness.shape}")
-
-                        # Now expand across wavelength dimension
-                        expanded_thickness = reshaped_thickness.expand(-1, pixel_mask.shape[1], -1, -1)
-                        print(f"After expansion: {expanded_thickness.shape}")
-
-                        # Combine masks
-                        combined_mask = pixel_mask * expanded_thickness
-
-                        # Compute loss
-                        pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
-                        valid_pixel_count = combined_mask.sum() + 1e-6
-                        return pixel_mse.sum() / valid_pixel_count
-
-                    except Exception as e:
-                        print(f"Error reshaping thickness mask: {e}")
-                        # Fall back to just using pixel mask
-                        pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
-                        masked_pixel_count = pixel_mask.sum() + 1e-6
-                        return pixel_mse.sum() / masked_pixel_count
-
-                elif thickness_mask.dim() == 4:
-                    try:
-                        # Expand across wavelength dimension
-                        expanded_thickness = thickness_mask.expand(-1, pixel_mask.shape[1], -1, -1)
-                        print(f"After expansion: {expanded_thickness.shape}")
-
-                        # Combine masks
-                        combined_mask = pixel_mask * expanded_thickness
-
-                        # Compute loss
-                        pixel_mse = ((pred_pixels - original_input) ** 2) * combined_mask
-                        valid_pixel_count = combined_mask.sum() + 1e-6
-                        return pixel_mse.sum() / valid_pixel_count
-
-                    except Exception as e:
-                        print(f"Error expanding thickness mask: {e}")
-                        # Fall back to just using pixel mask
-                        pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
-                        masked_pixel_count = pixel_mask.sum() + 1e-6
-                        return pixel_mse.sum() / masked_pixel_count
+                # Use this mask for variance calculations
+                final_mask = combined_mask
             else:
-                # No thickness mask, just use MAE mask
-                pixel_mse = ((pred_pixels - original_input) ** 2) * pixel_mask
-
-                # Sum loss and normalize by the number of masked pixels
+                # Apply only pixel mask
                 masked_pixel_count = pixel_mask.sum() + 1e-6
-                return pixel_mse.sum() / masked_pixel_count
+                mse_loss = (pixel_mse * pixel_mask).sum() / masked_pixel_count
+
+                # Use pixel mask for variance calculations
+                final_mask = pixel_mask
+
+            # Calculate adaptive variance penalty
+            B, C, T, H, W = original_input.shape
+            patch_h, patch_w = self.patch_size
+
+            # Reshape for patch extraction - handle one spectral band at a time
+            variance_loss = 0.0
+            bands_processed = 0
+
+            # Process a subset of bands to save computation (e.g., every 5th band)
+            band_step = max(1, T // 6)  # Process ~6 bands evenly spaced
+
+            for t in range(0, T, band_step):
+                # Get current spectral band
+                orig_band = original_input[:, :, t]  # [B, C, H, W]
+                pred_band = pred_pixels[:, :, t]
+                mask_band = final_mask[:, t] if final_mask.dim() >= 3 else final_mask  # [B, H, W]
+
+                # Invert mask to get unmasked regions (0 = masked, 1 = visible)
+                unmasked = 1.0 - mask_band
+
+                # Reshape for unfold operation
+                orig_band_flat = orig_band.reshape(B * C, 1, H, W)
+                pred_band_flat = pred_band.reshape(B * C, 1, H, W)
+
+                # Extract patches
+                orig_patches = F.unfold(
+                    orig_band_flat,
+                    kernel_size=(patch_h, patch_w),
+                    stride=(patch_h, patch_w)
+                ).reshape(B, C, patch_h * patch_w, -1)
+
+                pred_patches = F.unfold(
+                    pred_band_flat,
+                    kernel_size=(patch_h, patch_w),
+                    stride=(patch_h, patch_w)
+                ).reshape(B, C, patch_h * patch_w, -1)
+
+                # Calculate variance within each patch
+                orig_var = torch.var(orig_patches, dim=2)  # [B, C, num_patches]
+                pred_var = torch.var(pred_patches, dim=2)  # [B, C, num_patches]
+
+                # Create patch-level mask
+                mask_band_reshaped = mask_band.reshape(B, 1, H, W)
+                mask_patches = F.unfold(
+                    mask_band_reshaped,
+                    kernel_size=(patch_h, patch_w),
+                    stride=(patch_h, patch_w)
+                ).reshape(B, 1, patch_h * patch_w, -1)
+
+                # A patch is considered masked if majority of pixels are masked
+                patch_mask = (torch.mean(mask_patches, dim=2) > 0.5).float()  # [B, 1, num_patches]
+
+                # Calculate reference variance from unmasked patches
+                unmasked_patches = 1.0 - patch_mask
+
+                # Safe calculation of reference variance (avoid division by zero)
+                # Sum variance of unmasked patches and count
+                sum_unmasked_var = torch.sum(orig_var * unmasked_patches, dim=2, keepdim=True)
+                count_unmasked = torch.sum(unmasked_patches, dim=2, keepdim=True) + 1e-6
+
+                # Calculate mean variance of unmasked patches per batch
+                reference_variance = sum_unmasked_var / count_unmasked  # [B, C, 1]
+
+                # Set adaptive threshold as percentage of reference variance
+                # Allow natural uniformity but catch suspicious uniformity
+                threshold_ratio = 0.2  # Patches can be 20% as uniform as reference
+                min_variance_threshold = reference_variance * threshold_ratio
+
+                # Calculate variance deficit where prediction is too uniform
+                # Only apply to masked patches
+                too_uniform = (pred_var < min_variance_threshold) & (patch_mask > 0.5)
+                variance_deficit = torch.clamp(min_variance_threshold - pred_var, min=0.0)
+
+                # Final variance penalty - only applied to suspiciously uniform masked patches
+                band_variance_loss = (variance_deficit * too_uniform.float()).sum()
+
+                # Normalize by number of masked patches
+                num_masked_patches = patch_mask.sum() + 1e-6
+                band_variance_loss = band_variance_loss / num_masked_patches
+
+                # Accumulate loss across bands
+                variance_loss += band_variance_loss
+                bands_processed += 1
+
+            # Normalize by number of bands processed
+            if bands_processed > 0:
+                variance_loss = variance_loss / bands_processed
+
+            # Weight for variance penalty
+            variance_weight = 0.1
+
+            # Combined loss
+            total_loss = mse_loss + variance_weight * variance_loss
+
+            # For debugging
+            if not self.training and torch.rand(1).item() < 0.05:  # Log occasionally during validation
+                print(f"MSE Loss: {mse_loss.item():.6f}, Variance Loss: {variance_loss.item():.6f}")
+
+            return total_loss
 
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
         """Forward pass through the full model with direct pixel prediction."""
