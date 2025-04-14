@@ -94,6 +94,11 @@ def calculate_metrics(outputs, optimizer=None):
         'intra_patch_div_loss': 0.0,
         'inter_patch_div_loss': 0.0,
         'num_modalities': 0.0,
+        'reference_variance': 0.0,
+        'variance_threshold': 0.0,
+        'diversity_threshold': 0.0,
+        'reconstructed_variance': 0.0,
+        'reconstructed_similarity': 0.0,
     }
 
     # Add current learning rate if optimizer is provided
@@ -113,13 +118,27 @@ def calculate_metrics(outputs, optimizer=None):
         metrics['loss_contrast'] += output['loss_contrast']
         metrics['num_modalities'] += output['num_modalities']
 
-        # Add the new loss components
+        # Add the loss components
         if 'mse_loss' in output:
             metrics['mse_loss'] += output['mse_loss']
         if 'intra_patch_div_loss' in output:
             metrics['intra_patch_div_loss'] += output['intra_patch_div_loss']
         if 'inter_patch_div_loss' in output:
             metrics['inter_patch_div_loss'] += output['inter_patch_div_loss']
+
+        # Add the reference values
+        if 'reference_variance' in output:
+            metrics['reference_variance'] += output['reference_variance']
+        if 'variance_threshold' in output:
+            metrics['variance_threshold'] += output['variance_threshold']
+        if 'diversity_threshold' in output:
+            metrics['diversity_threshold'] += output['diversity_threshold']
+
+        # Add the reconstructed values
+        if 'reconstructed_variance' in output:
+            metrics['reconstructed_variance'] += output['reconstructed_variance']
+        if 'reconstructed_similarity' in output:
+            metrics['reconstructed_similarity'] += output['reconstructed_similarity']
 
     # Calculate the average for normal metrics
     for key in metrics.keys():

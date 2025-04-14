@@ -1257,6 +1257,9 @@ class MultiModalSpectralGPT(nn.Module):
         2. Inter-patch diversity loss - penalizes when masked patches are more similar to each other than unmasked ones
         """
         with torch.cuda.amp.autocast(enabled=True):
+            # Get the device from input tensors
+            device = original_input.device
+
             # Convert token mask to 3D pixel mask
             pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)  # [B, T, H, W]
 
@@ -1294,6 +1297,15 @@ class MultiModalSpectralGPT(nn.Module):
             intra_patch_div_loss = 0.0  # Variance within patches
             inter_patch_div_loss = 0.0  # Diversity between patches
             bands_processed = 0
+
+            # Create containers for reference values
+            all_reference_variances = []  # Original patch variances
+            all_variance_thresholds = []  # Thresholds for variance
+            all_diversity_thresholds = []  # Thresholds for inter-patch similarity
+
+            # New containers for reconstructed values
+            all_reconstructed_variances = []  # Reconstructed patch variances
+            all_reconstructed_similarities = []  # Reconstructed patch similarities
 
             # Process a subset of bands to save computation (e.g., every 5th band)
             band_step = max(1, T // 6)  # Process ~6 bands evenly spaced
@@ -1352,9 +1364,23 @@ class MultiModalSpectralGPT(nn.Module):
                     orig_var, unmasked_patches, B
                 )  # [B, C, 1]
 
+                # Save reference variance for export
+                all_reference_variances.append(reference_variance.detach().clone())
+
+                # Calculate reconstructed variances (average variance of masked patches)
+                reconstructed_variance = self._calculate_reference_variance(
+                    pred_var, patch_mask, B
+                )  # [B, C, 1]
+
+                # Save reconstructed variance for export
+                all_reconstructed_variances.append(reconstructed_variance.detach().clone())
+
                 # Set adaptive threshold as percentage of reference variance
                 threshold_ratio = 0.2  # Patches can be 20% as uniform as reference
                 min_variance_threshold = reference_variance * threshold_ratio
+
+                # Save variance threshold for export
+                all_variance_thresholds.append(min_variance_threshold.detach().clone())
 
                 # Calculate variance deficit where prediction is too uniform
                 # Only apply to masked patches
@@ -1378,10 +1404,68 @@ class MultiModalSpectralGPT(nn.Module):
                     orig_patches, pred_patches, patch_mask
                 )
 
+                # Calculate original unmasked patch similarities
+                orig_patches_flat = orig_patches.transpose(1, 2).reshape(B, patch_h * patch_w * C, -1)
+                orig_patches_norm = F.normalize(orig_patches_flat, p=2, dim=1)
+
+                # Calculate reconstructed patch similarities
+                pred_patches_flat = pred_patches.transpose(1, 2).reshape(B, patch_h * patch_w * C, -1)
+                pred_patches_norm = F.normalize(pred_patches_flat, p=2, dim=1)
+
+                # Get average similarity between unmasked patches (original)
+                orig_sum_sim = 0.0
+                orig_count_sim = 0
+
+                # Get average similarity between masked patches (reconstructed)
+                pred_sum_sim = 0.0
+                pred_count_sim = 0
+
+                # Process one batch at a time for memory efficiency
+                for b in range(B):
+                    # Process original unmasked patches
+                    unmasked_indices = torch.where(unmasked_patches[b, 0] > 0.5)[0]
+                    if len(unmasked_indices) >= 2:
+                        max_samples = min(50, len(unmasked_indices))
+                        sampled = unmasked_indices[torch.randperm(len(unmasked_indices))[:max_samples]]
+                        selected = orig_patches_norm[b, :, sampled]
+                        sim_matrix = torch.matmul(selected.T, selected)
+                        diag_mask = torch.ones_like(sim_matrix) - torch.eye(sim_matrix.shape[0],
+                                                                            device=sim_matrix.device)
+                        if diag_mask.sum() > 0:
+                            batch_sim = (sim_matrix * diag_mask).sum() / diag_mask.sum()
+                            orig_sum_sim += batch_sim.item()
+                            orig_count_sim += 1
+
+                    # Process reconstructed masked patches
+                    masked_indices = torch.where(patch_mask[b, 0] > 0.5)[0]
+                    if len(masked_indices) >= 2:
+                        max_samples = min(50, len(masked_indices))
+                        sampled = masked_indices[torch.randperm(len(masked_indices))[:max_samples]]
+                        selected = pred_patches_norm[b, :, sampled]
+                        sim_matrix = torch.matmul(selected.T, selected)
+                        diag_mask = torch.ones_like(sim_matrix) - torch.eye(sim_matrix.shape[0],
+                                                                            device=sim_matrix.device)
+                        if diag_mask.sum() > 0:
+                            batch_sim = (sim_matrix * diag_mask).sum() / diag_mask.sum()
+                            pred_sum_sim += batch_sim.item()
+                            pred_count_sim += 1
+
+                # Calculate average similarities
+                if orig_count_sim > 0:
+                    orig_mean_sim = orig_sum_sim / orig_count_sim
+                    margin = 0.1
+                    diversity_threshold = orig_mean_sim + margin
+                    all_diversity_thresholds.append(torch.tensor(diversity_threshold, device=device))
+
+                if pred_count_sim > 0:
+                    pred_mean_sim = pred_sum_sim / pred_count_sim
+                    all_reconstructed_similarities.append(torch.tensor(pred_mean_sim, device=device))
+
                 # Clean up large tensor variables
                 del orig_patches, pred_patches, patch_mask
                 del orig_band, pred_band, mask_band, orig_band_flat, pred_band_flat
                 del orig_var, pred_var, reference_variance, unmasked_patches
+                del orig_patches_flat, orig_patches_norm, pred_patches_flat, pred_patches_norm
                 torch.cuda.empty_cache()
 
                 # Accumulate diversity losses across bands
@@ -1411,12 +1495,33 @@ class MultiModalSpectralGPT(nn.Module):
             del pixel_mask, pixel_mse, final_mask
             torch.cuda.empty_cache()
 
-            # Return dictionary with all loss components for tracking
+            # Calculate average reference values across all bands
+            mean_reference_variance = torch.mean(
+                torch.cat(all_reference_variances)) if all_reference_variances else torch.tensor(0.0, device=device)
+            mean_variance_threshold = torch.mean(
+                torch.cat(all_variance_thresholds)) if all_variance_thresholds else torch.tensor(0.0, device=device)
+            mean_diversity_threshold = torch.mean(
+                torch.stack(all_diversity_thresholds)) if all_diversity_thresholds else torch.tensor(0.0, device=device)
+
+            # Calculate average reconstructed values across all bands
+            mean_reconstructed_variance = torch.mean(
+                torch.cat(all_reconstructed_variances)) if all_reconstructed_variances else torch.tensor(0.0,
+                                                                                                         device=device)
+            mean_reconstructed_similarity = torch.mean(
+                torch.stack(all_reconstructed_similarities)) if all_reconstructed_similarities else torch.tensor(0.0,
+                                                                                                                 device=device)
+
+            # Return dictionary with all loss components and diversity values for tracking
             return {
                 'total_loss': total_loss,
                 'mse_loss': mse_loss,
                 'intra_patch_div_loss': intra_patch_div_loss,
-                'inter_patch_div_loss': inter_patch_div_loss
+                'inter_patch_div_loss': inter_patch_div_loss,
+                'reference_variance': mean_reference_variance,
+                'variance_threshold': mean_variance_threshold,
+                'diversity_threshold': mean_diversity_threshold,
+                'reconstructed_variance': mean_reconstructed_variance,
+                'reconstructed_similarity': mean_reconstructed_similarity
             }
 
     def _calculate_reference_variance(self, orig_var, unmasked_patches, batch_size):
@@ -1699,6 +1804,13 @@ class MultiModalSpectralGPT(nn.Module):
         # Calculate total loss
         loss = loss_recon + loss_contrast
 
+        # Get reference and reconstructed values
+        reference_variance = losses.get('reference_variance', torch.tensor(0.0, device=device))
+        variance_threshold = losses.get('variance_threshold', torch.tensor(0.0, device=device))
+        diversity_threshold = losses.get('diversity_threshold', torch.tensor(0.0, device=device))
+        reconstructed_variance = losses.get('reconstructed_variance', torch.tensor(0.0, device=device))
+        reconstructed_similarity = losses.get('reconstructed_similarity', torch.tensor(0.0, device=device))
+
         return {
             'loss': loss,
             'loss_recon': loss_recon,
@@ -1712,5 +1824,10 @@ class MultiModalSpectralGPT(nn.Module):
             'thickness_mask': thickness_mask,
             'contrastive_mode': self.contrastive_mode,
             'original_input': original_input,
-            'reconstructed_pixels': reconstructed_pixels
+            'reconstructed_pixels': reconstructed_pixels,
+            'reference_variance': reference_variance,
+            'variance_threshold': variance_threshold,
+            'diversity_threshold': diversity_threshold,
+            'reconstructed_variance': reconstructed_variance,
+            'reconstructed_similarity': reconstructed_similarity
         }
