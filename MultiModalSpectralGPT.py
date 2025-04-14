@@ -513,7 +513,7 @@ class MultiModalSpectralGPT(nn.Module):
 
     def forward_encoder(self, hsi_img, aux_data=None):
         """Forward pass through encoder with masking and auxiliary conditioning."""
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             # Convert input to sequence of embedded patches
             x = self.patch_embed(hsi_img)  # Shape: [B, T, HW, D]
 
@@ -567,7 +567,7 @@ class MultiModalSpectralGPT(nn.Module):
 
     def forward_decoder(self, x, ids_restore):
         """Decoder to reconstruct masked tokens in embedding space."""
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             # Project to decoder dimension
             x = self.decoder_embed(x)
 
@@ -645,7 +645,7 @@ class MultiModalSpectralGPT(nn.Module):
         Returns:
             dict: Encoded and normalized auxiliary embeddings
         """
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             aux_embeddings = {}
             for modality, data in aux_data.items():
                 if data is not None:
@@ -660,7 +660,7 @@ class MultiModalSpectralGPT(nn.Module):
         Only applies thickness mask when processing the 'thickness' modality if use_thickness_mask is True.
         For other modalities (IR, AF), the thickness mask is not applied.
         """
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             device = hsi_features.device
             B = hsi_features.shape[0]
 
@@ -752,7 +752,7 @@ class MultiModalSpectralGPT(nn.Module):
 
     def contrastive_loss_global(self, hsi_features, aux_embeddings, batch_idx, thickness_mask=None):
         """Calculate contrastive loss with global representations, selectively applying thickness mask."""
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             device = hsi_features.device
             B = hsi_features.shape[0]
 
@@ -989,105 +989,89 @@ class MultiModalSpectralGPT(nn.Module):
 
         return pixel_mask
 
-    def calculate_inter_patch_diversity_loss(self, orig_patches, pred_patches, patch_mask):
+    def calculate_inter_patch_diversity_loss(self, orig_patches, pred_patches, patch_mask, reference_similarity=None):
         """
-        Calculate diversity loss between patches (inter-patch diversity).
-        Penalizes when reconstructed patches are more similar to each other than original patches.
+        Calculate diversity loss between patches (inter-patch diversity) more efficiently.
+        Uses pre-computed reference similarity if provided.
 
         Args:
-            orig_patches: Original patches tensor of shape [B, C, patch_pixels, num_patches]
-            pred_patches: Predicted patches tensor of shape [B, C, patch_pixels, num_patches]
-            patch_mask: Mask indicating which patches are masked (1.0) vs visible (0.0), shape [B, 1, num_patches]
+            orig_patches: Original patches tensor [B, C, pixels_per_patch, num_patches]
+            pred_patches: Predicted patches tensor [B, C, pixels_per_patch, num_patches]
+            patch_mask: Mask indicating masked patches [B, 1, num_patches]
+            reference_similarity: Pre-computed reference similarities [B] (optional)
 
         Returns:
-            torch.Tensor: Inter-patch diversity loss
+            Tensor: Inter-patch diversity loss
         """
         B, C, pixels_per_patch, num_patches = orig_patches.shape
+        device = orig_patches.device
 
-        # We'll use cosine similarity to measure patch similarity
-        # First, normalize patches along pixel dimension
-        orig_patches_norm = F.normalize(orig_patches, p=2, dim=2)  # [B, C, patch_pixels, num_patches]
-        pred_patches_norm = F.normalize(pred_patches, p=2, dim=2)  # [B, C, patch_pixels, num_patches]
+        # Reshape for more efficient computation
+        orig_patches = orig_patches.transpose(1, 2).reshape(B, pixels_per_patch * C, num_patches)
+        pred_patches = pred_patches.transpose(1, 2).reshape(B, pixels_per_patch * C, num_patches)
 
-        # Get unmasked patches mask (0 = masked, 1 = visible)
-        unmasked_patches = 1.0 - patch_mask  # [B, 1, num_patches]
+        # Get masked and unmasked indicators
+        patch_mask = patch_mask.squeeze(1)  # [B, num_patches]
+        unmasked_patches = 1.0 - patch_mask  # [B, num_patches]
 
-        # Compute pairwise cosine similarities between all patches
-        # For simplicity, we'll use a sampling approach to avoid computing all pairs
+        # Pre-normalize all patches at once
+        orig_patches_norm = F.normalize(orig_patches, p=2, dim=1)
+        pred_patches_norm = F.normalize(pred_patches, p=2, dim=1)
 
-        # Sample pairs of patches for diversity calculation (to avoid O(n²) computation)
-        max_samples = min(100, num_patches)  # Limit number of samples for efficiency
-
-        # For each batch, calculate average similarity between sampled patch pairs
         inter_patch_div_loss = 0.0
 
         for b in range(B):
-            # Get indices of masked and unmasked patches for this batch
-            masked_indices = torch.where(patch_mask[b, 0] > 0.5)[0]
-            unmasked_indices = torch.where(unmasked_patches[b, 0] > 0.5)[0]
+            # Get masked and unmasked indices
+            masked_indices = torch.where(patch_mask[b] > 0.5)[0]
+            unmasked_indices = torch.where(unmasked_patches[b] > 0.5)[0]
 
-            # Skip if we don't have enough patches
-            if len(unmasked_indices) < 2 or len(masked_indices) < 2:
+            # Skip if not enough patches
+            if len(masked_indices) < 2:
                 continue
 
-            # Sample pairs from unmasked patches
-            num_unmasked_pairs = min(max_samples, len(unmasked_indices) // 2 * 2)
-            if num_unmasked_pairs >= 2:
-                sampled_unmasked = unmasked_indices[torch.randperm(len(unmasked_indices))[:num_unmasked_pairs]]
-                pairs_unmasked = sampled_unmasked.reshape(-1, 2)  # Reshape to pairs
+            # For masked (reconstructed) patches
+            max_samples = min(50, len(masked_indices))
+            sampled_masked = masked_indices[torch.randperm(len(masked_indices))[:max_samples]]
 
-                # Calculate similarities between pairs of unmasked patches
-                orig_sims = []
-                for i, j in pairs_unmasked:
-                    # Calculate cosine similarity between this pair
-                    sim = F.cosine_similarity(
-                        orig_patches_norm[b, :, :, i].view(C, -1),
-                        orig_patches_norm[b, :, :, j].view(C, -1),
-                        dim=1
-                    ).mean()  # Average over channels
-                    orig_sims.append(sim)
+            # Extract normalized patches
+            masked_patches = pred_patches_norm[b, :, sampled_masked]  # [pixels*C, samples]
 
-                # Get mean similarity between unmasked patches (lower means more diverse)
-                if orig_sims:
-                    orig_mean_sim = torch.stack(orig_sims).mean()
-                else:
-                    orig_mean_sim = torch.tensor(0.5, device=orig_patches.device)
+            # Calculate similarity matrix efficiently
+            masked_sim_matrix = torch.matmul(masked_patches.T, masked_patches)  # [samples, samples]
+
+            # Create mask to exclude self-similarities
+            mask_for_diag = torch.ones_like(masked_sim_matrix) - torch.eye(max_samples, device=device)
+
+            # Calculate mean similarity excluding diagonal
+            masked_mean_sim = (masked_sim_matrix * mask_for_diag).sum() / (mask_for_diag.sum() + 1e-8)
+
+            # Get reference similarity (either pre-computed or calculate from unmasked patches)
+            if reference_similarity is not None:
+                orig_mean_sim = reference_similarity[b]
+            elif len(unmasked_indices) >= 2:
+                # Only calculate if not provided and enough unmasked patches exist
+                max_unmasked = min(50, len(unmasked_indices))
+                sampled_unmasked = unmasked_indices[torch.randperm(len(unmasked_indices))[:max_unmasked]]
+
+                # Extract normalized patches
+                unmasked_patches_norm = orig_patches_norm[b, :, sampled_unmasked]  # [pixels*C, samples]
+
+                # Calculate similarity matrix
+                unmasked_sim_matrix = torch.matmul(unmasked_patches_norm.T, unmasked_patches_norm)
+
+                # Exclude self-similarity
+                unmasked_mask = torch.ones_like(unmasked_sim_matrix) - torch.eye(max_unmasked, device=device)
+
+                # Calculate mean similarity
+                orig_mean_sim = (unmasked_sim_matrix * unmasked_mask).sum() / (unmasked_mask.sum() + 1e-8)
             else:
-                orig_mean_sim = torch.tensor(0.5, device=orig_patches.device)
+                # Fallback value if no reference available
+                orig_mean_sim = torch.tensor(0.5, device=device)
 
-            # Sample pairs from masked patches
-            num_masked_pairs = min(max_samples, len(masked_indices) // 2 * 2)
-            if num_masked_pairs >= 2:
-                sampled_masked = masked_indices[torch.randperm(len(masked_indices))[:num_masked_pairs]]
-                pairs_masked = sampled_masked.reshape(-1, 2)  # Reshape to pairs
-
-                # Calculate similarities between pairs of masked (reconstructed) patches
-                pred_sims = []
-                for i, j in pairs_masked:
-                    # Calculate cosine similarity between this pair
-                    sim = F.cosine_similarity(
-                        pred_patches_norm[b, :, :, i].view(C, -1),
-                        pred_patches_norm[b, :, :, j].view(C, -1),
-                        dim=1
-                    ).mean()  # Average over channels
-                    pred_sims.append(sim)
-
-                # Get mean similarity between masked patches (lower means more diverse)
-                if pred_sims:
-                    pred_mean_sim = torch.stack(pred_sims).mean()
-                else:
-                    pred_mean_sim = torch.tensor(0.5, device=pred_patches.device)
-            else:
-                pred_mean_sim = torch.tensor(0.5, device=pred_patches.device)
-
-            # Calculate inter-patch diversity loss
-            # If masked patches are more similar to each other than unmasked patches, penalize
-            # Allow reconstructed patches to be at most as similar as the original patches plus a margin
-            margin = 0.1  # Allowing some similarity increase
+            # Calculate diversity loss with margin
+            margin = 0.1
             diversity_threshold = orig_mean_sim + margin
-
-            # Penalize if reconstructed patches are too similar
-            batch_div_loss = torch.clamp(pred_mean_sim - diversity_threshold, min=0.0)
+            batch_div_loss = torch.clamp(masked_mean_sim - diversity_threshold, min=0.0)
             inter_patch_div_loss += batch_div_loss
 
         # Normalize by batch size
@@ -1095,9 +1079,180 @@ class MultiModalSpectralGPT(nn.Module):
 
         return inter_patch_div_loss
 
+    def calculate_batch_reference_variance(self, original_input, unmasked_pixels, num_samples=100):
+        """
+        Calculate reference variance statistics across the batch once.
+
+        Args:
+            original_input: Original HSI tensor [B, C, T, H, W]
+            unmasked_pixels: Binary mask of unmasked regions [B, T, H, W]
+            num_samples: Maximum number of samples to use
+
+        Returns:
+            Tensor with reference variance values [B, C, 1]
+        """
+        B, C, T, H, W = original_input.shape
+        patch_h, patch_w = self.patch_size
+
+        # Sample a subset of spectral bands
+        band_step = max(1, T // 5)  # Sample ~5 bands
+        reference_variances = []
+
+        # Process a few random bands to estimate variance
+        sampled_bands = torch.randperm(T)[:min(5, T)]
+
+        for t in sampled_bands:
+            # Get current band
+            orig_band = original_input[:, :, t]  # [B, C, H, W]
+            mask_band = unmasked_pixels[:, t] if unmasked_pixels.dim() >= 3 else unmasked_pixels  # [B, H, W]
+
+            # Reshape for unfold
+            orig_band_flat = orig_band.reshape(B * C, 1, H, W)
+
+            # Extract patches
+            orig_patches = F.unfold(
+                orig_band_flat,
+                kernel_size=(patch_h, patch_w),
+                stride=(patch_h, patch_w)
+            ).reshape(B, C, patch_h * patch_w, -1)
+
+            # Calculate variance within each patch
+            patch_vars = torch.var(orig_patches, dim=2)  # [B, C, num_patches]
+
+            # Create patch-level mask
+            mask_band_reshaped = mask_band.reshape(B, 1, H, W)
+            mask_patches = F.unfold(
+                mask_band_reshaped,
+                kernel_size=(patch_h, patch_w),
+                stride=(patch_h, patch_w)
+            ).reshape(B, 1, patch_h * patch_w, -1)
+
+            # A patch is considered unmasked if majority of pixels are unmasked
+            unmasked_patches = (torch.mean(mask_patches, dim=2) > 0.5).float()  # [B, 1, num_patches]
+
+            # Collect reference variance per batch
+            batch_reference_vars = []
+
+            for b in range(B):
+                # Get indices of unmasked patches for this batch
+                unmasked_indices = torch.where(unmasked_patches[b, 0] > 0.5)[0]
+
+                # Skip if not enough unmasked patches
+                if len(unmasked_indices) < 5:
+                    # Fallback to using all patches if not enough unmasked ones
+                    batch_ref_var = patch_vars[b].mean(dim=1, keepdim=True)
+                else:
+                    # Sample subset of unmasked patches
+                    num_samples_actual = min(num_samples, len(unmasked_indices))
+                    sampled_indices = unmasked_indices[torch.randperm(len(unmasked_indices))[:num_samples_actual]]
+
+                    # Calculate mean variance of sampled patches
+                    batch_vars = patch_vars[b, :, sampled_indices]
+                    batch_ref_var = batch_vars.mean(dim=1, keepdim=True)
+
+                batch_reference_vars.append(batch_ref_var)
+
+            # Stack the reference variances for this band
+            band_reference_var = torch.stack(batch_reference_vars, dim=0)  # [B, C, 1]
+            reference_variances.append(band_reference_var)
+
+        # Average across sampled bands
+        avg_reference_variance = torch.stack(reference_variances).mean(dim=0)
+
+        return avg_reference_variance
+
+    def calculate_batch_reference_similarity(self, original_input, unmasked_pixels, num_samples=100):
+        """
+        Calculate reference inter-patch similarity statistics across the batch once.
+
+        Args:
+            original_input: Original HSI tensor [B, C, T, H, W]
+            unmasked_pixels: Binary mask of unmasked regions [B, T, H, W]
+            num_samples: Maximum number of samples to use
+
+        Returns:
+            Tensor with reference similarity values [B]
+        """
+        B, C, T, H, W = original_input.shape
+        patch_h, patch_w = self.patch_size
+
+        # Sample a subset of spectral bands
+        band_step = max(1, T // 5)  # Sample ~5 bands
+        reference_similarities = []
+
+        # Process a few random bands
+        sampled_bands = torch.randperm(T)[:min(3, T)]
+
+        for t in sampled_bands:
+            # Get current band
+            orig_band = original_input[:, :, t]  # [B, C, H, W]
+            mask_band = unmasked_pixels[:, t] if unmasked_pixels.dim() >= 3 else unmasked_pixels  # [B, H, W]
+
+            # Reshape for unfold
+            orig_band_flat = orig_band.reshape(B * C, 1, H, W)
+
+            # Extract patches
+            orig_patches = F.unfold(
+                orig_band_flat,
+                kernel_size=(patch_h, patch_w),
+                stride=(patch_h, patch_w)
+            ).reshape(B, C, patch_h * patch_w, -1)
+
+            # Create patch-level mask
+            mask_band_reshaped = mask_band.reshape(B, 1, H, W)
+            mask_patches = F.unfold(
+                mask_band_reshaped,
+                kernel_size=(patch_h, patch_w),
+                stride=(patch_h, patch_w)
+            ).reshape(B, 1, patch_h * patch_w, -1)
+
+            # A patch is considered unmasked if majority of pixels are unmasked
+            unmasked_patches = (torch.mean(mask_patches, dim=2) > 0.5).float()  # [B, 1, num_patches]
+
+            # Calculate inter-patch similarities per batch
+            batch_similarities = []
+
+            for b in range(B):
+                # Get indices of unmasked patches for this batch
+                unmasked_indices = torch.where(unmasked_patches[b, 0] > 0.5)[0]
+
+                # Need at least 2 unmasked patches for similarity
+                if len(unmasked_indices) < 2:
+                    # Fallback to a default value if not enough patches
+                    batch_similarities.append(torch.tensor(0.5, device=original_input.device))
+                    continue
+
+                # Sample a reasonable number of patches
+                num_samples_actual = min(num_samples, len(unmasked_indices))
+                sampled_indices = unmasked_indices[torch.randperm(len(unmasked_indices))[:num_samples_actual]]
+
+                # Get the patches and normalize
+                selected_patches = orig_patches[b, :, :, sampled_indices]  # [C, patch_size², samples]
+                selected_patches = selected_patches.reshape(C * patch_h * patch_w, num_samples_actual)
+                selected_patches_norm = F.normalize(selected_patches, p=2, dim=0)
+
+                # Calculate similarity matrix
+                sim_matrix = torch.matmul(selected_patches_norm.T, selected_patches_norm)
+
+                # Exclude self-similarity (diagonal)
+                mask = torch.ones_like(sim_matrix) - torch.eye(num_samples_actual, device=sim_matrix.device)
+
+                # Calculate mean similarity excluding diagonal
+                mean_sim = (sim_matrix * mask).sum() / (mask.sum() + 1e-8)
+                batch_similarities.append(mean_sim)
+
+            # Stack similarities for this band
+            band_similarities = torch.stack(batch_similarities)  # [B]
+            reference_similarities.append(band_similarities)
+
+        # Average across sampled bands
+        avg_reference_similarities = torch.stack(reference_similarities).mean(dim=0)  # [B]
+
+        return avg_reference_similarities
+
     def forward_loss_in_pixel_space(self, pred_pixels, original_input, mask, thickness_mask=None):
         """
-        Compute loss in pixel space with two diversity penalties:
+        Compute loss in pixel space with two diversity penalties with improved memory management:
         1. Intra-patch variance loss - penalizes patches that are too uniform internally
         2. Inter-patch diversity loss - penalizes when masked patches are more similar to each other than unmasked ones
         """
@@ -1136,8 +1291,8 @@ class MultiModalSpectralGPT(nn.Module):
             patch_h, patch_w = self.patch_size
 
             # Initialize diversity losses
-            intra_patch_div_loss = 0.0  # Variance within patches (existing)
-            inter_patch_div_loss = 0.0  # Diversity between patches (new)
+            intra_patch_div_loss = 0.0  # Variance within patches
+            inter_patch_div_loss = 0.0  # Diversity between patches
             bands_processed = 0
 
             # Process a subset of bands to save computation (e.g., every 5th band)
@@ -1145,9 +1300,9 @@ class MultiModalSpectralGPT(nn.Module):
 
             for t in range(0, T, band_step):
                 # Get current spectral band
-                orig_band = original_input[:, :, t]  # [B, C, H, W]
-                pred_band = pred_pixels[:, :, t]
-                mask_band = final_mask[:, t] if final_mask.dim() >= 3 else final_mask  # [B, H, W]
+                orig_band = original_input[:, :, t].detach()  # [B, C, H, W]
+                pred_band = pred_pixels[:, :, t].detach()
+                mask_band = final_mask[:, t].detach() if final_mask.dim() >= 3 else final_mask.detach()  # [B, H, W]
 
                 # Invert mask to get unmasked regions (0 = masked, 1 = visible)
                 unmasked = 1.0 - mask_band
@@ -1184,40 +1339,20 @@ class MultiModalSpectralGPT(nn.Module):
                 # A patch is considered masked if majority of pixels are masked
                 patch_mask = (torch.mean(mask_patches, dim=2) > 0.5).float()  # [B, 1, num_patches]
 
-                # INTRA-PATCH DIVERSITY (EXISTING CODE)
+                # Clean up intermediate tensors
+                del mask_patches, mask_band_reshaped
+                torch.cuda.empty_cache()
+
+                # INTRA-PATCH DIVERSITY
                 # Calculate reference variance from unmasked patches
                 unmasked_patches = 1.0 - patch_mask
 
-                # Safe calculation of reference variance (avoid division by zero)
-                # Use sampling approach:
-                max_samples = 100  # Number of samples to use
-                reference_variances = []
-
-                for b in range(B):
-                    # Get indices of unmasked patches for this batch
-                    unmasked_indices = torch.where(unmasked_patches[b, 0] > 0.5)[0]
-
-                    # Skip if we don't have enough unmasked patches
-                    if len(unmasked_indices) < 5:  # Need some minimum number
-                        # Fallback to using all available unmasked patches
-                        batch_vars = orig_var[b, :, unmasked_indices]
-                        batch_ref_var = batch_vars.mean(dim=1, keepdim=True)
-                    else:
-                        # Sample subset of unmasked patches
-                        num_samples = min(max_samples, len(unmasked_indices))
-                        sampled_indices = unmasked_indices[torch.randperm(len(unmasked_indices))[:num_samples]]
-
-                        # Calculate mean variance of sampled patches
-                        batch_vars = orig_var[b, :, sampled_indices]
-                        batch_ref_var = batch_vars.mean(dim=1, keepdim=True)
-
-                    reference_variances.append(batch_ref_var)
-
-                # Stack the reference variances for all batches
-                reference_variance = torch.stack(reference_variances, dim=0)  # [B, C, 1]
+                # Reference variance calculation with memory management
+                reference_variance = self._calculate_reference_variance(
+                    orig_var, unmasked_patches, B
+                )  # [B, C, 1]
 
                 # Set adaptive threshold as percentage of reference variance
-                # Allow natural uniformity but catch suspicious uniformity
                 threshold_ratio = 0.2  # Patches can be 20% as uniform as reference
                 min_variance_threshold = reference_variance * threshold_ratio
 
@@ -1233,11 +1368,21 @@ class MultiModalSpectralGPT(nn.Module):
                 num_masked_patches = patch_mask.sum() + 1e-6
                 band_intra_div_loss = band_intra_div_loss / num_masked_patches
 
-                # INTER-PATCH DIVERSITY (NEW CODE)
-                # Calculate diversity between patches for this band
-                band_inter_div_loss = self.calculate_inter_patch_diversity_loss(
+                # Clean up intermediate tensors
+                del variance_deficit, too_uniform, min_variance_threshold
+                torch.cuda.empty_cache()
+
+                # INTER-PATCH DIVERSITY
+                # Calculate diversity between patches for this band using memory-optimized function
+                band_inter_div_loss = self._calculate_inter_patch_diversity_loss_optimized(
                     orig_patches, pred_patches, patch_mask
                 )
+
+                # Clean up large tensor variables
+                del orig_patches, pred_patches, patch_mask
+                del orig_band, pred_band, mask_band, orig_band_flat, pred_band_flat
+                del orig_var, pred_var, reference_variance, unmasked_patches
+                torch.cuda.empty_cache()
 
                 # Accumulate diversity losses across bands
                 intra_patch_div_loss += band_intra_div_loss
@@ -1262,6 +1407,10 @@ class MultiModalSpectralGPT(nn.Module):
                       f"Intra-Patch Div Loss: {intra_patch_div_loss.item():.6f}, "
                       f"Inter-Patch Div Loss: {inter_patch_div_loss.item():.6f}")
 
+            # Clean up large tensor variables
+            del pixel_mask, pixel_mse, final_mask
+            torch.cuda.empty_cache()
+
             # Return dictionary with all loss components for tracking
             return {
                 'total_loss': total_loss,
@@ -1269,6 +1418,199 @@ class MultiModalSpectralGPT(nn.Module):
                 'intra_patch_div_loss': intra_patch_div_loss,
                 'inter_patch_div_loss': inter_patch_div_loss
             }
+
+    def _calculate_reference_variance(self, orig_var, unmasked_patches, batch_size):
+        """
+        Memory-optimized helper function to calculate reference variance from unmasked patches.
+
+        Args:
+            orig_var: Variance of original patches [B, C, num_patches]
+            unmasked_patches: Mask of unmasked patches [B, 1, num_patches]
+            batch_size: Number of batches
+
+        Returns:
+            torch.Tensor: Reference variance [B, C, 1]
+        """
+        max_samples = 100  # Number of samples to use
+        reference_variances = []
+
+        # Process one batch at a time
+        for b in range(batch_size):
+            # Get indices of unmasked patches for this batch
+            unmasked_indices = torch.where(unmasked_patches[b, 0] > 0.5)[0]
+
+            # Skip if we don't have enough unmasked patches
+            if len(unmasked_indices) < 5:  # Need some minimum number
+                # Fallback to using all available unmasked patches
+                if len(unmasked_indices) > 0:
+                    batch_vars = orig_var[b, :, unmasked_indices]
+                    batch_ref_var = batch_vars.mean(dim=1, keepdim=True)
+                else:
+                    # If no unmasked patches, use a default value
+                    batch_ref_var = torch.tensor([0.01], device=orig_var.device).view(1, 1)
+            else:
+                # Sample subset of unmasked patches
+                num_samples = min(max_samples, len(unmasked_indices))
+                sampled_indices = unmasked_indices[
+                    torch.randperm(len(unmasked_indices), device=unmasked_indices.device)[:num_samples]]
+
+                # Calculate mean variance of sampled patches
+                batch_vars = orig_var[b, :, sampled_indices]
+                batch_ref_var = batch_vars.mean(dim=1, keepdim=True)
+
+                # Clean up
+                del sampled_indices, batch_vars
+
+            reference_variances.append(batch_ref_var)
+            del unmasked_indices
+
+        # Stack the reference variances for all batches
+        reference_variance = torch.stack(reference_variances, dim=0)  # [B, C, 1]
+        del reference_variances
+
+        return reference_variance
+
+    def _calculate_inter_patch_diversity_loss_optimized(self, orig_patches, pred_patches, patch_mask):
+        """
+        Memory-optimized implementation of inter-patch diversity loss calculation.
+
+        Args:
+            orig_patches: Original patches tensor [B, C, patch_pixels, num_patches]
+            pred_patches: Predicted patches tensor [B, C, patch_pixels, num_patches]
+            patch_mask: Mask indicating masked patches [B, 1, num_patches]
+
+        Returns:
+            torch.Tensor: Inter-patch diversity loss
+        """
+        B, C, pixels_per_patch, num_patches = orig_patches.shape
+        device = orig_patches.device
+
+        # We'll use cosine similarity to measure patch similarity
+        # First, normalize patches along pixel dimension - use in-place operations where possible
+        orig_patches_norm = F.normalize(orig_patches, p=2, dim=2)  # [B, C, patch_pixels, num_patches]
+        pred_patches_norm = F.normalize(pred_patches, p=2, dim=2)  # [B, C, patch_pixels, num_patches]
+
+        # Get unmasked patches mask (0 = masked, 1 = visible)
+        unmasked_patches = 1.0 - patch_mask  # [B, 1, num_patches]
+
+        # Sample pairs of patches for diversity calculation
+        max_samples = min(50, num_patches // 2)  # Reduced from 100 to 50 for memory efficiency
+
+        # Initialize accumulator for batch diversity losses
+        total_batch_div_loss = 0.0
+        valid_batches = 0
+
+        # Process one batch at a time to save memory
+        for b in range(B):
+            try:
+                # Get indices of masked and unmasked patches for this batch
+                masked_indices = torch.where(patch_mask[b, 0] > 0.5)[0]
+                unmasked_indices = torch.where(unmasked_patches[b, 0] > 0.5)[0]
+
+                # Skip if we don't have enough patches
+                if len(unmasked_indices) < 2 or len(masked_indices) < 2:
+                    continue
+
+                # Process original unmasked patches - compute pairwise similarities
+                orig_mean_sim = self._compute_patch_similarity(
+                    orig_patches_norm[b], unmasked_indices, max_samples, C, device
+                )
+
+                # Process predicted masked patches - compute pairwise similarities
+                pred_mean_sim = self._compute_patch_similarity(
+                    pred_patches_norm[b], masked_indices, max_samples, C, device
+                )
+
+                # Calculate inter-patch diversity loss - use a margin
+                margin = 0.1
+                diversity_threshold = orig_mean_sim + margin
+
+                # Penalize if reconstructed patches are too similar
+                batch_div_loss = torch.clamp(pred_mean_sim - diversity_threshold, min=0.0)
+                total_batch_div_loss += batch_div_loss
+                valid_batches += 1
+
+                # Clean up
+                del masked_indices, unmasked_indices
+                del orig_mean_sim, pred_mean_sim, diversity_threshold, batch_div_loss
+
+            except Exception as e:
+                print(f"Error in batch {b} diversity calculation: {e}")
+                continue
+
+        # Compute final loss
+        if valid_batches > 0:
+            inter_patch_div_loss = total_batch_div_loss / valid_batches
+        else:
+            inter_patch_div_loss = torch.tensor(0.0, device=device)
+
+        # Clean up
+        del total_batch_div_loss, unmasked_patches
+        torch.cuda.empty_cache()
+
+        return inter_patch_div_loss
+
+    def _compute_patch_similarity(self, patches_norm, indices, max_samples, num_channels, device):
+        """
+        Helper function to compute average similarity between patches.
+        Uses sampling and processes in small batches to save memory.
+
+        Args:
+            patches_norm: Normalized patches [C, patch_pixels, num_patches]
+            indices: Indices of patches to consider
+            max_samples: Maximum number of patch pairs to sample
+            num_channels: Number of channels
+            device: Current device
+
+        Returns:
+            torch.Tensor: Mean similarity between patches
+        """
+        # Sample pairs from provided indices
+        num_pairs = min(max_samples, len(indices) // 2 * 2)
+
+        if num_pairs < 2:
+            return torch.tensor(0.5, device=device)
+
+        # Create random permutation of indices and take pairs
+        sampled = indices[torch.randperm(len(indices), device=device)[:num_pairs]]
+        pairs = sampled.reshape(-1, 2)  # Reshape to pairs
+
+        # For memory efficiency, process in smaller batches of pairs
+        batch_size = 10  # Process 10 pairs at a time
+        total_sim = 0.0
+        num_processed = 0
+
+        for start_idx in range(0, len(pairs), batch_size):
+            end_idx = min(start_idx + batch_size, len(pairs))
+            batch_pairs = pairs[start_idx:end_idx]
+
+            batch_sims = []
+            for i, j in batch_pairs:
+                # Calculate cosine similarity between this pair
+                sim = F.cosine_similarity(
+                    patches_norm[:, :, i].view(num_channels, -1),
+                    patches_norm[:, :, j].view(num_channels, -1),
+                    dim=1
+                ).mean()  # Average over channels
+                batch_sims.append(sim)
+
+            # Accumulate similarity for this batch
+            if batch_sims:
+                batch_mean = torch.stack(batch_sims).mean()
+                total_sim += batch_mean.item() * len(batch_sims)
+                num_processed += len(batch_sims)
+
+                # Clean up
+                del batch_sims, batch_mean
+
+        # Clean up
+        del sampled, pairs
+
+        # Return mean similarity
+        if num_processed > 0:
+            return torch.tensor(total_sim / num_processed, device=device)
+        else:
+            return torch.tensor(0.5, device=device)
 
     def forward(self, hsi_img, aux_data=None, batch_idx=None):
         """Forward pass through the full model with direct pixel prediction."""
@@ -1288,7 +1630,7 @@ class MultiModalSpectralGPT(nn.Module):
         # Create unmasked embeddings for contrastive learning
         unmasked_features = None
         if aux_data is not None and batch_idx is not None:
-            with torch.cuda.amp.autocast(enabled=True):
+            with torch.amp.autocast('cuda', enabled=True):
                 unmasked_features = self.patch_embed(hsi_img)
                 B, T, HW, D = unmasked_features.shape
                 unmasked_features = unmasked_features.reshape(B, T * HW, D)
@@ -1305,7 +1647,7 @@ class MultiModalSpectralGPT(nn.Module):
             thickness_mask = thickness_mask.to(device)
 
         # Encode with masking for reconstruction
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=True):
             latent, mask, ids_restore = self.forward_encoder(hsi_img, aux_data)
 
             # Decode and reconstruct
@@ -1343,7 +1685,7 @@ class MultiModalSpectralGPT(nn.Module):
 
             # Only compute contrastive loss if at least one modality is available
             if num_available > 0:
-                with torch.cuda.amp.autocast(enabled=True):
+                with torch.amp.autocast('cuda', enabled=True):
                     if self.contrastive_mode == 'global':
                         aux_embeddings = self.encode_auxiliary(aux_data)
                         loss_contrast = self.contrastive_loss_global(unmasked_features, aux_embeddings, batch_idx,

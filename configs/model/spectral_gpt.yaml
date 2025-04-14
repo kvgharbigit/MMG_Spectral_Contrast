@@ -25,8 +25,8 @@ contrastive_mode: global
 use_thickness_mask: true
 
 # Diversity loss weights
-intra_div_weight: 0.01  # Weight for intra-patch diversity loss
-inter_div_weight: 0.01  # Weight for inter-patch diversity loss
+intra_div_weight: 5000  # Weight for intra-patch diversity loss
+inter_div_weight: 0.05  # Weight for inter-patch diversity loss
 
 # Loss weights
 loss_weights:

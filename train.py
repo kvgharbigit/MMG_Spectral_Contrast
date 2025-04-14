@@ -409,18 +409,12 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
             'loss': f"{loss.item():.6f}",  # Total loss from the model
             'recon': f"{output['loss_recon'].item():.6f}",
             'contrast': f"{output['loss_contrast'].item():.6f}",
+            'mse': f"{output['mse_loss'].item():.6f}",  # Add MSE loss display
             'lr': f"{current_lr:.6f}",
             'intra_div': f"{output['intra_patch_div_loss'].item():.6f}",
             'inter_div': f"{output['inter_patch_div_loss'].item():.6f}",
             'total_div': f"{(output['intra_patch_div_loss'].item() + output['inter_patch_div_loss'].item()):.6f}"
-            # New term
         }
-
-        # Add diversity losses to progress bar if available
-        if 'intra_patch_div_loss' in output:
-            pbar_info['intra_div'] = f"{output['intra_patch_div_loss'].item():.6f}"
-        if 'inter_patch_div_loss' in output:
-            pbar_info['inter_div'] = f"{output['inter_patch_div_loss'].item():.6f}"
 
         pbar.set_postfix(pbar_info)
 
@@ -457,6 +451,7 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
             # Forward pass with AMP
             with torch.cuda.amp.autocast():
                 output = model(hsi, aux_data, batch_idx_tensor)
+                loss = output['loss']
 
             # Store only required outputs as scalars (not tensors) to save memory
             batch_output = {
@@ -476,28 +471,24 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
 
             outputs.append(batch_output)
 
+            # Get current learning rate for progress bar
+            current_lr = optimizer.param_groups[0]['lr'] if 'optimizer' in locals() else 0.0
+
             # Update progress bar with more detailed information
             pbar_info = {
                 'loss': f"{loss.item():.6f}",  # Total loss from the model
                 'recon': f"{output['loss_recon'].item():.6f}",
                 'contrast': f"{output['loss_contrast'].item():.6f}",
-                'lr': f"{current_lr:.6f}",
+                'mse': f"{output['mse_loss'].item():.6f}",  # Add MSE loss display
                 'intra_div': f"{output['intra_patch_div_loss'].item():.6f}",
                 'inter_div': f"{output['inter_patch_div_loss'].item():.6f}",
                 'total_div': f"{(output['intra_patch_div_loss'].item() + output['inter_patch_div_loss'].item()):.6f}"
-                # New term
             }
-
-            # Add diversity losses to progress bar if available
-            if 'intra_patch_div_loss' in output:
-                pbar_info['intra_div'] = f"{output['intra_patch_div_loss'].item():.6f}"
-            if 'inter_patch_div_loss' in output:
-                pbar_info['inter_div'] = f"{output['inter_patch_div_loss'].item():.6f}"
 
             pbar.set_postfix(pbar_info)
 
             # Delete intermediate tensors to free memory
-            del hsi, aux_data, batch_idx_tensor, output
+            del hsi, aux_data, batch_idx_tensor, output, loss
 
             # Clear cache occasionally
             if batch_idx % 10 == 0:
