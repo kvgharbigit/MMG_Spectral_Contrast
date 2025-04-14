@@ -406,10 +406,14 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
 
         # Update progress bar with more detailed loss information
         pbar_info = {
-            'loss': f"{loss.item():.6f}",
+            'loss': f"{loss.item():.6f}",  # Total loss from the model
             'recon': f"{output['loss_recon'].item():.6f}",
             'contrast': f"{output['loss_contrast'].item():.6f}",
-            'lr': f"{current_lr:.6f}"
+            'lr': f"{current_lr:.6f}",
+            'intra_div': f"{output['intra_patch_div_loss'].item():.6f}",
+            'inter_div': f"{output['inter_patch_div_loss'].item():.6f}",
+            'total_div': f"{(output['intra_patch_div_loss'].item() + output['inter_patch_div_loss'].item()):.6f}"
+            # New term
         }
 
         # Add diversity losses to progress bar if available
@@ -474,9 +478,14 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
 
             # Update progress bar with more detailed information
             pbar_info = {
-                'loss': f"{output['loss'].item():.6f}",
+                'loss': f"{loss.item():.6f}",  # Total loss from the model
                 'recon': f"{output['loss_recon'].item():.6f}",
-                'contrast': f"{output['loss_contrast'].item():.6f}"
+                'contrast': f"{output['loss_contrast'].item():.6f}",
+                'lr': f"{current_lr:.6f}",
+                'intra_div': f"{output['intra_patch_div_loss'].item():.6f}",
+                'inter_div': f"{output['inter_patch_div_loss'].item():.6f}",
+                'total_div': f"{(output['intra_patch_div_loss'].item() + output['inter_patch_div_loss'].item()):.6f}"
+                # New term
             }
 
             # Add diversity losses to progress bar if available
