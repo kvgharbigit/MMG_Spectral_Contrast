@@ -1255,6 +1255,8 @@ class MultiModalSpectralGPT(nn.Module):
         Compute loss in pixel space with two diversity penalties with improved memory management:
         1. Intra-patch variance loss - penalizes patches that are too uniform internally
         2. Inter-patch diversity loss - penalizes when masked patches are more similar to each other than unmasked ones
+
+        With improved error handling and robust reference value tracking
         """
         with torch.cuda.amp.autocast(enabled=True):
             # Get the device from input tensors
@@ -1262,6 +1264,10 @@ class MultiModalSpectralGPT(nn.Module):
 
             # Convert token mask to 3D pixel mask
             pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)  # [B, T, H, W]
+
+            # Debug: Check masking percentage
+            masked_percentage = pixel_mask.float().mean().item() * 100
+            print(f"Percentage of pixels masked: {masked_percentage:.2f}%")
 
             # Standard MSE calculation
             pixel_mse = ((pred_pixels - original_input) ** 2)
@@ -1274,6 +1280,10 @@ class MultiModalSpectralGPT(nn.Module):
                 else:
                     expanded_thickness = thickness_mask
 
+                # Calculate percentage of valid pixels in thickness mask
+                valid_thickness_percent = expanded_thickness.float().mean().item() * 100
+                print(f"Percentage of valid pixels in thickness mask: {valid_thickness_percent:.2f}%")
+
                 # Combine masks
                 combined_mask = pixel_mask * expanded_thickness
                 valid_pixel_count = combined_mask.sum() + 1e-6
@@ -1281,6 +1291,10 @@ class MultiModalSpectralGPT(nn.Module):
 
                 # Use this mask for diversity calculations
                 final_mask = combined_mask
+
+                # Debug: Check combined mask stats
+                combined_mask_percent = combined_mask.float().mean().item() * 100
+                print(f"Percentage of pixels used in loss calculation: {combined_mask_percent:.2f}%")
             else:
                 # Apply only pixel mask
                 masked_pixel_count = pixel_mask.sum() + 1e-6
@@ -1309,8 +1323,10 @@ class MultiModalSpectralGPT(nn.Module):
 
             # Process a subset of bands to save computation (e.g., every 5th band)
             band_step = max(1, T // 6)  # Process ~6 bands evenly spaced
+            print(f"Processing diversity for {T // band_step} bands with step {band_step}")
 
             for t in range(0, T, band_step):
+                print(f"Processing band {t}/{T}...")
                 # Get current spectral band
                 orig_band = original_input[:, :, t].detach()  # [B, C, H, W]
                 pred_band = pred_pixels[:, :, t].detach()
@@ -1351,6 +1367,11 @@ class MultiModalSpectralGPT(nn.Module):
                 # A patch is considered masked if majority of pixels are masked
                 patch_mask = (torch.mean(mask_patches, dim=2) > 0.5).float()  # [B, 1, num_patches]
 
+                # Debug mask statistics
+                num_masked_patches = patch_mask.sum().item()
+                patch_masked_percentage = (patch_mask.sum() / patch_mask.numel() * 100).item()
+                print(f"  Band {t}: {num_masked_patches} masked patches ({patch_masked_percentage:.2f}%)")
+
                 # Clean up intermediate tensors
                 del mask_patches, mask_band_reshaped
                 torch.cuda.empty_cache()
@@ -1364,23 +1385,63 @@ class MultiModalSpectralGPT(nn.Module):
                     orig_var, unmasked_patches, B
                 )  # [B, C, 1]
 
-                # Save reference variance for export
-                all_reference_variances.append(reference_variance.detach().clone())
+                # Debug reference variance
+                print(f"  Band {t}: Reference variance mean: {reference_variance.mean().item():.6f}")
+
+                # Check for invalid reference variance
+                if not torch.isfinite(reference_variance).all():
+                    raise ValueError(f"Band {t}: Reference variance contains non-finite values: {reference_variance}")
+
+                if reference_variance.mean().item() <= 0:
+                    raise ValueError(
+                        f"Band {t}: Reference variance mean is zero or negative: {reference_variance.mean().item()}")
+
+                # Save reference variance without try/except to allow errors to surface
+                reference_variance_detached = reference_variance.detach().clone()
+                all_reference_variances.append(reference_variance_detached)
+                print(
+                    f"  Band {t}: Added reference variance with mean: {reference_variance_detached.mean().item():.6f}")
 
                 # Calculate reconstructed variances (average variance of masked patches)
                 reconstructed_variance = self._calculate_reference_variance(
                     pred_var, patch_mask, B
                 )  # [B, C, 1]
 
-                # Save reconstructed variance for export
-                all_reconstructed_variances.append(reconstructed_variance.detach().clone())
+                # Debug reconstructed variance
+                print(f"  Band {t}: Reconstructed variance mean: {reconstructed_variance.mean().item():.6f}")
+
+                # Check for invalid reconstructed variance
+                if not torch.isfinite(reconstructed_variance).all():
+                    raise ValueError(
+                        f"Band {t}: Reconstructed variance contains non-finite values: {reconstructed_variance}")
+
+                # Save reconstructed variance without try/except to allow errors to surface
+                reconstructed_variance_detached = reconstructed_variance.detach().clone()
+                all_reconstructed_variances.append(reconstructed_variance_detached)
+                print(
+                    f"  Band {t}: Added reconstructed variance with mean: {reconstructed_variance_detached.mean().item():.6f}")
 
                 # Set adaptive threshold as percentage of reference variance
                 threshold_ratio = 0.2  # Patches can be 20% as uniform as reference
                 min_variance_threshold = reference_variance * threshold_ratio
 
-                # Save variance threshold for export
-                all_variance_thresholds.append(min_variance_threshold.detach().clone())
+                # Debug variance threshold
+                print(f"  Band {t}: Variance threshold mean: {min_variance_threshold.mean().item():.6f}")
+
+                # Check for invalid variance threshold
+                if not torch.isfinite(min_variance_threshold).all():
+                    raise ValueError(
+                        f"Band {t}: Variance threshold contains non-finite values: {min_variance_threshold}")
+
+                if min_variance_threshold.mean().item() <= 0:
+                    raise ValueError(
+                        f"Band {t}: Variance threshold mean is zero or negative: {min_variance_threshold.mean().item()}")
+
+                # Save variance threshold without try/except to allow errors to surface
+                variance_threshold_detached = min_variance_threshold.detach().clone()
+                all_variance_thresholds.append(variance_threshold_detached)
+                print(
+                    f"  Band {t}: Added variance threshold with mean: {variance_threshold_detached.mean().item():.6f}")
 
                 # Calculate variance deficit where prediction is too uniform
                 # Only apply to masked patches
@@ -1394,6 +1455,9 @@ class MultiModalSpectralGPT(nn.Module):
                 num_masked_patches = patch_mask.sum() + 1e-6
                 band_intra_div_loss = band_intra_div_loss / num_masked_patches
 
+                # Debug intra-patch diversity loss
+                print(f"  Band {t}: Intra-patch diversity loss: {band_intra_div_loss.item():.6f}")
+
                 # Clean up intermediate tensors
                 del variance_deficit, too_uniform, min_variance_threshold
                 torch.cuda.empty_cache()
@@ -1403,6 +1467,9 @@ class MultiModalSpectralGPT(nn.Module):
                 band_inter_div_loss = self._calculate_inter_patch_diversity_loss_optimized(
                     orig_patches, pred_patches, patch_mask
                 )
+
+                # Debug inter-patch diversity loss
+                print(f"  Band {t}: Inter-patch diversity loss: {band_inter_div_loss.item():.6f}")
 
                 # Calculate original unmasked patch similarities
                 orig_patches_flat = orig_patches.transpose(1, 2).reshape(B, patch_h * patch_w * C, -1)
@@ -1455,11 +1522,32 @@ class MultiModalSpectralGPT(nn.Module):
                     orig_mean_sim = orig_sum_sim / orig_count_sim
                     margin = 0.1
                     diversity_threshold = orig_mean_sim + margin
-                    all_diversity_thresholds.append(torch.tensor(diversity_threshold, device=device))
+
+                    # Debug diversity threshold
+                    print(f"  Band {t}: Diversity threshold: {diversity_threshold:.6f} (from {orig_count_sim} samples)")
+
+                    # Save diversity threshold for reporting - no try/except to allow failure to surface
+                    diversity_threshold_tensor = torch.tensor(diversity_threshold, device=device)
+                    all_diversity_thresholds.append(diversity_threshold_tensor)
+                    print(f"  Band {t}: Added diversity threshold: {diversity_threshold:.6f}")
+                else:
+                    raise ValueError(
+                        f"Band {t}: Not enough original unmasked patch pairs to calculate diversity threshold. This is critical for inter-patch diversity loss.")
 
                 if pred_count_sim > 0:
                     pred_mean_sim = pred_sum_sim / pred_count_sim
-                    all_reconstructed_similarities.append(torch.tensor(pred_mean_sim, device=device))
+
+                    # Debug reconstructed similarity
+                    print(f"  Band {t}: Reconstructed similarity: {pred_mean_sim:.6f} (from {pred_count_sim} samples)")
+
+                    # Save reconstructed similarity for reporting
+                    try:
+                        reconstructed_similarity_tensor = torch.tensor(pred_mean_sim, device=device)
+                        all_reconstructed_similarities.append(reconstructed_similarity_tensor)
+                    except Exception as e:
+                        print(f"  Error saving reconstructed similarity: {e}")
+                else:
+                    print(f"  Band {t}: Not enough reconstructed masked patch pairs for similarity")
 
                 # Clean up large tensor variables
                 del orig_patches, pred_patches, patch_mask
@@ -1495,21 +1583,176 @@ class MultiModalSpectralGPT(nn.Module):
             del pixel_mask, pixel_mse, final_mask
             torch.cuda.empty_cache()
 
-            # Calculate average reference values across all bands
-            mean_reference_variance = torch.mean(
-                torch.cat(all_reference_variances)) if all_reference_variances else torch.tensor(0.0, device=device)
-            mean_variance_threshold = torch.mean(
-                torch.cat(all_variance_thresholds)) if all_variance_thresholds else torch.tensor(0.0, device=device)
-            mean_diversity_threshold = torch.mean(
-                torch.stack(all_diversity_thresholds)) if all_diversity_thresholds else torch.tensor(0.0, device=device)
+            # ============= IMPROVED REFERENCE VALUE AGGREGATION =============
+            # Debug aggregation process
+            print(f"Aggregating reference values for reporting:")
+            print(f"  Reference variances: {len(all_reference_variances)} items")
+            print(f"  Variance thresholds: {len(all_variance_thresholds)} items")
+            print(f"  Diversity thresholds: {len(all_diversity_thresholds)} items")
+            print(f"  Reconstructed variances: {len(all_reconstructed_variances)} items")
+            print(f"  Reconstructed similarities: {len(all_reconstructed_similarities)} items")
 
-            # Calculate average reconstructed values across all bands
-            mean_reconstructed_variance = torch.mean(
-                torch.cat(all_reconstructed_variances)) if all_reconstructed_variances else torch.tensor(0.0,
-                                                                                                         device=device)
-            mean_reconstructed_similarity = torch.mean(
-                torch.stack(all_reconstructed_similarities)) if all_reconstructed_similarities else torch.tensor(0.0,
-                                                                                                                 device=device)
+            # Add tensor shape debugging if lists are not empty
+            if all_reference_variances:
+                print(f"  First reference variance shape: {all_reference_variances[0].shape}")
+            if all_variance_thresholds:
+                print(f"  First variance threshold shape: {all_variance_thresholds[0].shape}")
+            if all_diversity_thresholds:
+                print(f"  First diversity threshold shape: {all_diversity_thresholds[0].shape}")
+
+            # Initialize default values
+            mean_reference_variance = torch.tensor(0.0, device=device)
+            mean_variance_threshold = torch.tensor(0.0, device=device)
+            mean_diversity_threshold = torch.tensor(0.0, device=device)
+            mean_reconstructed_variance = torch.tensor(0.0, device=device)
+            mean_reconstructed_similarity = torch.tensor(0.0, device=device)
+
+            # Handle reference variance calculation - fail with informative errors
+            if not all_reference_variances:
+                raise ValueError(
+                    "Reference variance list is empty! This suggests that no valid reference variances were calculated during band processing. Check patch masking, thickness mask, and reference_variance calculation.")
+
+            try:
+                # Use a more robust approach for tensors that might have different shapes
+                flattened_values = []
+                for i, tensor in enumerate(all_reference_variances):
+                    if tensor is None:
+                        raise ValueError(f"Reference variance at index {i} is None!")
+                    if not torch.isfinite(tensor).all():
+                        raise ValueError(f"Reference variance at index {i} contains non-finite values: {tensor}")
+                    flattened_values.append(tensor.flatten())
+
+                all_values = torch.cat(flattened_values)
+                mean_reference_variance = all_values.mean()
+
+                if not torch.isfinite(mean_reference_variance):
+                    raise ValueError(f"Mean reference variance is not finite: {mean_reference_variance}")
+                if mean_reference_variance == 0:
+                    raise ValueError(
+                        "Mean reference variance is exactly zero! Check for numerical issues in reference variance calculation.")
+            except Exception as e:
+                detailed_error = f"Failed to calculate mean reference variance: {str(e)}\n"
+                detailed_error += f"Reference variance list length: {len(all_reference_variances)}\n"
+                if all_reference_variances:
+                    for i, v in enumerate(all_reference_variances[:3]):  # Show first 3 for debugging
+                        detailed_error += f"  Item {i}: shape={v.shape}, min={v.min().item()}, max={v.max().item()}, mean={v.mean().item()}\n"
+                raise RuntimeError(detailed_error)
+
+            # Handle variance threshold calculation - fail with informative errors
+            if not all_variance_thresholds:
+                raise ValueError(
+                    "Variance threshold list is empty! This suggests that no valid variance thresholds were calculated during band processing.")
+
+            try:
+                flattened_values = []
+                for i, tensor in enumerate(all_variance_thresholds):
+                    if tensor is None:
+                        raise ValueError(f"Variance threshold at index {i} is None!")
+                    if not torch.isfinite(tensor).all():
+                        raise ValueError(f"Variance threshold at index {i} contains non-finite values: {tensor}")
+                    flattened_values.append(tensor.flatten())
+
+                all_values = torch.cat(flattened_values)
+                mean_variance_threshold = all_values.mean()
+
+                if not torch.isfinite(mean_variance_threshold):
+                    raise ValueError(f"Mean variance threshold is not finite: {mean_variance_threshold}")
+                if mean_variance_threshold == 0:
+                    raise ValueError(
+                        "Mean variance threshold is exactly zero! Check threshold calculation in diversity loss.")
+            except Exception as e:
+                detailed_error = f"Failed to calculate mean variance threshold: {str(e)}\n"
+                detailed_error += f"Variance threshold list length: {len(all_variance_thresholds)}\n"
+                if all_variance_thresholds:
+                    for i, v in enumerate(all_variance_thresholds[:3]):  # Show first 3 for debugging
+                        detailed_error += f"  Item {i}: shape={v.shape}, min={v.min().item()}, max={v.max().item()}, mean={v.mean().item()}\n"
+                raise RuntimeError(detailed_error)
+
+            # Handle diversity threshold calculation - fail with informative errors
+            if not all_diversity_thresholds:
+                raise ValueError(
+                    "Diversity threshold list is empty! This suggests that no valid diversity thresholds were calculated. Check unmasked patch pairwise similarity calculations.")
+
+            try:
+                for i, tensor in enumerate(all_diversity_thresholds):
+                    if tensor is None:
+                        raise ValueError(f"Diversity threshold at index {i} is None!")
+                    if not torch.isfinite(tensor).all():
+                        raise ValueError(f"Diversity threshold at index {i} contains non-finite values: {tensor}")
+
+                mean_diversity_threshold = torch.stack(all_diversity_thresholds).mean()
+
+                if not torch.isfinite(mean_diversity_threshold):
+                    raise ValueError(f"Mean diversity threshold is not finite: {mean_diversity_threshold}")
+                if mean_diversity_threshold == 0:
+                    raise ValueError(
+                        "Mean diversity threshold is exactly zero! Check similarity calculations in diversity loss.")
+            except Exception as e:
+                detailed_error = f"Failed to calculate mean diversity threshold: {str(e)}\n"
+                detailed_error += f"Diversity threshold list length: {len(all_diversity_thresholds)}\n"
+                if all_diversity_thresholds:
+                    for i, v in enumerate(all_diversity_thresholds[:3]):  # Show first 3 for debugging
+                        detailed_error += f"  Item {i}: shape={v}, value={v.item() if v.numel() == 1 else v}\n"
+                raise RuntimeError(detailed_error)
+
+            # Handle reconstructed variance calculation - fail with informative errors
+            if not all_reconstructed_variances:
+                raise ValueError(
+                    "Reconstructed variance list is empty! This suggests that no valid reconstructed variances were calculated during band processing.")
+
+            try:
+                flattened_values = []
+                for i, tensor in enumerate(all_reconstructed_variances):
+                    if tensor is None:
+                        raise ValueError(f"Reconstructed variance at index {i} is None!")
+                    if not torch.isfinite(tensor).all():
+                        raise ValueError(f"Reconstructed variance at index {i} contains non-finite values: {tensor}")
+                    flattened_values.append(tensor.flatten())
+
+                all_values = torch.cat(flattened_values)
+                mean_reconstructed_variance = all_values.mean()
+
+                if not torch.isfinite(mean_reconstructed_variance):
+                    raise ValueError(f"Mean reconstructed variance is not finite: {mean_reconstructed_variance}")
+            except Exception as e:
+                detailed_error = f"Failed to calculate mean reconstructed variance: {str(e)}\n"
+                detailed_error += f"Reconstructed variance list length: {len(all_reconstructed_variances)}\n"
+                if all_reconstructed_variances:
+                    for i, v in enumerate(all_reconstructed_variances[:3]):  # Show first 3 for debugging
+                        detailed_error += f"  Item {i}: shape={v.shape}, min={v.min().item()}, max={v.max().item()}, mean={v.mean().item()}\n"
+                raise RuntimeError(detailed_error)
+
+            # Handle reconstructed similarity calculation - fail with informative errors
+            if not all_reconstructed_similarities:
+                raise ValueError(
+                    "Reconstructed similarity list is empty! This suggests that no valid reconstructed similarities were calculated during band processing.")
+
+            try:
+                for i, tensor in enumerate(all_reconstructed_similarities):
+                    if tensor is None:
+                        raise ValueError(f"Reconstructed similarity at index {i} is None!")
+                    if not torch.isfinite(tensor).all():
+                        raise ValueError(f"Reconstructed similarity at index {i} contains non-finite values: {tensor}")
+
+                mean_reconstructed_similarity = torch.stack(all_reconstructed_similarities).mean()
+
+                if not torch.isfinite(mean_reconstructed_similarity):
+                    raise ValueError(f"Mean reconstructed similarity is not finite: {mean_reconstructed_similarity}")
+            except Exception as e:
+                detailed_error = f"Failed to calculate mean reconstructed similarity: {str(e)}\n"
+                detailed_error += f"Reconstructed similarity list length: {len(all_reconstructed_similarities)}\n"
+                if all_reconstructed_similarities:
+                    for i, v in enumerate(all_reconstructed_similarities[:3]):  # Show first 3 for debugging
+                        detailed_error += f"  Item {i}: shape={v.shape if hasattr(v, 'shape') else 'scalar'}, value={v.item() if hasattr(v, 'item') else v}\n"
+                raise RuntimeError(detailed_error)
+
+            # Print the final aggregated values
+            print(f"Final aggregated values:")
+            print(f"  Mean reference variance: {mean_reference_variance.item():.6f}")
+            print(f"  Mean variance threshold: {mean_variance_threshold.item():.6f}")
+            print(f"  Mean diversity threshold: {mean_diversity_threshold.item():.6f}")
+            print(f"  Mean reconstructed variance: {mean_reconstructed_variance.item():.6f}")
+            print(f"  Mean reconstructed similarity: {mean_reconstructed_similarity.item():.6f}")
 
             # Return dictionary with all loss components and diversity values for tracking
             return {
