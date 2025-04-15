@@ -410,13 +410,25 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
             'num_modalities': output['num_modalities'].detach().item()
         }
 
-        # Add the new loss components if available
+        # Add the loss components if available
         if 'mse_loss' in output:
             batch_output['mse_loss'] = output['mse_loss'].detach().item()
         if 'intra_patch_div_loss' in output:
             batch_output['intra_patch_div_loss'] = output['intra_patch_div_loss'].detach().item()
         if 'inter_patch_div_loss' in output:
             batch_output['inter_patch_div_loss'] = output['inter_patch_div_loss'].detach().item()
+
+        # ADD THESE LINES - Collect the reference values
+        if 'reference_variance' in output:
+            batch_output['reference_variance'] = output['reference_variance'].detach().item()
+        if 'variance_threshold' in output:
+            batch_output['variance_threshold'] = output['variance_threshold'].detach().item()
+        if 'diversity_threshold' in output:
+            batch_output['diversity_threshold'] = output['diversity_threshold'].detach().item()
+        if 'reconstructed_variance' in output:
+            batch_output['reconstructed_variance'] = output['reconstructed_variance'].detach().item()
+        if 'reconstructed_similarity' in output:
+            batch_output['reconstructed_similarity'] = output['reconstructed_similarity'].detach().item()
 
         outputs.append(batch_output)
 
@@ -480,13 +492,25 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
                 'num_modalities': output['num_modalities'].detach().item()
             }
 
-            # Add the new loss components if available
+            # Add the loss components if available
             if 'mse_loss' in output:
                 batch_output['mse_loss'] = output['mse_loss'].detach().item()
             if 'intra_patch_div_loss' in output:
                 batch_output['intra_patch_div_loss'] = output['intra_patch_div_loss'].detach().item()
             if 'inter_patch_div_loss' in output:
                 batch_output['inter_patch_div_loss'] = output['inter_patch_div_loss'].detach().item()
+
+            # ADD THESE LINES - Collect the reference values
+            if 'reference_variance' in output:
+                batch_output['reference_variance'] = output['reference_variance'].detach().item()
+            if 'variance_threshold' in output:
+                batch_output['variance_threshold'] = output['variance_threshold'].detach().item()
+            if 'diversity_threshold' in output:
+                batch_output['diversity_threshold'] = output['diversity_threshold'].detach().item()
+            if 'reconstructed_variance' in output:
+                batch_output['reconstructed_variance'] = output['reconstructed_variance'].detach().item()
+            if 'reconstructed_similarity' in output:
+                batch_output['reconstructed_similarity'] = output['reconstructed_similarity'].detach().item()
 
             outputs.append(batch_output)
 

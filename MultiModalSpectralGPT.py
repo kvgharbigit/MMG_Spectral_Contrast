@@ -1422,7 +1422,7 @@ class MultiModalSpectralGPT(nn.Module):
                     f"  Band {t}: Added reconstructed variance with mean: {reconstructed_variance_detached.mean().item():.6f}")
 
                 # Set adaptive threshold as percentage of reference variance
-                threshold_ratio = 0.2  # Patches can be 20% as uniform as reference
+                threshold_ratio = 0.4  # Patches are permitted to have as low as 40% as variance as reference
                 min_variance_threshold = reference_variance * threshold_ratio
 
                 # Debug variance threshold
