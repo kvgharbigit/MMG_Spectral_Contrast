@@ -1068,7 +1068,10 @@ def save_training_summary(cfg, output_dir):
             f.write(f"Temperature: {cfg.model.temperature}\n")
             f.write(f"Mask Ratio: {cfg.model.mask_ratio}\n")
             f.write(f"Contrastive Mode: {cfg.model.contrastive_mode}\n")
-            f.write(f"Using Thickness Mask: {cfg.model.use_thickness_mask}\n\n")
+            f.write(f"Using Thickness Mask: {cfg.model.use_thickness_mask}\n")
+            # Add the diversity loss weights to the summary
+            f.write(f"Intra-patch Diversity Loss Weight: {cfg.model.intra_div_weight}\n")
+            f.write(f"Inter-patch Diversity Loss Weight: {cfg.model.inter_div_weight}\n\n")
 
             # Optimizer Configuration
             f.write("OPTIMIZER CONFIGURATION\n")
