@@ -2010,6 +2010,18 @@ class MultiModalSpectralGPT(nn.Module):
             # Unpatchify to pixel space directly
             reconstructed_pixels = self.unpatchify(pred_tokens_reshaped, original_input.shape)
 
+            # Convert token mask to pixel mask (1 where masked, 0 where visible)
+            pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)
+
+            # Create inverse mask (1 where visible, 0 where masked)
+            inverse_pixel_mask = 1.0 - pixel_mask
+
+            # Combine original (unmasked) and reconstructed (masked) pixels
+            combined_reconstruction = (reconstructed_pixels * pixel_mask) + (original_input * inverse_pixel_mask)
+
+            # Replace the reconstructed_pixels with the combined version
+            reconstructed_pixels = combined_reconstruction
+
             # Calculate reconstruction losses (now returns a dictionary with all loss components)
             losses = self.forward_loss_in_pixel_space(
                 reconstructed_pixels,
@@ -2067,7 +2079,7 @@ class MultiModalSpectralGPT(nn.Module):
             'thickness_mask': thickness_mask,
             'contrastive_mode': self.contrastive_mode,
             'original_input': original_input,
-            'reconstructed_pixels': reconstructed_pixels,
+            'reconstructed_pixels': reconstructed_pixels,  # This should now be the combined version
             'reference_variance': reference_variance,
             'variance_threshold': variance_threshold,
             'diversity_threshold': diversity_threshold,
