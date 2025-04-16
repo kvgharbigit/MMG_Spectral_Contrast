@@ -56,32 +56,33 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
 
-def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr):
+def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr, use_warmup=True):
     """
-    Creates a learning rate schedule with linear warmup and cosine decay.
+    Creates a learning rate schedule with optional linear warmup and cosine decay.
 
     Args:
         optimizer: The optimizer to use
-        warmup_steps: Number of warmup steps
+        warmup_steps: Number of warmup steps (ignored if use_warmup is False)
         total_steps: Total number of training steps
         min_lr: Minimum learning rate at the end of training
         base_lr: Base learning rate after warmup
+        use_warmup: Whether to use warmup phase (if False, starts directly at base_lr)
 
     Returns:
         LambdaLR scheduler
     """
 
     def lr_lambda(current_step):
-        # Special case for no warmup
-        if warmup_steps == 0:
+        if not use_warmup:
+            # Simple cosine decay from base_lr to min_lr without warmup
             progress = float(current_step) / float(max(1, total_steps))
             cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             return max(min_lr / base_lr, cosine_decay)
-        # Linear warmup phase
         elif current_step < warmup_steps:
+            # Linear warmup phase
             return float(current_step) / float(max(1, warmup_steps))
-        # Cosine decay phase
         else:
+            # Cosine decay phase
             progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
             cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
             return max(min_lr / base_lr, cosine_decay)
@@ -369,8 +370,9 @@ def check_early_stopping(val_losses, patience, min_delta=0.0):
     return (best_loss - recent_best) < min_delta
 
 
-def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
-    """Train the model for one epoch with optimized AMP."""
+def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None, scheduler=None,
+                scheduler_step_frequency=None):
+    """Train the model for one epoch with optimized AMP. Now accepts scheduler parameters."""
     model.train()
     outputs = []
     scaler = torch.amp.GradScaler()  # Create gradient scaler for mixed precision
@@ -406,6 +408,10 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
         # Update weights with scaler
         scaler.step(optimizer)
         scaler.update()
+
+        # Update scheduler if it's batch-based
+        if scheduler is not None and scheduler_step_frequency == "batch":
+            scheduler.step()
 
         # Store only required outputs as scalars (not tensors) to save memory
         batch_output = {
@@ -804,13 +810,16 @@ def main(cfg: DictConfig):
     )
 
     # Create learning rate scheduler
+    # Create learning rate scheduler
     scheduler_step_frequency = "epoch"  # Default
     if cfg.scheduler.use_scheduler:
         if cfg.scheduler.type == "cosine":
-            # Check if warmup is enabled through config
-            if hasattr(cfg.scheduler, 'warmup_ratio') and cfg.scheduler.warmup_ratio > 0:
+            # Check if warmup is explicitly enabled through config
+            use_warmup = cfg.scheduler.get('use_warmup', False)  # Default to False if not specified
+            warmup_ratio = cfg.scheduler.get('warmup_ratio', 0.0)  # Default to 0 if not specified
+
+            if use_warmup and warmup_ratio > 0:
                 # Calculate warmup steps
-                warmup_ratio = cfg.scheduler.warmup_ratio
                 warmup_steps = int(warmup_ratio * cfg.training.epochs * len(train_loader))
                 total_steps = cfg.training.epochs * len(train_loader)
 
@@ -820,16 +829,22 @@ def main(cfg: DictConfig):
                     warmup_steps=warmup_steps,
                     total_steps=total_steps,
                     min_lr=cfg.scheduler.min_lr,
-                    base_lr=cfg.optimizer.lr
+                    base_lr=cfg.optimizer.lr,
+                    use_warmup=True
                 )
                 scheduler_step_frequency = "batch"
             else:
-                # Standard cosine scheduler without warmup
-                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                # Cosine scheduler without warmup
+                total_steps = cfg.training.epochs * len(train_loader)
+                scheduler = get_warmup_cosine_schedule(
                     optimizer,
-                    T_max=cfg.training.epochs,
-                    eta_min=cfg.scheduler.min_lr
+                    warmup_steps=0,
+                    total_steps=total_steps,
+                    min_lr=cfg.scheduler.min_lr,
+                    base_lr=cfg.optimizer.lr,
+                    use_warmup=False
                 )
+                scheduler_step_frequency = "batch" if cfg.scheduler.get('step_every_batch', True) else "epoch"
         elif cfg.scheduler.type == "step":
             scheduler = torch.optim.lr_scheduler.StepLR(
                 optimizer,
@@ -885,7 +900,9 @@ def main(cfg: DictConfig):
         # Training phase
         train_outputs = train_epoch(
             model, train_loader, optimizer, device,
-            contrastive_mode=cfg.model.contrastive_mode
+            contrastive_mode=cfg.model.contrastive_mode,
+            scheduler=scheduler if scheduler_step_frequency == "batch" else None,
+            scheduler_step_frequency=scheduler_step_frequency
         )
         train_metrics = calculate_metrics(train_outputs, optimizer)
 
@@ -1063,6 +1080,7 @@ def save_training_summary(cfg, output_dir):
             f.write(f"Beta2: {cfg.optimizer.beta2}\n\n")
 
             # Scheduler Configuration
+
             if cfg.scheduler.use_scheduler:
                 f.write("LEARNING RATE SCHEDULER\n")
                 f.write("-" * 50 + "\n")
@@ -1071,8 +1089,18 @@ def save_training_summary(cfg, output_dir):
                 # Write scheduler-specific parameters
                 if cfg.scheduler.type == "cosine":
                     f.write(f"Minimum Learning Rate: {cfg.scheduler.min_lr}\n")
-                    if hasattr(cfg.scheduler, 'warmup_ratio'):
-                        f.write(f"Warmup Ratio: {cfg.scheduler.warmup_ratio}\n")
+                    # Add warmup configuration details
+                    use_warmup = cfg.scheduler.get('use_warmup', False)
+                    f.write(f"Using Warmup: {use_warmup}\n")
+                    if use_warmup:
+                        warmup_ratio = cfg.scheduler.get('warmup_ratio', 0.0)
+                        f.write(f"Warmup Ratio: {warmup_ratio}\n")
+                        if warmup_ratio > 0:
+                            warmup_steps = int(warmup_ratio * cfg.training.epochs * len(train_loader))
+                            f.write(f"Warmup Steps: {warmup_steps}\n")
+                    # Add frequency information
+                    step_every_batch = cfg.scheduler.get('step_every_batch', True)
+                    f.write(f"Update Every Batch: {step_every_batch}\n")
                 elif cfg.scheduler.type == "step":
                     f.write(f"Step Size: {cfg.scheduler.step_size}\n")
                     f.write(f"Gamma: {cfg.scheduler.gamma}\n")

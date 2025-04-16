@@ -2,6 +2,7 @@
 
 # Learning rate scheduler settings
 use_scheduler: true
+use_warmup: false
 type: cosine  # Options: cosine, step, reduce_on_plateau
 min_lr: 1e-8
 
