@@ -2011,7 +2011,9 @@ class MultiModalSpectralGPT(nn.Module):
             reconstructed_pixels = self.unpatchify(pred_tokens_reshaped, original_input.shape)
 
             # Convert token mask to pixel mask (1 where masked, 0 where visible)
-            pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)
+            pixel_mask = self.token_mask_to_pixel_mask(mask, original_input.shape)  # [B, T, H, W]
+            pixel_mask = pixel_mask.unsqueeze(1)  # -> [B, 1, T, H, W] for broadcasting
+
 
             # Create inverse mask (1 where visible, 0 where masked)
             inverse_pixel_mask = 1.0 - pixel_mask
