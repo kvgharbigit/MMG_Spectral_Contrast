@@ -72,8 +72,13 @@ def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, bas
     """
 
     def lr_lambda(current_step):
+        # Special case for no warmup
+        if warmup_steps == 0:
+            progress = float(current_step) / float(max(1, total_steps))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(min_lr / base_lr, cosine_decay)
         # Linear warmup phase
-        if current_step < warmup_steps:
+        elif current_step < warmup_steps:
             return float(current_step) / float(max(1, warmup_steps))
         # Cosine decay phase
         else:
@@ -441,7 +446,7 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None):
             'recon': f"{output['loss_recon'].item():.6f}",
             'contrast': f"{output['loss_contrast'].item():.6f}",
             'mse': f"{output['mse_loss'].item():.6f}",  # Add MSE loss display
-            'lr': f"{current_lr:.6f}",
+            'lr': f"{current_lr:.8f}",  # Get actual current LR with more precision
             'intra_div': f"{output['intra_patch_div_loss'].item():.6f}",
             'inter_div': f"{output['inter_patch_div_loss'].item():.6f}",
             'total_div': f"{(output['intra_patch_div_loss'].item() + output['inter_patch_div_loss'].item()):.6f}"
@@ -921,7 +926,7 @@ def main(cfg: DictConfig):
         # Print metrics summary
         print(f"Train Loss: {train_metrics['loss']:.10f}, "
               f"Val Loss: {val_metrics['loss']:.10f}, "
-              f"LR: {train_metrics.get('learning_rate', 0):.8f}, "
+              f"LR: {optimizer.param_groups[0]['lr']:.8f}, "
               f"Time: {epoch_time:.2f}s")
 
         # Log to TensorBoard and MLflow
