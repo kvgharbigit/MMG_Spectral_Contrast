@@ -15,7 +15,7 @@ defaults:
   - model: spectral_gpt
   - data: default
   - optimizer: adamw
-  - scheduler: cosine
+  - scheduler: none
   - override hydra/job_logging: default
   - override hydra/hydra_logging: default
 
