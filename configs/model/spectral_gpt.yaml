@@ -26,7 +26,7 @@ use_thickness_mask: true
 
 # Diversity loss weights
 intra_div_weight: 1000  # Weight for intra-patch diversity loss
-inter_div_weight: 2  # Weight for inter-patch diversity loss
+inter_div_weight: 4  # Weight for inter-patch diversity loss
 
 # Loss weights
 loss_weights:

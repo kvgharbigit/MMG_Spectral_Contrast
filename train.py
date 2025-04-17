@@ -146,9 +146,10 @@ def calculate_metrics(outputs, optimizer=None):
         if 'reconstructed_similarity' in output:
             metrics['reconstructed_similarity'] += output['reconstructed_similarity']
 
-    # Calculate the average for normal metrics
+    # Calculate the average for normal metrics (excluding learning rate)
     for key in metrics.keys():
-        metrics[key] /= batch_count
+        if key != 'learning_rate':  # Don't average the learning rate
+            metrics[key] /= batch_count
 
     return metrics
 
@@ -372,10 +373,14 @@ def check_early_stopping(val_losses, patience, min_delta=0.0):
 
 def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None, scheduler=None,
                 scheduler_step_frequency=None):
+    print(f"==== train_epoch starting LR: {optimizer.param_groups[0]['lr']} ====")
     """Train the model for one epoch with optimized AMP. Now accepts scheduler parameters."""
     model.train()
     outputs = []
     scaler = torch.amp.GradScaler()  # Create gradient scaler for mixed precision
+    print(f"==== New GradScaler created, initial scale: {scaler.get_scale()} ====")
+
+
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:
@@ -408,10 +413,20 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None, sch
         # Update weights with scaler
         scaler.step(optimizer)
         scaler.update()
+        print(f"==== Updated GradScaler scale: {scaler.get_scale()} ====")
 
         # Update scheduler if it's batch-based
         if scheduler is not None and scheduler_step_frequency == "batch":
             scheduler.step()
+
+        # Add debugging here
+        print(f"==== Batch {batch_idx} LR: {optimizer.param_groups[0]['lr']} ====")
+
+        # Update scheduler if it's batch-based
+        if scheduler is not None and scheduler_step_frequency == "batch":
+            print(f"==== Before batch scheduler step LR: {optimizer.param_groups[0]['lr']} ====")
+            scheduler.step()
+            print(f"==== After batch scheduler step LR: {optimizer.param_groups[0]['lr']} ====")
 
         # Store only required outputs as scalars (not tensors) to save memory
         batch_output = {
@@ -808,8 +823,14 @@ def main(cfg: DictConfig):
         weight_decay=cfg.optimizer.weight_decay,
         betas=(cfg.optimizer.beta1, cfg.optimizer.beta2),
     )
+    # Add this debug statement
+    print(f"DEBUG - Initial learning rate after optimizer creation: {optimizer.param_groups[0]['lr']}")
 
     # Create learning rate scheduler
+
+    # Before scheduler creation
+    print(f"DEBUG - Learning rate before scheduler setup: {optimizer.param_groups[0]['lr']}")
+
     # Create learning rate scheduler
     scheduler_step_frequency = "epoch"  # Default
     if cfg.scheduler.use_scheduler:
@@ -865,6 +886,11 @@ def main(cfg: DictConfig):
         scheduler = None
         scheduler_step_frequency = None
 
+    print(f"==== Scheduler enabled: {cfg.scheduler.use_scheduler} ====")
+    print(f"==== Scheduler object exists: {scheduler is not None} ====")
+    if scheduler is not None:
+        print(f"==== Scheduler type: {type(scheduler).__name__} ====")
+
     # Resume from checkpoint if specified
     start_epoch = 0
     val_losses = []
@@ -891,6 +917,8 @@ def main(cfg: DictConfig):
     # Training loop
     for epoch in range(start_epoch, cfg.training.epochs):
         print(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
+        print(f"==== Beginning of epoch {epoch} LR: {optimizer.param_groups[0]['lr']} ====")
+
         epoch_start_time = time.time()
 
         # Clear memory before each epoch
@@ -931,11 +959,14 @@ def main(cfg: DictConfig):
                 log_reconstruction(recon_path, epoch, writer, cfg.logging.use_mlflow)
 
         # Update learning rate scheduler - only for epoch-based schedulers
+        # Update learning rate scheduler - only for epoch-based schedulers
         if scheduler is not None and scheduler_step_frequency == "epoch":
+            print(f"==== Before epoch scheduler step LR: {optimizer.param_groups[0]['lr']} ====")
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 scheduler.step(val_metrics['loss'])
             else:
                 scheduler.step()
+            print(f"==== After epoch scheduler step LR: {optimizer.param_groups[0]['lr']} ====")
 
         # Calculate epoch time
         epoch_time = time.time() - epoch_start_time
