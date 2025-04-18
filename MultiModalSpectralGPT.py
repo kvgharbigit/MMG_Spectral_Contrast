@@ -1068,10 +1068,11 @@ class MultiModalSpectralGPT(nn.Module):
                 # Fallback value if no reference available
                 orig_mean_sim = torch.tensor(0.5, device=device)
 
-            # Calculate diversity loss with margin
+            # Calculate diversity loss with margin - REPLACE CLAMP WITH SMOOTH HINGE
             margin = 0.1
             diversity_threshold = orig_mean_sim + margin
-            batch_div_loss = torch.clamp(masked_mean_sim - diversity_threshold, min=0.0)
+            # OLD: batch_div_loss = torch.clamp(masked_mean_sim - diversity_threshold, min=0.0)
+            batch_div_loss = self.smooth_hinge(masked_mean_sim - diversity_threshold)
             inter_patch_div_loss += batch_div_loss
 
         # Normalize by batch size
@@ -1160,6 +1161,25 @@ class MultiModalSpectralGPT(nn.Module):
         avg_reference_variance = torch.stack(reference_variances).mean(dim=0)
 
         return avg_reference_variance
+
+    def smooth_hinge(self, x, margin=0.0, beta=1.0):
+        """
+        A smooth approximation to the hinge function max(0, x).
+
+        Args:
+            x: Input tensor
+            margin: Offset (like in hinge loss)
+            beta: Smoothing parameter - larger values make it closer to hard hinge
+
+        Returns:
+            Tensor with smoothed hinge values
+        """
+        # Shift x by margin
+        shifted_x = x - margin
+
+        # Smooth approximation of max(0, shifted_x)
+        # This is a softplus-based approximation: log(1 + exp(beta * x)) / beta
+        return torch.log(1 + torch.exp(beta * shifted_x)) / beta
 
     def calculate_batch_reference_similarity(self, original_input, unmasked_pixels, num_samples=100):
         """
@@ -1446,7 +1466,8 @@ class MultiModalSpectralGPT(nn.Module):
                 # Calculate variance deficit where prediction is too uniform
                 # Only apply to masked patches
                 too_uniform = (pred_var < min_variance_threshold) & (patch_mask > 0.5)
-                variance_deficit = torch.clamp(min_variance_threshold - pred_var, min=0.0)
+                # OLD: variance_deficit = torch.clamp(min_variance_threshold - pred_var, min=0.0)
+                variance_deficit = self.smooth_hinge(min_variance_threshold - pred_var)
 
                 # Final intra-patch diversity loss - only applied to suspiciously uniform masked patches
                 band_intra_div_loss = (variance_deficit * too_uniform.float()).sum()
@@ -1835,8 +1856,8 @@ class MultiModalSpectralGPT(nn.Module):
 
         # We'll use cosine similarity to measure patch similarity
         # First, normalize patches along pixel dimension - use in-place operations where possible
-        orig_patches_norm = F.normalize(orig_patches, p=2, dim=2)  # [B, C, patch_pixels, num_patches]
-        pred_patches_norm = F.normalize(pred_patches, p=2, dim=2)  # [B, C, patch_pixels, num_patches]
+        orig_patches_norm = F.normalize(orig_patches, p=2, dim=2)
+        pred_patches_norm = F.normalize(pred_patches, p=2, dim=2)
 
         # Get unmasked patches mask (0 = masked, 1 = visible)
         unmasked_patches = 1.0 - patch_mask  # [B, 1, num_patches]
@@ -1874,7 +1895,8 @@ class MultiModalSpectralGPT(nn.Module):
                 diversity_threshold = orig_mean_sim + margin
 
                 # Penalize if reconstructed patches are too similar
-                batch_div_loss = torch.clamp(pred_mean_sim - diversity_threshold, min=0.0)
+                # OLD: batch_div_loss = torch.clamp(pred_mean_sim - diversity_threshold, min=0.0)
+                batch_div_loss = self.smooth_hinge(pred_mean_sim - diversity_threshold)
                 total_batch_div_loss += batch_div_loss
                 valid_batches += 1
 
