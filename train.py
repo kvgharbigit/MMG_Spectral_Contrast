@@ -175,37 +175,50 @@ def log_metrics(split, metrics, epoch, writer, mlflow_logging=True):
             mlflow.log_metric(f"{split}_{key}", value, step=epoch)
 
 
-def log_reconstruction(recon_path, epoch, writer, mlflow_logging=True):
+def log_reconstruction(recon_paths, epoch, writer, mlflow_logging=True):
     """
     Log reconstruction visualization to TensorBoard and MLflow.
 
     Args:
-        recon_path: Path to reconstruction image
+        recon_paths: Path or list of paths to reconstruction images
         epoch: Current epoch number
         writer: TensorBoard SummaryWriter instance
         mlflow_logging: Whether to log to MLflow
     """
-    if recon_path is None or not os.path.exists(recon_path):
-        print(f"No reconstruction image found at epoch {epoch}")
+    # Ensure recon_paths is a list
+    if recon_paths is None:
+        print(f"No reconstruction images found at epoch {epoch}")
         return
 
+    if not isinstance(recon_paths, list):
+        recon_paths = [recon_paths]
+
     try:
-        # Log to TensorBoard
-        img = plt.imread(recon_path)
-        if img.shape[2] == 4:  # RGBA image with alpha channel
-            img = img[:, :, :3]  # Remove alpha channel
+        # Log each reconstruction image
+        for i, recon_path in enumerate(recon_paths):
+            if not os.path.exists(recon_path):
+                print(f"Reconstruction image not found: {recon_path}")
+                continue
 
-        # TensorBoard expects images in [C, H, W] format
-        img = np.transpose(img, (2, 0, 1))
-        writer.add_image(f"Reconstruction/epoch_{epoch}", img, epoch, dataformats='CHW')
+            # Log to TensorBoard
+            img = plt.imread(recon_path)
+            if img.shape[2] == 4:  # RGBA image with alpha channel
+                img = img[:, :, :3]  # Remove alpha channel
 
-        # Log to MLflow if enabled
-        if mlflow_logging:
-            try:
-                import mlflow
-                mlflow.log_artifact(recon_path, f"reconstructions/epoch_{epoch}")
-            except Exception as e:
-                print(f"Error logging reconstruction to MLflow: {e}")
+            # TensorBoard expects images in [C, H, W] format
+            img = np.transpose(img, (2, 0, 1))
+
+            # Use different names for multiple reconstructions
+            reconstruction_type = "combined" if i == 0 else "full"
+            writer.add_image(f"Reconstruction_{reconstruction_type}/epoch_{epoch}", img, epoch, dataformats='CHW')
+
+            # Log to MLflow if enabled
+            if mlflow_logging:
+                try:
+                    import mlflow
+                    mlflow.log_artifact(recon_path, f"reconstructions/epoch_{epoch}/{reconstruction_type}")
+                except Exception as e:
+                    print(f"Error logging {reconstruction_type} reconstruction to MLflow: {e}")
 
     except Exception as e:
         print(f"Error logging reconstruction image: {e}")
@@ -604,6 +617,9 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
 def visualize_reconstruction_during_training(model, val_loader, device, epoch, output_dir):
     """
     Visualizes reconstruction quality during training with integrated numerical pixel maps.
+    Generates two visualizations:
+    1. Combined reconstruction (original pixels with masked regions replaced)
+    2. Fully reconstructed image
     """
     # Create visualization directory if it doesn't exist
     viz_dir = os.path.join(output_dir, 'visualizations')
@@ -629,26 +645,44 @@ def visualize_reconstruction_during_training(model, val_loader, device, epoch, o
         with torch.no_grad():
             output = model(hsi, aux_data, batch_idx)
 
-        # Define save path
-        save_path = os.path.join(viz_dir, f'reconstruction_epoch_{epoch}.png')
+        # Define save paths for both reconstructions
+        combined_save_path = os.path.join(viz_dir, f'combined_reconstruction_epoch_{epoch}.png')
+        full_save_path = os.path.join(viz_dir, f'full_reconstruction_epoch_{epoch}.png')
 
-        # Visualize the reconstruction
-        # Pass the model to allow conversion of token mask to pixel mask
+        # Visualize the combined reconstruction (original + masked reconstruction)
         from visualisation import visualize_reconstruction_quality
-        fig = visualize_reconstruction_quality(
+        combined_fig = visualize_reconstruction_quality(
             original=hsi,
             reconstruction=output['reconstructed_pixels'],
             mask=output['mask'],
             thickness_mask=thickness_mask,
-            save_path=save_path,
+            save_path=combined_save_path,
             model=model  # Pass the model to convert token mask
         )
 
-        print(f"Generated visualization with numerical pixel maps for epoch {epoch}")
-        print(f"  - Saved to: {save_path}")
+        # Now create a fully reconstructed image
+        # We'll use the predicted tokens to reconstruct the entire image
+        pred_tokens_reshaped = output['pred'].reshape(
+            hsi.shape[0], model.spectral_patches, model.spatial_patches, -1
+        )
+        full_reconstructed = model.unpatchify(pred_tokens_reshaped, hsi.shape)
 
-        # Return the main reconstruction path for logging in TensorBoard
-        return save_path
+        # Visualize the fully reconstructed image
+        full_fig = visualize_reconstruction_quality(
+            original=hsi,
+            reconstruction=full_reconstructed,
+            mask=output['mask'],
+            thickness_mask=thickness_mask,
+            save_path=full_save_path,
+            model=model
+        )
+
+        print(f"Generated visualizations for epoch {epoch}")
+        print(f"  - Combined Reconstruction: {combined_save_path}")
+        print(f"  - Full Reconstruction: {full_save_path}")
+
+        # Return both paths for logging in TensorBoard
+        return [combined_save_path, full_save_path]
 
     except Exception as e:
         print(f"Error generating reconstruction visualization: {e}")

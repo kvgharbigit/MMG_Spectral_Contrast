@@ -296,9 +296,8 @@ class MultiModalSpectralGPT(nn.Module):
 
         # New: Dynamically created projection layer to pixel output dimension
         self.decoder_pred = nn.Sequential(
-            nn.Linear(decoder_embed_dim, decoder_embed_dim),  # Optional intermediate layer
-            nn.GELU(),  # Optional activation
-            nn.Linear(decoder_embed_dim, pixel_output_dim)  # Final projection to pixel dimension
+            nn.LayerNorm(decoder_embed_dim),
+            nn.Linear(decoder_embed_dim, pixel_output_dim)
         )
 
         # Position embeddings for decoder

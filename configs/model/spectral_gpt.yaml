@@ -4,11 +4,11 @@
 analysis_dim: 224
 patch_size: [7, 7]
 embed_dim: 1024
-depth: 8
+depth: 10
 num_heads: 16
-decoder_embed_dim: 1024
-decoder_depth: 8
-decoder_num_heads: 16
+decoder_embed_dim: 512
+decoder_depth: 4
+decoder_num_heads: 8
 mlp_ratio: 4.0
 num_frames: 30
 t_patch_size: 5
@@ -16,7 +16,7 @@ in_chans: 1
 aux_chans: 1
 aux_embed_dim: 256
 temperature: 0.07
-mask_ratio: 0.2
+mask_ratio: 0.7
 
 # Contrastive learning mode: 'global' or 'spatial'
 contrastive_mode: global
@@ -25,8 +25,8 @@ contrastive_mode: global
 use_thickness_mask: true
 
 # Diversity loss weights
-intra_div_weight: 1000  # Weight for intra-patch diversity loss
-inter_div_weight: 4  # Weight for inter-patch diversity loss
+intra_div_weight: 0.1  # Weight for intra-patch diversity loss
+inter_div_weight: 0.1  # Weight for inter-patch diversity loss
 
 # Loss weights
 loss_weights:
