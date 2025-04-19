@@ -35,6 +35,7 @@ from dataset import MultiModalTransforms
 from visualisation import (
     visualize_pixel_reconstruction  # Add this line
 )
+from samplers import ProgressiveSampler
 
 import matplotlib.cm as cm
 
@@ -762,11 +763,18 @@ def main(cfg: DictConfig):
             generator=torch.Generator().manual_seed(cfg.seed)
         )
 
-        # Create dataloaders
+        # Create Progressive Sampler for train dataset
+        train_sampler = ProgressiveSampler(
+            train_dataset,
+            samples_per_epoch=2000,  # Your desired samples per epoch
+            shuffle=True
+        )
+
+        # Create dataloaders with the sampler
         train_loader = DataLoader(
             train_dataset,
             batch_size=cfg.training.batch_size,
-            shuffle=True,
+            sampler=train_sampler,  # Use the progressive sampler instead of shuffle
             num_workers=cfg.data.num_workers,
             pin_memory=False,
             collate_fn=custom_collate_fn,
@@ -791,30 +799,91 @@ def main(cfg: DictConfig):
         )
 
         print(f"Dataset split: {train_size} training, {val_size} validation")
+        print(f"Using ProgressiveSampler: {2000} samples per epoch")
+
 
     else:
+
         print(f"Using predefined split: {cfg.data.train_dir} and {cfg.data.val_dir}")
 
-        # For predefined split:
-        train_loader = create_patient_dataloader(
+        # Create the training dataset
+
+        train_dataset = PatientDataset(
+
             parent_dir=cfg.data.train_dir,
+
             analysis_dim=cfg.model.analysis_dim,
-            target_bands=cfg.model.num_frames,
-            batch_size=cfg.training.batch_size,
-            num_workers=cfg.data.num_workers,
-            shuffle=True,
-            augment=cfg.data.use_augmentation  # Enable augmentation for training
+
+            target_bands=cfg.model.num_frames
+
         )
 
-        val_loader = create_patient_dataloader(
-            parent_dir=cfg.data.val_dir,
-            analysis_dim=cfg.model.analysis_dim,
-            target_bands=cfg.model.num_frames,
-            batch_size=cfg.training.batch_size,
-            num_workers=cfg.data.num_workers,
-            shuffle=False,
-            augment=False  # No augmentation for validation
+        # Create Progressive Sampler for train dataset
+
+        train_sampler = ProgressiveSampler(
+
+            train_dataset,
+
+            samples_per_epoch=2000,  # Your desired samples per epoch
+
+            shuffle=True
+
         )
+
+        # Create train loader with the sampler
+
+        train_loader = DataLoader(
+
+            train_dataset,
+
+            batch_size=cfg.training.batch_size,
+
+            sampler=train_sampler,  # Use the progressive sampler
+
+            num_workers=cfg.data.num_workers,
+
+            pin_memory=False,
+
+            collate_fn=custom_collate_fn,
+
+            drop_last=cfg.data.drop_last,
+
+        )
+
+        # Add augmentation if needed
+
+        if cfg.data.use_augmentation:
+            train_dataset.transform = MultiModalTransforms(
+
+                prob=cfg.data.augmentation.prob,
+
+                rotation_degrees=cfg.data.augmentation.rotation_degrees,
+
+                scale_range=cfg.data.augmentation.scale_range
+
+            )
+
+        # Create validation loader normally (no progressive sampling needed)
+
+        val_loader = create_patient_dataloader(
+
+            parent_dir=cfg.data.val_dir,
+
+            analysis_dim=cfg.model.analysis_dim,
+
+            target_bands=cfg.model.num_frames,
+
+            batch_size=cfg.training.batch_size,
+
+            num_workers=cfg.data.num_workers,
+
+            shuffle=False,
+
+            augment=False  # No augmentation for validation
+
+        )
+
+        print(f"Using ProgressiveSampler: {2000} samples per epoch")
 
     # Create and initialize model
     model = MultiModalSpectralGPT(
@@ -869,20 +938,20 @@ def main(cfg: DictConfig):
     scheduler_step_frequency = "epoch"  # Default
     if cfg.scheduler.use_scheduler:
         if cfg.scheduler.type == "cosine":
-            # Check if warmup is explicitly enabled through config
-            use_warmup = cfg.scheduler.get('use_warmup', False)  # Default to False if not specified
-            warmup_ratio = cfg.scheduler.get('warmup_ratio', 0.0)  # Default to 0 if not specified
+            # Calculate warmup steps based on our samples per epoch instead of total dataset
+            samples_per_epoch = 2000  # Your configured samples per epoch
+            batches_per_epoch = samples_per_epoch // cfg.training.batch_size
+            total_batches = batches_per_epoch * cfg.training.epochs
 
             if use_warmup and warmup_ratio > 0:
                 # Calculate warmup steps
-                warmup_steps = int(warmup_ratio * cfg.training.epochs * len(train_loader))
-                total_steps = cfg.training.epochs * len(train_loader)
+                warmup_steps = int(warmup_ratio * total_batches)
 
                 # Create warmup-cosine scheduler
                 scheduler = get_warmup_cosine_schedule(
                     optimizer,
                     warmup_steps=warmup_steps,
-                    total_steps=total_steps,
+                    total_steps=total_batches,
                     min_lr=cfg.scheduler.min_lr,
                     base_lr=cfg.optimizer.lr,
                     use_warmup=True
@@ -890,11 +959,10 @@ def main(cfg: DictConfig):
                 scheduler_step_frequency = "batch"
             else:
                 # Cosine scheduler without warmup
-                total_steps = cfg.training.epochs * len(train_loader)
                 scheduler = get_warmup_cosine_schedule(
                     optimizer,
                     warmup_steps=0,
-                    total_steps=total_steps,
+                    total_steps=total_batches,
                     min_lr=cfg.scheduler.min_lr,
                     base_lr=cfg.optimizer.lr,
                     use_warmup=False
@@ -950,8 +1018,15 @@ def main(cfg: DictConfig):
 
     # Training loop
     for epoch in range(start_epoch, cfg.training.epochs):
+        # Get progress information
+        dataset_size = len(train_loader.sampler.data_source)
+        current_position = train_loader.sampler.current_position
+        samples_per_epoch = train_loader.sampler.samples_per_epoch
+        progress_percent = (current_position / dataset_size) * 100
+
         print(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
-        print(f"==== Beginning of epoch {epoch} LR: {optimizer.param_groups[0]['lr']} ====")
+        print(f"Dataset progress: {current_position}/{dataset_size} samples ({progress_percent:.1f}%)")
+        print(f"Samples this epoch: {min(samples_per_epoch, dataset_size - current_position)}")
 
         epoch_start_time = time.time()
 
@@ -1222,6 +1297,16 @@ def save_training_summary(cfg, output_dir):
                 f.write(f"Experiment Name: {cfg.logging.experiment_name}\n")
                 f.write(f"Run Name: {cfg.logging.run_name}\n")
             f.write(f"Visualization Frequency: {cfg.visualization.viz_frequency}\n")
+            f.write("\n")
+
+            # Inside your with open(summary_path, 'w') as f: block, add:
+            f.write("PROGRESSIVE SAMPLING CONFIGURATION\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"Samples per epoch: 2000\n")
+            f.write(f"Total dataset size: {len(train_dataset)}\n")
+            dataset_cycles = len(train_dataset) / 2000
+            f.write(
+                f"Complete dataset cycles per {cfg.training.epochs} epochs: {cfg.training.epochs / dataset_cycles:.2f}\n")
             f.write("\n")
 
             # Additional Information
