@@ -1484,10 +1484,14 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     print("RUNNING GRADIENT DIAGNOSTICS")
     print("=" * 80)
 
-    # Create diagnostics tool
-    diagnostics = GradientDiagnostics(model, output_dir=output_dir)
+    # Create epoch-specific output directory
+    epoch_dir = os.path.join(output_dir, f"epoch_0")
+    os.makedirs(epoch_dir, exist_ok=True)
 
-    # Register monitoring hooks
+    # Create diagnostics tool
+    diagnostics = GradientDiagnostics(model, output_dir=epoch_dir)
+
+    # Register monitoring hooks - make sure this happens BEFORE any optimizer operations
     diagnostics.register_gradient_hooks()
     diagnostics.register_activation_hooks()
 
@@ -1499,9 +1503,6 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         betas=(0.9, 0.95)
     )
     scaler = torch.cuda.amp.GradScaler()
-
-    # Keep track of batch idx for the diagnostics
-    batch_idx = 0
 
     # Set model to train mode
     model.train()
@@ -1530,6 +1531,28 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
 
+        # Diagnostics - add gradient check here for debugging
+        print(f"Checking gradients for batch {batch_idx}...")
+        grad_exists = []
+        grad_count = 0
+        total_params = 0
+
+        for name, param in model.named_parameters():
+            total_params += 1
+            if param.grad is not None:
+                grad_count += 1
+                # Check a few key parameters more specifically
+                if 'decoder_pred' in name:
+                    grad_exists.append(f"decoder_pred: {param.grad.abs().mean().item():.8f}")
+                elif 'blocks.0' in name and not 'decoder' in name:
+                    grad_exists.append(f"encoder block 0: {param.grad.abs().mean().item():.8f}")
+                elif 'decoder_blocks.0' in name:
+                    grad_exists.append(f"decoder block 0: {param.grad.abs().mean().item():.8f}")
+
+        print(f"Gradients generated for {grad_count}/{total_params} parameters")
+        if grad_exists:
+            print(f"Sample gradient values: {', '.join(grad_exists)}")
+
         # Log diagnostics for this batch
         diagnostics.analyze_batch(batch_idx, loss=loss.item(), scaler=scaler)
 
@@ -1551,7 +1574,7 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     else:
         print("\n✅ No clear signs of vanishing gradients detected.")
 
-    print(f"\nDetailed report available at: {output_dir}/summary_report.txt")
+    print(f"\nDetailed report available at: {epoch_dir}/summary_report.txt")
     print("=" * 80)
 
     return results

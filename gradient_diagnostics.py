@@ -72,11 +72,8 @@ class GradientDiagnostics:
         registered_count = 0
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                # Create a closure to capture the current name
-                def get_hook(param_name):
-                    return lambda grad: self._gradient_hook(grad, param_name)
-
-                handle = param.register_hook(get_hook(name))
+                # Create a closure with the name parameter explicitly bound
+                handle = param.register_hook(lambda grad, name=name: self._gradient_hook(grad, name))
                 self.hook_handles.append(handle)
                 registered_count += 1
 
@@ -99,21 +96,19 @@ class GradientDiagnostics:
         for name, module in self.model.named_modules():
             # Check all normalization layers
             if isinstance(module, torch.nn.LayerNorm):
-                # Use closure to capture the current name
-                def get_hook(layer_name):
-                    return lambda mod, inp, out: self._activation_hook(out, layer_name)
-
-                handle = module.register_forward_hook(get_hook(name))
+                # Use default parameter in lambda to capture current value of name
+                handle = module.register_forward_hook(
+                    lambda mod, inp, out, name=name: self._activation_hook(out, name)
+                )
                 self.hook_handles.append(handle)
                 monitored_layers.append(name)
 
             # Check prediction, projection and other key layers
             elif any(key in name for key in ['pred', 'proj_head', 'patch_embed']) and hasattr(module, 'forward'):
-                # Use closure to capture the current name
-                def get_hook(layer_name):
-                    return lambda mod, inp, out: self._activation_hook(out, layer_name)
-
-                handle = module.register_forward_hook(get_hook(name))
+                # Use default parameter in lambda to capture current value of name
+                handle = module.register_forward_hook(
+                    lambda mod, inp, out, name=name: self._activation_hook(out, name)
+                )
                 self.hook_handles.append(handle)
                 monitored_layers.append(name)
 
