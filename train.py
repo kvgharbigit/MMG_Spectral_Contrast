@@ -979,9 +979,7 @@ def main(cfg: DictConfig):
     if scheduler is not None:
         print(f"==== Scheduler type: {type(scheduler).__name__} ====")
 
-    # After model initialization but before training loop look at gradient diagnostics
-    diagnostics_dir = os.path.join(output_dir, 'gradient_diagnostics')
-    gradient_results = run_gradient_diagnostics(model, train_loader, device, diagnostics_dir)
+
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -1023,6 +1021,20 @@ def main(cfg: DictConfig):
         # Clear memory before each epoch
         torch.cuda.empty_cache()
         gc.collect()
+
+        #  Run gradient diagnostics every 10 epochs
+        if should_run_diagnostics(epoch):
+            diagnostics_dir = os.path.join(output_dir, f'gradient_diagnostics/epoch_{epoch}')
+            print(f"\nRunning gradient diagnostics at epoch {epoch}...")
+            gradient_results = run_gradient_diagnostics(model, train_loader, device, diagnostics_dir)
+
+            # Log diagnostic results to MLflow if enabled
+            if cfg.logging.use_mlflow:
+                mlflow.log_artifact(os.path.join(diagnostics_dir, "summary_report.txt"),
+                                    f"gradient_diagnostics/epoch_{epoch}")
+                mlflow.log_metric("has_vanishing_gradients",
+                                  1 if gradient_results["has_vanishing_gradients"] else 0,
+                                  step=epoch)
 
         # Training phase
         train_outputs = train_epoch(
@@ -1543,5 +1555,10 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     print("=" * 80)
 
     return results
+
+def should_run_diagnostics(epoch, frequency=10):
+    """Determine if gradient diagnostics should run on this epoch."""
+    return epoch % frequency == 0
+
 if __name__ == "__main__":
     main()
