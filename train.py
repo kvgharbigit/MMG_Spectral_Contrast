@@ -1,11 +1,8 @@
-import os
+import os  # tw os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-# tw
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.putenv('KMP_DUPLICATE_LIB_OK', 'TRUE')
 import sys
 from torch.cuda.amp import autocast, GradScaler
-
 import time
 import torch.nn.functional as F
 import glob
@@ -30,13 +27,15 @@ import gc
 # Import custom modules
 from MultiModalSpectralGPT import MultiModalSpectralGPT
 from dataset import PatientDataset, custom_collate_fn, create_patient_dataloader
-from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb  # These are already imported elsewhere
+from hsi_to_rgb import hsi_to_rgb, simple_hsi_to_rgb
+
+# These are already imported elsewhere
 from dataset import MultiModalTransforms
 from visualisation import (
-    visualize_pixel_reconstruction  # Add this line
+    visualize_reconstruction_quality  # Add this line
 )
 from samplers import ProgressiveSampler
-from gradient_diagnostics import run_gradient_diagnostics
+from gradient_diagnostics import GradientDiagnostics, run_gradient_diagnostics
 
 import matplotlib.cm as cm
 
@@ -48,14 +47,6 @@ import os
 
 # Optional: only necessary if you want to lock to GPU 0
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-
-
-
-
-
-
-
 
 
 def get_warmup_cosine_schedule(optimizer, warmup_steps, total_steps, min_lr, base_lr, use_warmup=True):
@@ -388,14 +379,28 @@ def check_early_stopping(val_losses, patience, min_delta=0.0):
 
 def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None, scheduler=None,
                 scheduler_step_frequency=None):
+    """Train the model for one epoch with optimized AMP and proper gradient diagnostics.
+
+    Args:
+        model: The model to train
+        dataloader: DataLoader for training data
+        optimizer: Optimizer for updating weights
+        device: Device to run on
+        contrastive_mode: Optional contrastive mode to use
+        scheduler: Optional learning rate scheduler
+        scheduler_step_frequency: How often to step the scheduler ("batch" or "epoch")
+
+    Returns:
+        List of batch outputs
+    """
     print(f"==== train_epoch starting LR: {optimizer.param_groups[0]['lr']} ====")
-    """Train the model for one epoch with optimized AMP. Now accepts scheduler parameters."""
+
     model.train()
     outputs = []
-    scaler = torch.amp.GradScaler()  # Create gradient scaler for mixed precision
+
+    # Create gradient scaler for mixed precision
+    scaler = torch.amp.GradScaler()
     print(f"==== New GradScaler created, initial scale: {scaler.get_scale()} ====")
-
-
 
     # Set contrastive mode if specified
     if contrastive_mode is not None:
@@ -429,10 +434,6 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None, sch
         scaler.step(optimizer)
         scaler.update()
         print(f"==== Updated GradScaler scale: {scaler.get_scale()} ====")
-
-        # Update scheduler if it's batch-based
-        if scheduler is not None and scheduler_step_frequency == "batch":
-            scheduler.step()
 
         # Add debugging here
         print(f"==== Batch {batch_idx} LR: {optimizer.param_groups[0]['lr']} ====")
@@ -612,10 +613,6 @@ def save_checkpoint(model, optimizer, epoch, val_loss, output_dir, is_best=False
         print(f"Saved new best model with validation loss: {val_loss:.10f}")
 
 
-# Add this function to train.py to visualize reconstructions during training
-# Add this function to train.py to visualize reconstructions during training
-# Update the function in train.py to use the simplified visualization
-
 def visualize_reconstruction_during_training(model, val_loader, device, epoch, output_dir):
     """
     Visualizes reconstruction quality during training with integrated numerical pixel maps.
@@ -693,478 +690,146 @@ def visualize_reconstruction_during_training(model, val_loader, device, epoch, o
         return None
 
 
-@hydra.main(config_path="configs", config_name="train", version_base="1.1")
-def main(cfg: DictConfig):
-    print(OmegaConf.to_yaml(cfg))
+def should_run_diagnostics(epoch, frequency=10):
+    """Determine if gradient diagnostics should run on this epoch."""
+    return epoch % frequency == 0 or epoch == 0  # Always run on first epoch
 
-    # Set random seed for reproducibility
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(cfg.seed)
-        torch.cuda.manual_seed_all(cfg.seed)
 
-    # Get original working directory for path handling
-    original_cwd = hydra.utils.get_original_cwd()
+def run_gradient_diagnostics_with_error_handling(model, train_loader, device, output_dir, epoch):
+    """
+    Run gradient diagnostics with proper error handling and directory structure.
 
-    # Convert data paths to absolute paths if they're relative
-    if not os.path.isabs(cfg.data.parent_dir):
-        cfg.data.parent_dir = os.path.join(original_cwd, cfg.data.parent_dir)
-    if not os.path.isabs(cfg.data.train_dir):
-        cfg.data.train_dir = os.path.join(original_cwd, cfg.data.train_dir)
-    if not os.path.isabs(cfg.data.val_dir):
-        cfg.data.val_dir = os.path.join(original_cwd, cfg.data.val_dir)
+    Args:
+        model: The model to diagnose
+        train_loader: DataLoader for training data
+        device: The device to run on
+        output_dir: Base output directory
+        epoch: Current epoch number
 
-    # Set device
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    Returns:
+        Tuple: (success, diagnostics_results, summary_path)
+    """
+    try:
+        # Create diagnostics directory with proper nesting
+        diagnostics_dir = os.path.join(output_dir, 'gradient_diagnostics')
+        os.makedirs(diagnostics_dir, exist_ok=True)
 
-    # Clear CUDA cache at the beginning
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        # Create epoch-specific directory
+        epoch_dir = os.path.join(diagnostics_dir, f"epoch_{epoch}")
+        os.makedirs(epoch_dir, exist_ok=True)
 
-    # Create output directory
-    output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
-    print(f"Output directory: {output_dir}")
+        # Create a diagnostics instance for this model
+        diagnostics = GradientDiagnostics(model, output_dir=epoch_dir)
 
-    # Load datasets FIRST (moved up from later in the function)
-    train_dataset = None
-    val_dataset = None
-    train_loader = None
-    val_loader = None
+        # ONLY register activation hooks - we'll collect gradients directly
+        diagnostics.register_activation_hooks()
 
-    if cfg.data.use_auto_split:
-        print(f"Loading dataset with auto split: {cfg.data.auto_split_ratio}")
-
-        # Load the entire dataset
-        dataset = PatientDataset(
-            parent_dir=cfg.data.parent_dir,
-            analysis_dim=cfg.model.analysis_dim,
-            target_bands=cfg.model.num_frames
+        # Set up a mini-training session to collect gradients
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=0.0001,
+            weight_decay=0.05,
+            betas=(0.9, 0.95)
         )
+        scaler = torch.cuda.amp.GradScaler()
 
-        # Split into train and validation sets
-        val_size = int(len(dataset) * cfg.data.auto_split_ratio)
-        train_size = len(dataset) - val_size
-        train_dataset, val_dataset = random_split(
-            dataset, [train_size, val_size],
-            generator=torch.Generator().manual_seed(cfg.seed)
-        )
+        # Store original training state
+        was_training = model.training
 
-        # Create Progressive Sampler for train dataset
-        train_sampler = ProgressiveSampler(
-            train_dataset,
-            samples_per_epoch=2000,  # Your desired samples per epoch
-            shuffle=True
-        )
+        # Ensure model is in training mode
+        model.train()
 
-        # Create dataloaders with the sampler
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=cfg.training.batch_size,
-            sampler=train_sampler,  # Use the progressive sampler instead of shuffle
-            num_workers=cfg.data.num_workers,
-            pin_memory=False,
-            collate_fn=custom_collate_fn,
-            drop_last=cfg.data.drop_last,
-        )
+        # Process a small number of batches for diagnostics
+        max_batches = 3
+        successful_batches = 0
 
-        # Add augmentation transform to the train_dataset
-        if cfg.data.use_augmentation:
-            train_dataset.dataset.transform = MultiModalTransforms(
-                prob=cfg.data.augmentation.prob,
-                rotation_degrees=cfg.data.augmentation.rotation_degrees,
-                scale_range=cfg.data.augmentation.scale_range,
-                # New augmentation parameters
-                intensity_range=cfg.data.augmentation.intensity.range,
-                noise_level_range=cfg.data.augmentation.noise.level_range,
-                band_mask_ratio=cfg.data.augmentation.band_mask.ratio,
-                use_intensity=cfg.data.augmentation.intensity.enabled,
-                use_noise=cfg.data.augmentation.noise.enabled,
-                use_band_mask=cfg.data.augmentation.band_mask.enabled
-            )
+        # Set flag to disable gradient checkpointing if it exists
+        if hasattr(model, 'training'):
+            setattr(model, '_disable_gradient_checkpointing', True)
 
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=cfg.training.batch_size,
-            shuffle=False,
-            num_workers=cfg.data.num_workers,
-            pin_memory=False,
-            collate_fn=custom_collate_fn,
-        )
-
-        print(f"Dataset split: {train_size} training, {val_size} validation")
-        print(f"Using ProgressiveSampler: {2000} samples per epoch")
-
-    else:
-        print(f"Using predefined split: {cfg.data.train_dir} and {cfg.data.val_dir}")
-
-        # Create the training dataset
-        train_dataset = PatientDataset(
-            parent_dir=cfg.data.train_dir,
-            analysis_dim=cfg.model.analysis_dim,
-            target_bands=cfg.model.num_frames
-        )
-
-        # Create Progressive Sampler for train dataset
-        train_sampler = ProgressiveSampler(
-            train_dataset,
-            samples_per_epoch=2000,  # Your desired samples per epoch
-            shuffle=True
-        )
-
-        # Create train loader with the sampler
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=cfg.training.batch_size,
-            sampler=train_sampler,  # Use the progressive sampler
-            num_workers=cfg.data.num_workers,
-            pin_memory=False,
-            collate_fn=custom_collate_fn,
-            drop_last=cfg.data.drop_last,
-        )
-
-        # Add augmentation if needed
-        if cfg.data.use_augmentation:
-            train_dataset.transform = MultiModalTransforms(
-                prob=cfg.data.augmentation.prob,
-                rotation_degrees=cfg.data.augmentation.rotation_degrees,
-                scale_range=cfg.data.augmentation.scale_range,
-                # New augmentation parameters
-                intensity_range=cfg.data.augmentation.intensity.range,
-                noise_level_range=cfg.data.augmentation.noise.level_range,
-                band_mask_ratio=cfg.data.augmentation.band_mask.ratio,
-                use_intensity=cfg.data.augmentation.intensity.enabled,
-                use_noise=cfg.data.augmentation.noise.enabled,
-                use_band_mask=cfg.data.augmentation.band_mask.enabled
-            )
-
-        # Create validation loader normally (no progressive sampling needed)
-        val_loader = create_patient_dataloader(
-            parent_dir=cfg.data.val_dir,
-            analysis_dim=cfg.model.analysis_dim,
-            target_bands=cfg.model.num_frames,
-            batch_size=cfg.training.batch_size,
-            num_workers=cfg.data.num_workers,
-            shuffle=False,
-            augment=False  # No augmentation for validation
-        )
-
-        print(f"Using ProgressiveSampler: {2000} samples per epoch")
-
-    # NOW save hyperparameter and training configuration summary AFTER datasets are created
-    summary_path = save_training_summary(cfg, output_dir, train_dataset, val_dataset)
-    print(f"Training configuration summary saved to: {summary_path}")
-
-    # Set up MLflow
-    if cfg.logging.use_mlflow:
-        mlflow.set_experiment(cfg.logging.experiment_name)
-        mlflow.start_run(run_name=cfg.logging.run_name)
-
-        # Log Hydra config
-        mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
-
-        # Log configuration summary to MLflow
-        if summary_path and os.path.exists(summary_path):
-            mlflow.log_artifact(summary_path)
-
-    # Set up TensorBoard
-    writer = SummaryWriter(log_dir=os.path.join(output_dir, 'tensorboard'))
-
-    # Create and initialize model
-    model = MultiModalSpectralGPT(
-        analysis_dim=cfg.model.analysis_dim,
-        patch_size=cfg.model.patch_size,
-        embed_dim=cfg.model.embed_dim,
-        depth=cfg.model.depth,
-        num_heads=cfg.model.num_heads,
-        decoder_embed_dim=cfg.model.decoder_embed_dim,
-        decoder_depth=cfg.model.decoder_depth,
-        decoder_num_heads=cfg.model.decoder_num_heads,
-        mlp_ratio=cfg.model.mlp_ratio,
-        num_frames=cfg.model.num_frames,
-        t_patch_size=cfg.model.t_patch_size,
-        in_chans=cfg.model.in_chans,
-        aux_chans=cfg.model.aux_chans,
-        aux_embed_dim=cfg.model.aux_embed_dim,
-        temperature=cfg.model.temperature,
-        mask_ratio=cfg.model.mask_ratio,
-        contrastive_mode=cfg.model.contrastive_mode,
-        use_thickness_mask=cfg.model.use_thickness_mask,
-        intra_div_weight=cfg.model.intra_div_weight,
-        inter_div_weight=cfg.model.inter_div_weight,
-    )
-
-    # Move model to device
-    model = model.to(device)
-
-    for param in model.parameters():
-        param.data = param.data.to(device)
-
-    # Print model summary
-    print(f"Model initialized: {model.__class__.__name__}")
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-
-    # Create optimizer
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.optimizer.lr,
-        weight_decay=cfg.optimizer.weight_decay,
-        betas=(cfg.optimizer.beta1, cfg.optimizer.beta2),
-    )
-    # Add this debug statement
-    print(f"DEBUG - Initial learning rate after optimizer creation: {optimizer.param_groups[0]['lr']}")
-
-    # Create learning rate scheduler
-
-    # Before scheduler creation
-    print(f"DEBUG - Learning rate before scheduler setup: {optimizer.param_groups[0]['lr']}")
-
-    # Create learning rate scheduler
-    scheduler_step_frequency = "epoch"  # Default
-    if cfg.scheduler.use_scheduler:
-        if cfg.scheduler.type == "cosine":
-            # Calculate warmup steps based on our samples per epoch instead of total dataset
-            samples_per_epoch = 2000  # Your configured samples per epoch
-            batches_per_epoch = samples_per_epoch // cfg.training.batch_size
-            total_batches = batches_per_epoch * cfg.training.epochs
-
-            if use_warmup and warmup_ratio > 0:
-                # Calculate warmup steps
-                warmup_steps = int(warmup_ratio * total_batches)
-
-                # Create warmup-cosine scheduler
-                scheduler = get_warmup_cosine_schedule(
-                    optimizer,
-                    warmup_steps=warmup_steps,
-                    total_steps=total_batches,
-                    min_lr=cfg.scheduler.min_lr,
-                    base_lr=cfg.optimizer.lr,
-                    use_warmup=True
-                )
-                scheduler_step_frequency = "batch"
-            else:
-                # Cosine scheduler without warmup
-                scheduler = get_warmup_cosine_schedule(
-                    optimizer,
-                    warmup_steps=0,
-                    total_steps=total_batches,
-                    min_lr=cfg.scheduler.min_lr,
-                    base_lr=cfg.optimizer.lr,
-                    use_warmup=False
-                )
-                scheduler_step_frequency = "batch" if cfg.scheduler.get('step_every_batch', True) else "epoch"
-        elif cfg.scheduler.type == "step":
-            scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer,
-                step_size=cfg.scheduler.step_size,
-                gamma=cfg.scheduler.gamma
-            )
-        elif cfg.scheduler.type == "reduce_on_plateau":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode='min',
-                factor=cfg.scheduler.factor,
-                patience=cfg.scheduler.patience,
-                min_lr=cfg.scheduler.min_lr
-            )
-        else:
-            raise ValueError(f"Unknown scheduler type: {cfg.scheduler.type}")
-    else:
-        scheduler = None
-        scheduler_step_frequency = None
-
-    print(f"==== Scheduler enabled: {cfg.scheduler.use_scheduler} ====")
-    print(f"==== Scheduler object exists: {scheduler is not None} ====")
-    if scheduler is not None:
-        print(f"==== Scheduler type: {type(scheduler).__name__} ====")
-
-
-
-    # Resume from checkpoint if specified
-    start_epoch = 0
-    val_losses = []
-    best_val_loss = float('inf')
-
-    if cfg.training.resume_from_checkpoint:
-        checkpoint_path = cfg.training.checkpoint_path
-        if os.path.exists(checkpoint_path):
-            print(f"Loading checkpoint from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            start_epoch = checkpoint['epoch'] + 1
-            best_val_loss = checkpoint['val_loss']
-            print(f"Resuming from epoch {start_epoch}")
-        else:
-            print(f"Checkpoint not found at {checkpoint_path}, starting from scratch")
-
-    # Training loop
-    print(f"Starting training for {cfg.training.epochs} epochs")
-    total_start_time = time.time()  # Add this line to record when training started
-    early_stopped = False  # Add this line to track if early stopping occurred
-
-    # Training loop
-    for epoch in range(start_epoch, cfg.training.epochs):
-        # Get progress information
-        dataset_size = len(train_loader.sampler.data_source)
-        current_position = train_loader.sampler.current_position
-        samples_per_epoch = train_loader.sampler.samples_per_epoch
-        progress_percent = (current_position / dataset_size) * 100
-
-        print(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
-        print(f"Dataset progress: {current_position}/{dataset_size} samples ({progress_percent:.1f}%)")
-        print(f"Samples this epoch: {min(samples_per_epoch, dataset_size - current_position)}")
-
-        epoch_start_time = time.time()
-
-        # Clear memory before each epoch
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        #  Run gradient diagnostics every 10 epochs
-        if should_run_diagnostics(epoch, cfg.diagnostics.frequency):
-            print(f"\nRunning gradient diagnostics at epoch {epoch}...")
-            success, gradient_results, summary_path = run_gradient_diagnostics_with_error_handling(
-                model=model,
-                train_loader=train_loader,
-                device=device,
-                output_dir=output_dir,
-                epoch=epoch
-            )
-
-            # Log diagnostic results to MLflow if enabled and successful
-            if success and cfg.logging.use_mlflow:
-                try:
-                    # Make sure the summary file exists before logging it
-                    if os.path.exists(summary_path):
-                        mlflow.log_artifact(
-                            summary_path,
-                            f"gradient_diagnostics/epoch_{epoch}"
-                        )
-
-                        # Log whether vanishing gradients were detected
-                        mlflow.log_metric(
-                            "has_vanishing_gradients",
-                            1 if gradient_results["has_vanishing_gradients"] else 0,
-                            step=epoch
-                        )
-                    else:
-                        print(f"Warning: Cannot log to MLflow - summary path not found: {summary_path}")
-                except Exception as mlflow_err:
-                    print(f"Error logging gradient diagnostics to MLflow: {mlflow_err}")
-
-        # Training phase
-        train_outputs = train_epoch(
-            model, train_loader, optimizer, device,
-            contrastive_mode=cfg.model.contrastive_mode,
-            scheduler=scheduler if scheduler_step_frequency == "batch" else None,
-            scheduler_step_frequency=scheduler_step_frequency
-        )
-        train_metrics = calculate_metrics(train_outputs, optimizer)
-
-        # Validation phase
-        val_outputs = validate_epoch(
-            model, val_loader, device,
-            contrastive_mode=cfg.model.contrastive_mode
-        )
-        val_metrics = calculate_metrics(val_outputs)
-
-        # Visualise
-        if (epoch + 1) % cfg.visualization.viz_frequency == 0 or epoch == cfg.training.epochs - 1:
-            # Clear cache before visualization
-            torch.cuda.empty_cache()
-
-            print("Generating reconstruction visualization...")
-            recon_path = visualize_reconstruction_during_training(
-                model, val_loader, device, epoch, output_dir
-            )
-
-            # Clear cache after visualization
-            torch.cuda.empty_cache()
-
-            # Log reconstruction to TensorBoard and MLflow
-            if recon_path:
-                log_reconstruction(recon_path, epoch, writer, cfg.logging.use_mlflow)
-
-        # Update learning rate scheduler - only for epoch-based schedulers
-        # Update learning rate scheduler - only for epoch-based schedulers
-        if scheduler is not None and scheduler_step_frequency == "epoch":
-            print(f"==== Before epoch scheduler step LR: {optimizer.param_groups[0]['lr']} ====")
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_metrics['loss'])
-            else:
-                scheduler.step()
-            print(f"==== After epoch scheduler step LR: {optimizer.param_groups[0]['lr']} ====")
-
-        # Calculate epoch time
-        epoch_time = time.time() - epoch_start_time
-
-        # Print metrics summary
-        print(f"Train Loss: {train_metrics['loss']:.10f}, "
-              f"Val Loss: {val_metrics['loss']:.10f}, "
-              f"LR: {optimizer.param_groups[0]['lr']:.8f}, "
-              f"Time: {epoch_time:.2f}s")
-
-        # Log to TensorBoard and MLflow
-        log_metrics('train', train_metrics, epoch, writer, cfg.logging.use_mlflow)
-        log_metrics('val', val_metrics, epoch, writer, cfg.logging.use_mlflow)
-
-        # Save metrics to CSV
-        save_metrics_to_csv(train_metrics, output_dir, epoch, 'train')
-        save_metrics_to_csv(val_metrics, output_dir, epoch, 'val')
-
-        # Save epoch summary
-        save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, epoch_time)
-
-        # Keep track of validation losses for early stopping
-        val_losses.append(val_metrics['loss'])
-
-        # Save checkpoint
-        is_best = val_metrics['loss'] < best_val_loss
-        if is_best:
-            best_val_loss = val_metrics['loss']
-            print(f"New best validation loss: {best_val_loss:.6f}")
-
-        # Only pass is_best=True when it's actually the best model
-        save_checkpoint(model, optimizer, epoch, val_metrics['loss'], output_dir, is_best=is_best)
-
-        # Check for early stopping
-        if cfg.training.early_stopping.enabled:
-            if check_early_stopping(
-                    val_losses,
-                    cfg.training.early_stopping.patience,
-                    cfg.training.early_stopping.min_delta
-            ):
-                print(f"Early stopping triggered after epoch {epoch + 1}")
-                early_stopped = True  # Add this line to record that early stopping happened
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx >= max_batches:
                 break
 
-    # Calculate total training time
-    total_training_time = time.time() - total_start_time
+            try:
+                # Get data
+                hsi = batch['hsi'].to(device)
+                aux_data = {k: v.to(device) if v is not None else None
+                            for k, v in batch['aux_data'].items()}
+                batch_idx_tensor = batch['batch_idx'].to(device)
 
-    # Final logging
-    print("\nTraining completed!")
-    print(f"Best validation loss: {best_val_loss:.6f}")
+                # Clear gradients
+                optimizer.zero_grad()
 
-    # Update the summary file with training results
-    update_summary_with_results(
-        output_dir,
-        best_val_loss,
-        total_training_time,
-        epoch + 1,  # Number of epochs completed
-        early_stopped
-    )
+                # Forward pass with AMP
+                with torch.cuda.amp.autocast():
+                    output = model(hsi, aux_data, batch_idx_tensor)
+                    loss = output['loss']
 
-    # Log the configuration summary to MLflow if enabled
-    if cfg.logging.use_mlflow:
-        summary_path = os.path.join(output_dir, 'summaries', "training_configuration.txt")
-        if os.path.exists(summary_path):
-            mlflow.log_artifact(summary_path, "training_summary")
-        mlflow.end_run()
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()
 
-    # Close TensorBoard writer
-    writer.close()
+                # KEY IMPROVEMENT: Collect gradients now - AFTER backward() but BEFORE optimizer step
+                diagnostics.collect_and_analyze_gradients(batch_idx, loss=loss.item(), scaler=scaler)
+
+                # Update weights and scaler
+                scaler.step(optimizer)
+                scaler.update()
+
+                successful_batches += 1
+
+                # Clean up
+                del hsi, aux_data, batch_idx_tensor, output, loss
+                torch.cuda.empty_cache()
+
+            except Exception as batch_err:
+                print(f"Error processing batch {batch_idx} for diagnostics: {batch_err}")
+
+        # Remove the gradient checkpointing flag
+        if hasattr(model, '_disable_gradient_checkpointing'):
+            delattr(model, '_disable_gradient_checkpointing')
+
+        # Restore original training state
+        if not was_training:
+            model.eval()
+
+        # Check if we processed at least one batch successfully
+        if successful_batches == 0:
+            raise RuntimeError("No batches were successfully processed for gradient diagnostics")
+
+        # Generate the diagnostic report
+        results, summary_path = diagnostics.generate_report()
+
+        print(f"Gradient diagnostics completed successfully for epoch {epoch}")
+
+        # Verify that the summary file exists
+        if not os.path.exists(summary_path):
+            print(f"Warning: Summary file not found at {summary_path}")
+            # Create a minimal summary file if it doesn't exist
+            os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+            with open(summary_path, 'w') as f:
+                f.write("Gradient Diagnostics Summary\n")
+                f.write("No detailed information available\n")
+
+        return True, results[0], summary_path
+
+    except Exception as e:
+        print(f"Error running gradient diagnostics: {e}")
+        import traceback
+        traceback.print_exc()
+
+        # Create minimal error report
+        error_dir = os.path.join(output_dir, 'gradient_diagnostics', f'epoch_{epoch}_error')
+        os.makedirs(error_dir, exist_ok=True)
+
+        error_path = os.path.join(error_dir, "error_report.txt")
+        with open(error_path, 'w') as f:
+            f.write(f"Error running gradient diagnostics for epoch {epoch}\n")
+            f.write(f"Error: {str(e)}\n")
+            f.write("\nTraceback:\n")
+            f.write(traceback.format_exc())
+
+        return False, {"has_vanishing_gradients": False, "errors": [str(e)]}, error_path
 
 
 def save_training_summary(cfg, output_dir, train_dataset=None, val_dataset=None):
@@ -1483,72 +1148,480 @@ def update_summary_with_results(output_dir, best_val_loss, training_time, epochs
         return False
 
 
-def should_run_diagnostics(epoch, frequency=10):
-    """Determine if gradient diagnostics should run on this epoch."""
-    return epoch % frequency == 0 or epoch == 0  # Always run on first epoch
+@hydra.main(config_path="configs", config_name="train", version_base="1.1")
+def main(cfg: DictConfig):
+    print(OmegaConf.to_yaml(cfg))
 
+    # Set random seed for reproducibility
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.seed)
+        torch.cuda.manual_seed_all(cfg.seed)
 
-def run_gradient_diagnostics_with_error_handling(model, train_loader, device, output_dir, epoch):
-    """
-    Run gradient diagnostics with proper error handling and directory structure.
+    # Get original working directory for path handling
+    original_cwd = hydra.utils.get_original_cwd()
 
-    Args:
-        model: The model to diagnose
-        train_loader: DataLoader for training data
-        device: The device to run on
-        output_dir: Base output directory
-        epoch: Current epoch number
+    # Convert data paths to absolute paths if they're relative
+    if not os.path.isabs(cfg.data.parent_dir):
+        cfg.data.parent_dir = os.path.join(original_cwd, cfg.data.parent_dir)
+    if not os.path.isabs(cfg.data.train_dir):
+        cfg.data.train_dir = os.path.join(original_cwd, cfg.data.train_dir)
+    if not os.path.isabs(cfg.data.val_dir):
+        cfg.data.val_dir = os.path.join(original_cwd, cfg.data.val_dir)
 
-    Returns:
-        Tuple: (success, diagnostics_results, summary_path)
-    """
-    try:
-        # Create diagnostics directory with proper nesting
-        diagnostics_dir = os.path.join(output_dir, 'gradient_diagnostics')
-        os.makedirs(diagnostics_dir, exist_ok=True)
+    # Set device
+    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-        # Create epoch-specific directory
-        epoch_dir = os.path.join(diagnostics_dir, f"epoch_{epoch}")
-        os.makedirs(epoch_dir, exist_ok=True)
+    # Clear CUDA cache at the beginning
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-        # Call run_gradient_diagnostics WITHOUT the epoch parameter
-        results, summary_path = run_gradient_diagnostics(
-            model=model,
-            train_loader=train_loader,
-            device=device,
-            output_dir=epoch_dir  # Pass the epoch-specific directory
+    # Create output directory
+    output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
+    print(f"Output directory: {output_dir}")
+
+    # Load datasets FIRST (moved up from later in the function)
+    train_dataset = None
+    val_dataset = None
+    train_loader = None
+    val_loader = None
+
+    if cfg.data.use_auto_split:
+        print(f"Loading dataset with auto split: {cfg.data.auto_split_ratio}")
+
+        # Load the entire dataset
+        dataset = PatientDataset(
+            parent_dir=cfg.data.parent_dir,
+            analysis_dim=cfg.model.analysis_dim,
+            target_bands=cfg.model.num_frames
         )
 
-        print(f"Gradient diagnostics completed successfully for epoch {epoch}")
+        # Split into train and validation sets
+        val_size = int(len(dataset) * cfg.data.auto_split_ratio)
+        train_size = len(dataset) - val_size
+        train_dataset, val_dataset = random_split(
+            dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(cfg.seed)
+        )
 
-        # Verify that the summary file exists
-        if not os.path.exists(summary_path):
-            print(f"Warning: Summary file not found at {summary_path}")
-            # Create a minimal summary file if it doesn't exist
-            os.makedirs(os.path.dirname(summary_path), exist_ok=True)
-            with open(summary_path, 'w') as f:
-                f.write("Gradient Diagnostics Summary\n")
-                f.write("No detailed information available\n")
+        # Create Progressive Sampler for train dataset
+        train_sampler = ProgressiveSampler(
+            train_dataset,
+            samples_per_epoch=2000,  # Your desired samples per epoch
+            shuffle=True
+        )
 
-        return True, results, summary_path
+        # Create dataloaders with the sampler
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.training.batch_size,
+            sampler=train_sampler,  # Use the progressive sampler instead of shuffle
+            num_workers=cfg.data.num_workers,
+            pin_memory=False,
+            collate_fn=custom_collate_fn,
+            drop_last=cfg.data.drop_last,
+        )
 
-    except Exception as e:
-        print(f"Error running gradient diagnostics: {e}")
-        import traceback
-        traceback.print_exc()
+        # Add augmentation transform to the train_dataset
+        if cfg.data.use_augmentation:
+            train_dataset.dataset.transform = MultiModalTransforms(
+                prob=cfg.data.augmentation.prob,
+                rotation_degrees=cfg.data.augmentation.rotation_degrees,
+                scale_range=cfg.data.augmentation.scale_range,
+                # New augmentation parameters
+                intensity_range=cfg.data.augmentation.intensity.range,
+                noise_level_range=cfg.data.augmentation.noise.level_range,
+                band_mask_ratio=cfg.data.augmentation.band_mask.ratio,
+                use_intensity=cfg.data.augmentation.intensity.enabled,
+                use_noise=cfg.data.augmentation.noise.enabled,
+                use_band_mask=cfg.data.augmentation.band_mask.enabled
+            )
 
-        # Create minimal error report
-        error_dir = os.path.join(output_dir, 'gradient_diagnostics', f'epoch_{epoch}_error')
-        os.makedirs(error_dir, exist_ok=True)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=cfg.training.batch_size,
+            shuffle=False,
+            num_workers=cfg.data.num_workers,
+            pin_memory=False,
+            collate_fn=custom_collate_fn,
+        )
 
-        error_path = os.path.join(error_dir, "error_report.txt")
-        with open(error_path, 'w') as f:
-            f.write(f"Error running gradient diagnostics for epoch {epoch}\n")
-            f.write(f"Error: {str(e)}\n")
-            f.write("\nTraceback:\n")
-            f.write(traceback.format_exc())
+        print(f"Dataset split: {train_size} training, {val_size} validation")
+        print(f"Using ProgressiveSampler: {2000} samples per epoch")
 
-        return False, {"has_vanishing_gradients": False, "errors": [str(e)]}, error_path
+    else:
+        print(f"Using predefined split: {cfg.data.train_dir} and {cfg.data.val_dir}")
+
+        # Create the training dataset
+        train_dataset = PatientDataset(
+            parent_dir=cfg.data.train_dir,
+            analysis_dim=cfg.model.analysis_dim,
+            target_bands=cfg.model.num_frames
+        )
+
+        # Create Progressive Sampler for train dataset
+        train_sampler = ProgressiveSampler(
+            train_dataset,
+            samples_per_epoch=2000,  # Your desired samples per epoch
+            shuffle=True
+        )
+
+        # Create train loader with the sampler
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=cfg.training.batch_size,
+            sampler=train_sampler,  # Use the progressive sampler
+            num_workers=cfg.data.num_workers,
+            pin_memory=False,
+            collate_fn=custom_collate_fn,
+            drop_last=cfg.data.drop_last,
+        )
+
+        # Add augmentation if needed
+        if cfg.data.use_augmentation:
+            train_dataset.transform = MultiModalTransforms(
+                prob=cfg.data.augmentation.prob,
+                rotation_degrees=cfg.data.augmentation.rotation_degrees,
+                scale_range=cfg.data.augmentation.scale_range,
+                # New augmentation parameters
+                intensity_range=cfg.data.augmentation.intensity.range,
+                noise_level_range=cfg.data.augmentation.noise.level_range,
+                band_mask_ratio=cfg.data.augmentation.band_mask.ratio,
+                use_intensity=cfg.data.augmentation.intensity.enabled,
+                use_noise=cfg.data.augmentation.noise.enabled,
+                use_band_mask=cfg.data.augmentation.band_mask.enabled
+            )
+
+        # Create validation loader normally (no progressive sampling needed)
+        val_loader = create_patient_dataloader(
+            parent_dir=cfg.data.val_dir,
+            analysis_dim=cfg.model.analysis_dim,
+            target_bands=cfg.model.num_frames,
+            batch_size=cfg.training.batch_size,
+            num_workers=cfg.data.num_workers,
+            shuffle=False,
+            augment=False  # No augmentation for validation
+        )
+
+        print(f"Using ProgressiveSampler: {2000} samples per epoch")
+
+    # NOW save hyperparameter and training configuration summary AFTER datasets are created
+    summary_path = save_training_summary(cfg, output_dir, train_dataset, val_dataset)
+    print(f"Training configuration summary saved to: {summary_path}")
+
+    # Set up MLflow
+    if cfg.logging.use_mlflow:
+        mlflow.set_experiment(cfg.logging.experiment_name)
+        mlflow.start_run(run_name=cfg.logging.run_name)
+
+        # Log Hydra config
+        mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
+
+        # Log configuration summary to MLflow
+        if summary_path and os.path.exists(summary_path):
+            mlflow.log_artifact(summary_path)
+
+    # Set up TensorBoard
+    writer = SummaryWriter(log_dir=os.path.join(output_dir, 'tensorboard'))
+
+    # Create and initialize model
+    model = MultiModalSpectralGPT(
+        analysis_dim=cfg.model.analysis_dim,
+        patch_size=cfg.model.patch_size,
+        embed_dim=cfg.model.embed_dim,
+        depth=cfg.model.depth,
+        num_heads=cfg.model.num_heads,
+        decoder_embed_dim=cfg.model.decoder_embed_dim,
+        decoder_depth=cfg.model.decoder_depth,
+        decoder_num_heads=cfg.model.decoder_num_heads,
+        mlp_ratio=cfg.model.mlp_ratio,
+        num_frames=cfg.model.num_frames,
+        t_patch_size=cfg.model.t_patch_size,
+        in_chans=cfg.model.in_chans,
+        aux_chans=cfg.model.aux_chans,
+        aux_embed_dim=cfg.model.aux_embed_dim,
+        temperature=cfg.model.temperature,
+        mask_ratio=cfg.model.mask_ratio,
+        contrastive_mode=cfg.model.contrastive_mode,
+        use_thickness_mask=cfg.model.use_thickness_mask,
+        intra_div_weight=cfg.model.intra_div_weight,
+        inter_div_weight=cfg.model.inter_div_weight,
+    )
+
+    # Move model to device
+    model = model.to(device)
+
+    for param in model.parameters():
+        param.data = param.data.to(device)
+
+    # Print model summary
+    print(f"Model initialized: {model.__class__.__name__}")
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+    # Create optimizer
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.optimizer.lr,
+        weight_decay=cfg.optimizer.weight_decay,
+        betas=(cfg.optimizer.beta1, cfg.optimizer.beta2),
+    )
+    # Add this debug statement
+    print(f"DEBUG - Initial learning rate after optimizer creation: {optimizer.param_groups[0]['lr']}")
+
+    # Create learning rate scheduler
+
+    # Before scheduler creation
+    print(f"DEBUG - Learning rate before scheduler setup: {optimizer.param_groups[0]['lr']}")
+
+    # Create learning rate scheduler
+    scheduler_step_frequency = "epoch"  # Default
+    if cfg.scheduler.use_scheduler:
+        if cfg.scheduler.type == "cosine":
+            # Calculate warmup steps based on our samples per epoch instead of total dataset
+            samples_per_epoch = 2000  # Your configured samples per epoch
+            batches_per_epoch = samples_per_epoch // cfg.training.batch_size
+            total_batches = batches_per_epoch * cfg.training.epochs
+
+            # Get warmup settings
+            use_warmup = cfg.scheduler.get('use_warmup', False)
+            warmup_ratio = cfg.scheduler.get('warmup_ratio', 0.0)
+
+            if use_warmup and warmup_ratio > 0:
+                # Calculate warmup steps
+                warmup_steps = int(warmup_ratio * total_batches)
+
+                # Create warmup-cosine scheduler
+                scheduler = get_warmup_cosine_schedule(
+                    optimizer,
+                    warmup_steps=warmup_steps,
+                    total_steps=total_batches,
+                    min_lr=cfg.scheduler.min_lr,
+                    base_lr=cfg.optimizer.lr,
+                    use_warmup=True
+                )
+                scheduler_step_frequency = "batch"
+            else:
+                # Cosine scheduler without warmup
+                scheduler = get_warmup_cosine_schedule(
+                    optimizer,
+                    warmup_steps=0,
+                    total_steps=total_batches,
+                    min_lr=cfg.scheduler.min_lr,
+                    base_lr=cfg.optimizer.lr,
+                    use_warmup=False
+                )
+                scheduler_step_frequency = "batch" if cfg.scheduler.get('step_every_batch', True) else "epoch"
+        elif cfg.scheduler.type == "step":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=cfg.scheduler.step_size,
+                gamma=cfg.scheduler.gamma
+            )
+        elif cfg.scheduler.type == "reduce_on_plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=cfg.scheduler.factor,
+                patience=cfg.scheduler.patience,
+                min_lr=cfg.scheduler.min_lr
+            )
+        else:
+            raise ValueError(f"Unknown scheduler type: {cfg.scheduler.type}")
+    else:
+        scheduler = None
+        scheduler_step_frequency = None
+
+    print(f"==== Scheduler enabled: {cfg.scheduler.use_scheduler} ====")
+    print(f"==== Scheduler object exists: {scheduler is not None} ====")
+    if scheduler is not None:
+        print(f"==== Scheduler type: {type(scheduler).__name__} ====")
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    val_losses = []
+    best_val_loss = float('inf')
+
+    if cfg.training.resume_from_checkpoint:
+        checkpoint_path = cfg.training.checkpoint_path
+        if os.path.exists(checkpoint_path):
+            print(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint['val_loss']
+            print(f"Resuming from epoch {start_epoch}")
+        else:
+            print(f"Checkpoint not found at {checkpoint_path}, starting from scratch")
+
+    # Training loop
+    print(f"Starting training for {cfg.training.epochs} epochs")
+    total_start_time = time.time()  # Add this line to record when training started
+    early_stopped = False  # Add this line to track if early stopping occurred
+
+    # Training loop
+    for epoch in range(start_epoch, cfg.training.epochs):
+        # Get progress information
+        dataset_size = len(train_loader.sampler.data_source)
+        current_position = train_loader.sampler.current_position
+        samples_per_epoch = train_loader.sampler.samples_per_epoch
+        progress_percent = (current_position / dataset_size) * 100
+
+        print(f"\nEpoch {epoch + 1}/{cfg.training.epochs}")
+        print(f"Dataset progress: {current_position}/{dataset_size} samples ({progress_percent:.1f}%)")
+        print(f"Samples this epoch: {min(samples_per_epoch, dataset_size - current_position)}")
+
+        epoch_start_time = time.time()
+
+        # Clear memory before each epoch
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        #  Run gradient diagnostics every N epochs
+        if should_run_diagnostics(epoch, cfg.diagnostics.frequency):
+            print(f"\nRunning gradient diagnostics at epoch {epoch}...")
+            success, gradient_results, summary_path = run_gradient_diagnostics_with_error_handling(
+                model=model,
+                train_loader=train_loader,
+                device=device,
+                output_dir=output_dir,
+                epoch=epoch
+            )
+
+            # Log diagnostic results to MLflow if enabled and successful
+            if success and cfg.logging.use_mlflow:
+                try:
+                    # Make sure the summary file exists before logging it
+                    if os.path.exists(summary_path):
+                        mlflow.log_artifact(
+                            summary_path,
+                            f"gradient_diagnostics/epoch_{epoch}"
+                        )
+
+                        # Log whether vanishing gradients were detected
+                        mlflow.log_metric(
+                            "has_vanishing_gradients",
+                            1 if gradient_results["has_vanishing_gradients"] else 0,
+                            step=epoch
+                        )
+                    else:
+                        print(f"Warning: Cannot log to MLflow - summary path not found: {summary_path}")
+                except Exception as mlflow_err:
+                    print(f"Error logging gradient diagnostics to MLflow: {mlflow_err}")
+
+        # Training phase
+        train_outputs = train_epoch(
+            model, train_loader, optimizer, device,
+            contrastive_mode=cfg.model.contrastive_mode,
+            scheduler=scheduler if scheduler_step_frequency == "batch" else None,
+            scheduler_step_frequency=scheduler_step_frequency
+        )
+        train_metrics = calculate_metrics(train_outputs, optimizer)
+
+        # Validation phase
+        val_outputs = validate_epoch(
+            model, val_loader, device,
+            contrastive_mode=cfg.model.contrastive_mode
+        )
+        val_metrics = calculate_metrics(val_outputs)
+
+        # Visualise
+        if (epoch + 1) % cfg.visualization.viz_frequency == 0 or epoch == cfg.training.epochs - 1:
+            # Clear cache before visualization
+            torch.cuda.empty_cache()
+
+            print("Generating reconstruction visualization...")
+            recon_path = visualize_reconstruction_during_training(
+                model, val_loader, device, epoch, output_dir
+            )
+
+            # Clear cache after visualization
+            torch.cuda.empty_cache()
+
+            # Log reconstruction to TensorBoard and MLflow
+            if recon_path:
+                log_reconstruction(recon_path, epoch, writer, cfg.logging.use_mlflow)
+
+        # Update learning rate scheduler - only for epoch-based schedulers
+        if scheduler is not None and scheduler_step_frequency == "epoch":
+            print(f"==== Before epoch scheduler step LR: {optimizer.param_groups[0]['lr']} ====")
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_metrics['loss'])
+            else:
+                scheduler.step()
+            print(f"==== After epoch scheduler step LR: {optimizer.param_groups[0]['lr']} ====")
+
+        # Calculate epoch time
+        epoch_time = time.time() - epoch_start_time
+
+        # Print metrics summary
+        print(f"Train Loss: {train_metrics['loss']:.10f}, "
+              f"Val Loss: {val_metrics['loss']:.10f}, "
+              f"LR: {optimizer.param_groups[0]['lr']:.8f}, "
+              f"Time: {epoch_time:.2f}s")
+
+        # Log to TensorBoard and MLflow
+        log_metrics('train', train_metrics, epoch, writer, cfg.logging.use_mlflow)
+        log_metrics('val', val_metrics, epoch, writer, cfg.logging.use_mlflow)
+
+        # Save metrics to CSV
+        save_metrics_to_csv(train_metrics, output_dir, epoch, 'train')
+        save_metrics_to_csv(val_metrics, output_dir, epoch, 'val')
+
+        # Save epoch summary
+        save_epoch_summary(train_metrics, val_metrics, epoch, output_dir, epoch_time)
+
+        # Keep track of validation losses for early stopping
+        val_losses.append(val_metrics['loss'])
+
+        # Save checkpoint
+        is_best = val_metrics['loss'] < best_val_loss
+        if is_best:
+            best_val_loss = val_metrics['loss']
+            print(f"New best validation loss: {best_val_loss:.6f}")
+
+        # Only pass is_best=True when it's actually the best model
+        save_checkpoint(model, optimizer, epoch, val_metrics['loss'], output_dir, is_best=is_best)
+
+        # Check for early stopping
+        if cfg.training.early_stopping.enabled:
+            if check_early_stopping(
+                    val_losses,
+                    cfg.training.early_stopping.patience,
+                    cfg.training.early_stopping.min_delta
+            ):
+                print(f"Early stopping triggered after epoch {epoch + 1}")
+                early_stopped = True  # Add this line to record that early stopping happened
+                break
+
+    # Calculate total training time
+    total_training_time = time.time() - total_start_time
+
+    # Final logging
+    print("\nTraining completed!")
+    print(f"Best validation loss: {best_val_loss:.6f}")
+
+    # Update the summary file with training results
+    update_summary_with_results(
+        output_dir,
+        best_val_loss,
+        total_training_time,
+        epoch + 1,  # Number of epochs completed
+        early_stopped
+    )
+
+    # Log the configuration summary to MLflow if enabled
+    if cfg.logging.use_mlflow:
+        summary_path = os.path.join(output_dir, 'summaries', "training_configuration.txt")
+        if os.path.exists(summary_path):
+            mlflow.log_artifact(summary_path, "training_summary")
+        mlflow.end_run()
+
+    # Close TensorBoard writer
+    writer.close()
+
 
 if __name__ == "__main__":
     main()

@@ -13,6 +13,11 @@ class GradientDiagnostics:
     """
     An improved diagnostics tool to monitor and analyze gradients in the MultiModalSpectralGPT model
     to help identify vanishing gradient problems across the entire model.
+
+    Key improvements:
+    - Direct gradient collection after backward pass instead of hooks
+    - Better handling of mixed precision training
+    - Enhanced visualization and analysis
     """
 
     def __init__(self, model, output_dir="gradient_diagnostics"):
@@ -86,34 +91,11 @@ class GradientDiagnostics:
         self.log_fh.flush()
 
     def register_gradient_hooks(self):
-        """Register gradient hooks on all model parameters - improved version"""
-        self.log("Registering gradient hooks on model parameters")
-
-        # Clear any existing hooks
-        for handle in self.hook_handles:
-            handle.remove()
-        self.hook_handles = []
-
-        # Register new hooks - count parameters by gradient requirement
-        requires_grad_count = 0
-        no_grad_count = 0
-
-        # Register hooks for each parameter - use a proper hook function
-        for name, param in self.named_parameters:
-            if param.requires_grad:
-                requires_grad_count += 1
-
-                # Define hook function with fixed name parameter
-                def hook_fn(grad, param_name=name):
-                    return self._gradient_hook(grad, param_name)
-
-                handle = param.register_hook(hook_fn)
-                self.hook_handles.append(handle)
-            else:
-                no_grad_count += 1
-
-        self.log(f"Registered gradient hooks on {requires_grad_count} parameters")
-        self.log(f"Skipped {no_grad_count} parameters that don't require gradients")
+        """
+        This method is kept for backward compatibility, but we're no longer using hooks
+        for gradient collection as they don't work reliably with mixed precision training.
+        """
+        self.log("Gradient hooks are no longer used - gradients will be collected directly after backward()")
         return self
 
     def register_activation_hooks(self):
@@ -153,49 +135,6 @@ class GradientDiagnostics:
         self.log(f"Registered activation hooks on {len(monitored_layers)} layers")
         return self
 
-    def _gradient_hook(self, grad, name):
-        """Hook function to capture gradient statistics - improved version"""
-        if grad is None:
-            self.log(f"Warning: Gradient is None for parameter {name}")
-            return None
-
-        # Calculate gradient statistics
-        with torch.no_grad():
-            grad_abs = grad.abs()
-
-            # Handle different tensor shapes
-            if grad.dim() > 1:
-                flat_grad = grad.view(-1)
-                median_val = torch.median(flat_grad)
-            else:
-                median_val = torch.median(grad)
-
-            stats = {
-                "norm": torch.norm(grad).item(),
-                "mean": grad.mean().item(),
-                "std": grad.std().item(),
-                "min": grad.min().item(),
-                "max": grad.max().item(),
-                "median": median_val.item(),
-                "zeros": (grad == 0).float().mean().item(),
-                "name": name,
-                "batch": self.batch_counter
-            }
-
-            # Categorize the parameter
-            for category, keywords in self.layer_categories.items():
-                if any(keyword in name for keyword in keywords):
-                    stats["category"] = category
-                    break
-            else:
-                stats["category"] = "other"
-
-            # Store the stats
-            self.grad_stats[name].append(stats)
-
-        # The hook must return the gradient unchanged
-        return grad
-
     def _activation_hook(self, output, name):
         """Hook function to capture activation statistics - improved version"""
         with torch.no_grad():
@@ -228,6 +167,105 @@ class GradientDiagnostics:
         # No need to return anything for activation hooks
         return None
 
+    def collect_and_analyze_gradients(self, batch_idx, loss=None, scaler=None):
+        """
+        Collect and analyze gradients after backward() but before optimizer step.
+        This is a key improvement to correctly capture gradients when using mixed precision training.
+
+        Args:
+            batch_idx: Current batch index
+            loss: Loss value for the current batch
+            scaler: GradScaler instance for mixed precision training
+        """
+        self.batch_counter = batch_idx
+        self.log(f"Analyzing batch {batch_idx}")
+
+        # Track GradScaler if provided
+        if scaler is not None:
+            self.track_gradscaler(scaler)
+
+        # Collect gradients directly from parameters
+        grad_count = 0
+        total_params = 0
+        grad_by_category = defaultdict(int)
+        interesting_grads = []
+
+        for name, param in self.named_parameters:
+            if param.requires_grad:
+                total_params += 1
+                if param.grad is not None:
+                    grad_count += 1
+
+                    # Calculate gradient statistics
+                    with torch.no_grad():
+                        grad = param.grad
+                        grad_abs = grad.abs()
+
+                        # Handle different tensor shapes
+                        if grad.dim() > 1:
+                            flat_grad = grad.view(-1)
+                            median_val = torch.median(flat_grad)
+                        else:
+                            median_val = torch.median(grad)
+
+                        # Collect important stats
+                        stats = {
+                            "norm": torch.norm(grad).item(),
+                            "mean": grad.mean().item(),
+                            "std": grad.std().item(),
+                            "min": grad.min().item(),
+                            "max": grad.max().item(),
+                            "median": median_val.item(),
+                            "zeros": (grad == 0).float().mean().item(),
+                            "name": name,
+                            "batch": self.batch_counter
+                        }
+
+                        # Categorize the parameter
+                        category = "other"
+                        for cat_name, keywords in self.layer_categories.items():
+                            if any(keyword in name for keyword in keywords):
+                                category = cat_name
+                                break
+
+                        stats["category"] = category
+                        grad_by_category[category] += 1
+
+                        # Store the stats
+                        self.grad_stats[name].append(stats)
+
+                        # Track interesting gradients (key layers) for reporting
+                        if 'decoder_pred' in name or 'blocks.0' in name or 'decoder_blocks.0' in name:
+                            grad_mean = grad_abs.mean().item()
+                            interesting_grads.append(f"{name}: {grad_mean:.8f}")
+
+        # Log detailed gradient information
+        self.log(f"Collected gradients for {grad_count}/{total_params} parameters")
+
+        # Log categories with gradients
+        for category, count in grad_by_category.items():
+            self.log(f"  - {category}: {count} parameters have gradients")
+
+        # Log sample interesting gradients
+        if interesting_grads:
+            self.log(f"Sample gradients: {', '.join(interesting_grads[:5])}")
+        else:
+            self.log(f"No interesting gradients found")
+
+        # Check for gradient coverage across categories
+        missing_categories = []
+        for category in self.layer_categories:
+            if grad_by_category[category] == 0:
+                missing_categories.append(category)
+
+        if missing_categories:
+            self.log(f"Warning: No gradients collected for categories: {missing_categories}")
+        else:
+            self.log(f"Good gradient coverage: gradients found for all categories")
+
+        # Return self for chaining
+        return self
+
     def track_gradscaler(self, scaler):
         """Track GradScaler statistics"""
         if isinstance(scaler, GradScaler):
@@ -240,22 +278,11 @@ class GradientDiagnostics:
             self.log(f"Tracked GradScaler with scale: {scaler.get_scale()}")
 
     def analyze_batch(self, batch_idx, loss=None, scaler=None):
-        """Analyze a batch after backward pass"""
-        self.batch_counter = batch_idx
-        self.log(f"Analyzing batch {batch_idx}")
-
-        # Track GradScaler if provided
-        if scaler is not None:
-            self.track_gradscaler(scaler)
-
-        # Check gradient statistics directly
-        self.check_gradients_directly()
-
-        # Check if we have gradients for each layer type
-        self._check_gradient_coverage()
-
-        # Return self for chaining
-        return self
+        """
+        Backwards compatibility method that redirects to collect_and_analyze_gradients.
+        """
+        self.log("analyze_batch is deprecated, redirecting to collect_and_analyze_gradients")
+        return self.collect_and_analyze_gradients(batch_idx, loss, scaler)
 
     def check_gradients_directly(self):
         """Check gradients directly from model parameters"""
@@ -1021,6 +1048,8 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     Temporarily disables gradient checkpointing to ensure accurate gradient collection,
     then restores the original state before returning.
     Uses a smaller batch size to avoid memory errors.
+
+    Key improvement: Collects gradients after backward() but before optimizer step.
     """
     print("\n" + "=" * 80)
     print("RUNNING GRADIENT DIAGNOSTICS")
@@ -1038,8 +1067,7 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     # Create diagnostics tool
     diagnostics = GradientDiagnostics(model, output_dir=epoch_dir)
 
-    # Register monitoring hooks - do this before optimizer creation
-    diagnostics.register_gradient_hooks()
+    # We'll only register activation hooks - we'll collect gradients directly later
     diagnostics.register_activation_hooks()
 
     # Create optimizer and scaler (same settings as main training)
@@ -1089,8 +1117,9 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
 
-            # Log diagnostics for this batch
-            diagnostics.analyze_batch(batch_idx, loss=loss.item(), scaler=scaler)
+            # IMPORTANT: This is the key change - collect gradients AFTER backward()
+            # but BEFORE optimizer step and scaler update
+            diagnostics.collect_and_analyze_gradients(batch_idx, loss=loss.item(), scaler=scaler)
 
             # Update weights with scaler
             scaler.step(optimizer)
@@ -1110,10 +1139,10 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     results = diagnostics.generate_report()
 
     # Print summary
-    if results["has_vanishing_gradients"]:
+    if results[0]["has_vanishing_gradients"]:
         print("\n⚠️ VANISHING GRADIENTS DETECTED!")
         print("\nWarnings:")
-        for warning in results["warnings"]:
+        for warning in results[0]["warnings"]:
             print(f"- {warning}")
     else:
         print("\n✅ No clear signs of vanishing gradients detected.")
