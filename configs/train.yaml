@@ -54,3 +54,4 @@ visualization:
 
 diagnostics:
   run_gradient_diagnostics: true
+  frequency: 10

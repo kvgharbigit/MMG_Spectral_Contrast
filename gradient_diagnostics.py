@@ -1,4 +1,3 @@
-# gradient_diagnostics.py
 import os
 import time
 import torch
@@ -12,7 +11,7 @@ from torch.cuda.amp import GradScaler
 
 class GradientDiagnostics:
     """
-    A diagnostics tool to monitor and analyze gradients in the MultiModalSpectralGPT model
+    An improved diagnostics tool to monitor and analyze gradients in the MultiModalSpectralGPT model
     to help identify vanishing gradient problems across the entire model.
     """
 
@@ -37,9 +36,14 @@ class GradientDiagnostics:
         self.scaler_stats = []
         self.batch_counter = 0
 
+        # Store named parameters for easier access later
+        self.named_parameters = list(model.named_parameters())
+        self.param_dict = {name: param for name, param in self.named_parameters}
+
         # Open log file
         self.log_fh = open(self.log_file, "w")
-        self.log("Gradient Diagnostics initialized at {}".format(time.strftime("%Y-%m-%d %H:%M:%S")))
+        self.log(f"Gradient Diagnostics initialized at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.log(f"Model has {len(self.named_parameters)} named parameters")
 
         # Layer categories for analysis
         self.layer_categories = {
@@ -50,8 +54,30 @@ class GradientDiagnostics:
             "contrastive": ["temperature", "mask_token"]
         }
 
+        # Count parameters by category
+        self.count_parameters_by_category()
+
         # Counters for hooks
         self.hook_handles = []
+
+    def count_parameters_by_category(self):
+        """Count parameters by category and log the results"""
+        category_counts = defaultdict(int)
+
+        for name, param in self.named_parameters:
+            if param.requires_grad:
+                category = "other"
+                for cat_name, keywords in self.layer_categories.items():
+                    if any(keyword in name for keyword in keywords):
+                        category = cat_name
+                        break
+                category_counts[category] += 1
+
+        self.log("Parameter counts by category:")
+        for category, count in category_counts.items():
+            self.log(f"  - {category}: {count} parameters")
+
+        return category_counts
 
     def log(self, message):
         """Write a message to the log file and print it"""
@@ -60,7 +86,7 @@ class GradientDiagnostics:
         self.log_fh.flush()
 
     def register_gradient_hooks(self):
-        """Register gradient hooks on all model parameters"""
+        """Register gradient hooks on all model parameters - improved version"""
         self.log("Registering gradient hooks on model parameters")
 
         # Clear any existing hooks
@@ -68,16 +94,26 @@ class GradientDiagnostics:
             handle.remove()
         self.hook_handles = []
 
-        # Register new hooks
-        registered_count = 0
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                # Create a closure with the name parameter explicitly bound
-                handle = param.register_hook(lambda grad, name=name: self._gradient_hook(grad, name))
-                self.hook_handles.append(handle)
-                registered_count += 1
+        # Register new hooks - count parameters by gradient requirement
+        requires_grad_count = 0
+        no_grad_count = 0
 
-        self.log(f"Registered gradient hooks on {registered_count} parameters")
+        # Register hooks for each parameter - use a proper hook function
+        for name, param in self.named_parameters:
+            if param.requires_grad:
+                requires_grad_count += 1
+
+                # Define hook function with fixed name parameter
+                def hook_fn(grad, param_name=name):
+                    return self._gradient_hook(grad, param_name)
+
+                handle = param.register_hook(hook_fn)
+                self.hook_handles.append(handle)
+            else:
+                no_grad_count += 1
+
+        self.log(f"Registered gradient hooks on {requires_grad_count} parameters")
+        self.log(f"Skipped {no_grad_count} parameters that don't require gradients")
         return self
 
     def register_activation_hooks(self):
@@ -96,27 +132,29 @@ class GradientDiagnostics:
         for name, module in self.model.named_modules():
             # Check all normalization layers
             if isinstance(module, torch.nn.LayerNorm):
-                # Use default parameter in lambda to capture current value of name
-                handle = module.register_forward_hook(
-                    lambda mod, inp, out, name=name: self._activation_hook(out, name)
-                )
+                # Define hook function with fixed name parameter
+                def activation_hook_fn(mod, inp, out, layer_name=name):
+                    return self._activation_hook(out, layer_name)
+
+                handle = module.register_forward_hook(activation_hook_fn)
                 self.hook_handles.append(handle)
                 monitored_layers.append(name)
 
             # Check prediction, projection and other key layers
             elif any(key in name for key in ['pred', 'proj_head', 'patch_embed']) and hasattr(module, 'forward'):
-                # Use default parameter in lambda to capture current value of name
-                handle = module.register_forward_hook(
-                    lambda mod, inp, out, name=name: self._activation_hook(out, name)
-                )
+                # Define hook function with fixed name parameter
+                def projection_hook_fn(mod, inp, out, layer_name=name):
+                    return self._activation_hook(out, layer_name)
+
+                handle = module.register_forward_hook(projection_hook_fn)
                 self.hook_handles.append(handle)
                 monitored_layers.append(name)
 
-        self.log(f"Registered activation hooks on {len(monitored_layers)} layers: {monitored_layers}")
+        self.log(f"Registered activation hooks on {len(monitored_layers)} layers")
         return self
 
     def _gradient_hook(self, grad, name):
-        """Hook function to capture gradient statistics"""
+        """Hook function to capture gradient statistics - improved version"""
         if grad is None:
             self.log(f"Warning: Gradient is None for parameter {name}")
             return None
@@ -124,13 +162,21 @@ class GradientDiagnostics:
         # Calculate gradient statistics
         with torch.no_grad():
             grad_abs = grad.abs()
+
+            # Handle different tensor shapes
+            if grad.dim() > 1:
+                flat_grad = grad.view(-1)
+                median_val = torch.median(flat_grad)
+            else:
+                median_val = torch.median(grad)
+
             stats = {
                 "norm": torch.norm(grad).item(),
                 "mean": grad.mean().item(),
                 "std": grad.std().item(),
                 "min": grad.min().item(),
                 "max": grad.max().item(),
-                "median": torch.median(grad_abs).item(),
+                "median": median_val.item(),
                 "zeros": (grad == 0).float().mean().item(),
                 "name": name,
                 "batch": self.batch_counter
@@ -144,14 +190,17 @@ class GradientDiagnostics:
             else:
                 stats["category"] = "other"
 
+            # Store the stats
             self.grad_stats[name].append(stats)
 
+        # The hook must return the gradient unchanged
         return grad
 
     def _activation_hook(self, output, name):
-        """Hook function to capture activation statistics"""
+        """Hook function to capture activation statistics - improved version"""
         with torch.no_grad():
             if isinstance(output, torch.Tensor):
+                # Calculate statistics
                 stats = {
                     "mean": output.mean().item(),
                     "std": output.std().item(),
@@ -176,30 +225,84 @@ class GradientDiagnostics:
                 }
                 self.activation_stats[name].append(stats)
 
+        # No need to return anything for activation hooks
         return None
 
     def track_gradscaler(self, scaler):
         """Track GradScaler statistics"""
         if isinstance(scaler, GradScaler):
+            # Store scaler stats
             self.scaler_stats.append({
                 "scale": scaler.get_scale(),
                 "batch": self.batch_counter,
                 "growth_tracker": getattr(scaler, "_growth_tracker", 0)
             })
+            self.log(f"Tracked GradScaler with scale: {scaler.get_scale()}")
 
     def analyze_batch(self, batch_idx, loss=None, scaler=None):
         """Analyze a batch after backward pass"""
         self.batch_counter = batch_idx
+        self.log(f"Analyzing batch {batch_idx}")
 
         # Track GradScaler if provided
         if scaler is not None:
             self.track_gradscaler(scaler)
+
+        # Check gradient statistics directly
+        self.check_gradients_directly()
 
         # Check if we have gradients for each layer type
         self._check_gradient_coverage()
 
         # Return self for chaining
         return self
+
+    def check_gradients_directly(self):
+        """Check gradients directly from model parameters"""
+        # Count how many parameters have non-None gradients
+        grad_count = 0
+        total_params = 0
+        grad_categories = defaultdict(int)
+
+        # Also collect some sample gradient info
+        sample_grads = []
+
+        for name, param in self.named_parameters:
+            if param.requires_grad:
+                total_params += 1
+
+                # Check if gradient exists and is not None
+                if param.grad is not None:
+                    grad_count += 1
+
+                    # Categorize
+                    category = "other"
+                    for cat_name, keywords in self.layer_categories.items():
+                        if any(keyword in name for keyword in keywords):
+                            category = cat_name
+                            break
+
+                    grad_categories[category] += 1
+
+                    # Add to sample if it's an interesting layer
+                    if 'decoder_pred' in name or 'blocks.0' in name or 'decoder_blocks.0' in name:
+                        grad_mean = param.grad.abs().mean().item()
+                        sample_grads.append(f"{name}: {grad_mean:.8f}")
+
+        # Log the results
+        self.log(f"Direct gradient check: {grad_count}/{total_params} parameters have gradients")
+
+        # Log categories
+        for category, count in grad_categories.items():
+            self.log(f"  - {category}: {count} parameters have gradients")
+
+        # Log sample gradients
+        if sample_grads:
+            self.log(f"Sample gradients: {', '.join(sample_grads[:10])}")
+        else:
+            self.log(f"No sample gradients found")
+
+        return grad_count, total_params
 
     def _check_gradient_coverage(self):
         """Check if we have gradients for all major components of the model"""
@@ -233,6 +336,8 @@ class GradientDiagnostics:
 
             if missing_categories:
                 self.log(f"Missing gradients for entire categories: {missing_categories}")
+        else:
+            self.log(f"Good gradient coverage: {grad_count}/{param_count} parameters")
 
     def _save_stats_to_csv(self):
         """Save all collected statistics to CSV files"""
@@ -283,12 +388,12 @@ class GradientDiagnostics:
         vanishing_status = self._check_for_vanishing_gradients()
 
         # 4. Summarize findings in the report
-        self._write_summary_report(vanishing_status)
+        summary_path = self._write_summary_report(vanishing_status)
 
-        self.log("Report generation complete. Files saved to " + self.output_dir)
+        self.log(f"Report generation complete. Files saved to {self.output_dir}")
         self.log_fh.close()
 
-        return vanishing_status
+        return vanishing_status, summary_path
 
     def _generate_plots(self):
         """Generate diagnostic plots"""
@@ -804,6 +909,13 @@ class GradientDiagnostics:
 
             f.write("\n")
 
+            # Write direct gradient check information
+            f.write("DIRECT GRADIENT CHECK:\n")
+            f.write("-" * 50 + "\n")
+            grad_count, total_params = self.check_gradients_directly()
+            f.write(
+                f"Parameters with gradients: {grad_count}/{total_params} ({grad_count / total_params * 100:.1f}%)\n\n")
+
             # Summarize gradient data statistics
             gradient_stats_file = os.path.join(self.output_dir, "gradient_stats.csv")
             if os.path.exists(gradient_stats_file):
@@ -877,6 +989,15 @@ class GradientDiagnostics:
                 f.write("3. Batch normalization or activation function problems\n")
                 f.write("4. Dataset imbalance or preprocessing issues\n")
 
+            # If there are missing gradients, add specific recommendations
+            if grad_count < total_params * 0.5:
+                f.write("\nMISSING GRADIENTS RECOMMENDATIONS:\n")
+                f.write("1. Check for detached operations in forward pass that break the computation graph\n")
+                f.write("2. Make sure gradient checkpointing is properly configured\n")
+                f.write("3. Confirm all loss components are connected to the model parameters\n")
+                f.write("4. Verify autocast (mixed precision) is properly implemented\n")
+                f.write("5. Consider removing custom backward hooks that might interfere with gradient flow\n")
+
             # Save raw data reference
             f.write("\n")
             f.write("RAW DATA:\n")
@@ -894,7 +1015,7 @@ class GradientDiagnostics:
         return summary_file
 
 
-def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_diagnostics"):
+def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_diagnostics", epoch=0):
     """
     Run a focused diagnostic session to check for vanishing gradients across the entire model.
     This function runs a single batch through the model with special
@@ -905,6 +1026,7 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         train_loader: DataLoader for training data
         device: The device to run on
         output_dir: Directory to save diagnostic outputs
+        epoch: Current epoch number for organization
 
     Returns:
         dict: Analysis results with vanishing gradient diagnosis
@@ -913,8 +1035,12 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     print("RUNNING GRADIENT DIAGNOSTICS")
     print("=" * 80)
 
+    # Create epoch-specific output directory
+    epoch_dir = os.path.join(output_dir, f"epoch_{epoch}")
+    os.makedirs(epoch_dir, exist_ok=True)
+
     # Create diagnostics tool
-    diagnostics = GradientDiagnostics(model, output_dir=output_dir)
+    diagnostics = GradientDiagnostics(model, output_dir=epoch_dir)
 
     # Register monitoring hooks - do this before the optimizer creation
     diagnostics.register_gradient_hooks()
@@ -927,7 +1053,14 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         weight_decay=0.05,
         betas=(0.9, 0.95)
     )
-    scaler = torch.cuda.amp.GradScaler()
+
+    # Define AMP scaler properly for future PyTorch versions
+    try:
+        # Try the new style first (PyTorch 2.0+)
+        scaler = torch.amp.GradScaler('cuda')
+    except TypeError:
+        # Fall back to old style
+        scaler = torch.cuda.amp.GradScaler()
 
     # Keep track of batch idx for the diagnostics
     batch_idx = 0
@@ -952,35 +1085,23 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         optimizer.zero_grad(set_to_none=True)
 
         # Forward pass with AMP
-        with torch.cuda.amp.autocast():
-            output = model(hsi, aux_data, batch_idx_tensor)
-            loss = output['loss']
+        try:
+            # Try the new style autocast first (PyTorch 2.0+)
+            with torch.amp.autocast('cuda'):
+                output = model(hsi, aux_data, batch_idx_tensor)
+                loss = output['loss']
+        except TypeError:
+            # Fall back to old style
+            with torch.cuda.amp.autocast():
+                output = model(hsi, aux_data, batch_idx_tensor)
+                loss = output['loss']
 
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
 
-        # Gradient check
+        # Check gradients directly from the model before scaler step
         print(f"Checking gradients for batch {batch_idx}...")
-        # Check a few key components to verify gradients exist
-        grad_exists = []
-        grad_count = 0
-        total_params = 0
-
-        for name, param in model.parameters():
-            total_params += 1
-            if param.grad is not None:
-                grad_count += 1
-                # Check a few key parameters more specifically
-                if 'decoder_pred' in name:
-                    grad_exists.append(f"decoder_pred: {param.grad.abs().mean().item():.8f}")
-                elif 'blocks.0' in name:
-                    grad_exists.append(f"encoder block 0: {param.grad.abs().mean().item():.8f}")
-                elif 'decoder_blocks.0' in name:
-                    grad_exists.append(f"decoder block 0: {param.grad.abs().mean().item():.8f}")
-
-        print(f"Gradients generated for {grad_count}/{total_params} parameters")
-        if grad_exists:
-            print(f"Sample gradient values: {', '.join(grad_exists)}")
+        grad_count, total_params = diagnostics.check_gradients_directly()
 
         # Log diagnostics for this batch
         diagnostics.analyze_batch(batch_idx, loss=loss.item(), scaler=scaler)
@@ -992,7 +1113,7 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         print(f"Processed diagnostic batch {batch_idx + 1}/3, Loss: {loss.item():.6f}")
 
     # Generate diagnostic report
-    results = diagnostics.generate_report()
+    results, summary_path = diagnostics.generate_report()
 
     # Print summary
     if results["has_vanishing_gradients"]:
@@ -1003,7 +1124,7 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     else:
         print("\n✅ No clear signs of vanishing gradients detected.")
 
-    print(f"\nDetailed report available at: {output_dir}/summary_report.txt")
+    print(f"\nDetailed report available at: {summary_path}")
     print("=" * 80)
 
-    return results
+    return results, summary_path

@@ -36,7 +36,7 @@ from visualisation import (
     visualize_pixel_reconstruction  # Add this line
 )
 from samplers import ProgressiveSampler
-from gradient_diagnostics import GradientDiagnostics
+from gradient_diagnostics import run_gradient_diagnostics
 
 import matplotlib.cm as cm
 
@@ -1023,18 +1023,36 @@ def main(cfg: DictConfig):
         gc.collect()
 
         #  Run gradient diagnostics every 10 epochs
-        if should_run_diagnostics(epoch):
-            diagnostics_dir = os.path.join(output_dir, f'gradient_diagnostics/epoch_{epoch}')
+        if should_run_diagnostics(epoch, cfg.diagnostics.frequency):
             print(f"\nRunning gradient diagnostics at epoch {epoch}...")
-            gradient_results = run_gradient_diagnostics(model, train_loader, device, diagnostics_dir)
+            success, gradient_results, summary_path = run_gradient_diagnostics_with_error_handling(
+                model=model,
+                train_loader=train_loader,
+                device=device,
+                output_dir=output_dir,
+                epoch=epoch
+            )
 
-            # Log diagnostic results to MLflow if enabled
-            if cfg.logging.use_mlflow:
-                mlflow.log_artifact(os.path.join(diagnostics_dir, "summary_report.txt"),
-                                    f"gradient_diagnostics/epoch_{epoch}")
-                mlflow.log_metric("has_vanishing_gradients",
-                                  1 if gradient_results["has_vanishing_gradients"] else 0,
-                                  step=epoch)
+            # Log diagnostic results to MLflow if enabled and successful
+            if success and cfg.logging.use_mlflow:
+                try:
+                    # Make sure the summary file exists before logging it
+                    if os.path.exists(summary_path):
+                        mlflow.log_artifact(
+                            summary_path,
+                            f"gradient_diagnostics/epoch_{epoch}"
+                        )
+
+                        # Log whether vanishing gradients were detected
+                        mlflow.log_metric(
+                            "has_vanishing_gradients",
+                            1 if gradient_results["has_vanishing_gradients"] else 0,
+                            step=epoch
+                        )
+                    else:
+                        print(f"Warning: Cannot log to MLflow - summary path not found: {summary_path}")
+                except Exception as mlflow_err:
+                    print(f"Error logging gradient diagnostics to MLflow: {mlflow_err}")
 
         # Training phase
         train_outputs = train_epoch(
@@ -1465,123 +1483,69 @@ def update_summary_with_results(output_dir, best_val_loss, training_time, epochs
         return False
 
 
-def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_diagnostics"):
+def should_run_diagnostics(epoch, frequency=10):
+    """Determine if gradient diagnostics should run on this epoch."""
+    return epoch % frequency == 0 or epoch == 0  # Always run on first epoch
+
+
+def run_gradient_diagnostics_with_error_handling(model, train_loader, device, output_dir, epoch):
     """
-    Run a focused diagnostic session to check for vanishing gradients.
-    This function runs a single batch through the model with special
-    monitoring hooks to diagnose gradient flow issues.
+    Run gradient diagnostics with proper error handling and directory structure.
 
     Args:
         model: The model to diagnose
         train_loader: DataLoader for training data
         device: The device to run on
-        output_dir: Directory to save diagnostic outputs
+        output_dir: Base output directory
+        epoch: Current epoch number
 
     Returns:
-        dict: Analysis results with vanishing gradient diagnosis
+        Tuple: (success, diagnostics_results, summary_path)
     """
-    print("\n" + "=" * 80)
-    print("RUNNING GRADIENT DIAGNOSTICS")
-    print("=" * 80)
+    try:
+        # Create diagnostics directory with proper nesting
+        diagnostics_dir = os.path.join(output_dir, 'gradient_diagnostics')
+        os.makedirs(diagnostics_dir, exist_ok=True)
 
-    # Create epoch-specific output directory
-    epoch_dir = os.path.join(output_dir, f"epoch_0")
-    os.makedirs(epoch_dir, exist_ok=True)
+        # Epoch-specific directory will be created by the diagnostics tool
+        results, summary_path = run_gradient_diagnostics(
+            model=model,
+            train_loader=train_loader,
+            device=device,
+            output_dir=diagnostics_dir,
+            epoch=epoch
+        )
 
-    # Create diagnostics tool
-    diagnostics = GradientDiagnostics(model, output_dir=epoch_dir)
+        print(f"Gradient diagnostics completed successfully for epoch {epoch}")
 
-    # Register monitoring hooks - make sure this happens BEFORE any optimizer operations
-    diagnostics.register_gradient_hooks()
-    diagnostics.register_activation_hooks()
+        # Verify that the summary file exists
+        if not os.path.exists(summary_path):
+            print(f"Warning: Summary file not found at {summary_path}")
+            # Create a minimal summary file if it doesn't exist
+            os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+            with open(summary_path, 'w') as f:
+                f.write("Gradient Diagnostics Summary\n")
+                f.write("No detailed information available\n")
 
-    # Create optimizer and scaler (same settings as main training)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=0.0001,
-        weight_decay=0.05,
-        betas=(0.9, 0.95)
-    )
-    scaler = torch.cuda.amp.GradScaler()
+        return True, results, summary_path
 
-    # Set model to train mode
-    model.train()
+    except Exception as e:
+        print(f"Error running gradient diagnostics: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # Run a few batches with diagnostics
-    print("Running diagnostic training on 3 batches...")
-    for batch_idx, batch in enumerate(train_loader):
-        # Only process a few batches
-        if batch_idx >= 3:
-            break
+        # Create minimal error report
+        error_dir = os.path.join(output_dir, 'gradient_diagnostics', f'epoch_{epoch}_error')
+        os.makedirs(error_dir, exist_ok=True)
 
-        # Move data to device
-        hsi = batch['hsi'].to(device)
-        aux_data = {k: v.to(device) if v is not None else None
-                    for k, v in batch['aux_data'].items()}
-        batch_idx_tensor = batch['batch_idx'].to(device)
+        error_path = os.path.join(error_dir, "error_report.txt")
+        with open(error_path, 'w') as f:
+            f.write(f"Error running gradient diagnostics for epoch {epoch}\n")
+            f.write(f"Error: {str(e)}\n")
+            f.write("\nTraceback:\n")
+            f.write(traceback.format_exc())
 
-        # Clear gradients
-        optimizer.zero_grad(set_to_none=True)
-
-        # Forward pass with AMP
-        with torch.cuda.amp.autocast():
-            output = model(hsi, aux_data, batch_idx_tensor)
-            loss = output['loss']
-
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
-
-        # Diagnostics - add gradient check here for debugging
-        print(f"Checking gradients for batch {batch_idx}...")
-        grad_exists = []
-        grad_count = 0
-        total_params = 0
-
-        for name, param in model.named_parameters():
-            total_params += 1
-            if param.grad is not None:
-                grad_count += 1
-                # Check a few key parameters more specifically
-                if 'decoder_pred' in name:
-                    grad_exists.append(f"decoder_pred: {param.grad.abs().mean().item():.8f}")
-                elif 'blocks.0' in name and not 'decoder' in name:
-                    grad_exists.append(f"encoder block 0: {param.grad.abs().mean().item():.8f}")
-                elif 'decoder_blocks.0' in name:
-                    grad_exists.append(f"decoder block 0: {param.grad.abs().mean().item():.8f}")
-
-        print(f"Gradients generated for {grad_count}/{total_params} parameters")
-        if grad_exists:
-            print(f"Sample gradient values: {', '.join(grad_exists)}")
-
-        # Log diagnostics for this batch
-        diagnostics.analyze_batch(batch_idx, loss=loss.item(), scaler=scaler)
-
-        # Update weights with scaler
-        scaler.step(optimizer)
-        scaler.update()
-
-        print(f"Processed diagnostic batch {batch_idx + 1}/3, Loss: {loss.item():.6f}")
-
-    # Generate diagnostic report
-    results = diagnostics.generate_report()
-
-    # Print summary
-    if results["has_vanishing_gradients"]:
-        print("\n⚠️ VANISHING GRADIENTS DETECTED!")
-        print("\nWarnings:")
-        for warning in results["warnings"]:
-            print(f"- {warning}")
-    else:
-        print("\n✅ No clear signs of vanishing gradients detected.")
-
-    print(f"\nDetailed report available at: {epoch_dir}/summary_report.txt")
-    print("=" * 80)
-
-    return results
-
-def should_run_diagnostics(epoch, frequency=10):
-    """Determine if gradient diagnostics should run on this epoch."""
-    return epoch % frequency == 0
+        return False, {"has_vanishing_gradients": False, "errors": [str(e)]}, error_path
 
 if __name__ == "__main__":
     main()
