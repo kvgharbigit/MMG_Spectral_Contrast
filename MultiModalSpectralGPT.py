@@ -534,30 +534,36 @@ class MultiModalSpectralGPT(nn.Module):
                     if embedding is not None:
                         cond_tokens = self.modality_proj(embedding).unsqueeze(1)
                         for block in self.cross_attn:
-                            # Use gradient checkpointing for cross-attention blocks
+                            # Check if we should disable checkpointing for diagnostics
+                            use_checkpointing = self.training and not hasattr(self, '_disable_gradient_checkpointing')
+
+                            # Define custom forward function for checkpointing
                             def create_custom_forward(mod):
                                 def custom_forward(*inputs):
                                     return mod(torch.cat(inputs, dim=1))[:, :-1, :]
 
                                 return custom_forward
 
-                            if self.training:
+                            if use_checkpointing:
                                 # Use checkpointing during training
                                 x = x + checkpoint(
                                     create_custom_forward(block),
                                     x, cond_tokens
                                 )
                             else:
-                                # Regular forward pass during evaluation
+                                # Regular forward pass during evaluation or diagnostics
                                 x = x + block(torch.cat([x, cond_tokens], dim=1))[:, :-1, :]
 
             # Apply main transformer blocks with gradient checkpointing
             for i, block in enumerate(self.blocks):
-                if self.training:
+                # Check if we should disable checkpointing for diagnostics
+                use_checkpointing = self.training and not hasattr(self, '_disable_gradient_checkpointing')
+
+                if use_checkpointing:
                     # Use gradient checkpointing during training
                     x = checkpoint(block, x)
                 else:
-                    # Regular forward pass during evaluation
+                    # Regular forward pass during evaluation or diagnostics
                     x = block(x)
 
             x = self.norm(x)
@@ -588,11 +594,14 @@ class MultiModalSpectralGPT(nn.Module):
             x = x_ + self.decoder_pos_embed
 
             for block in self.decoder_blocks:
-                if self.training:
+                # Check if we should disable checkpointing for diagnostics
+                use_checkpointing = self.training and not hasattr(self, '_disable_gradient_checkpointing')
+
+                if use_checkpointing:
                     # Use gradient checkpointing during training
                     x = checkpoint(block, x)
                 else:
-                    # Regular forward pass during evaluation
+                    # Regular forward pass during evaluation or diagnostics
                     x = block(x)
 
             x = self.decoder_norm(x)

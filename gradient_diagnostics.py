@@ -1015,34 +1015,29 @@ class GradientDiagnostics:
         return summary_file
 
 
-def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_diagnostics", epoch=0):
+def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_diagnostics"):
     """
-    Run a focused diagnostic session to check for vanishing gradients across the entire model.
-    This function runs a single batch through the model with special
-    monitoring hooks to diagnose gradient flow issues.
-
-    Args:
-        model: The model to diagnose
-        train_loader: DataLoader for training data
-        device: The device to run on
-        output_dir: Directory to save diagnostic outputs
-        epoch: Current epoch number for organization
-
-    Returns:
-        dict: Analysis results with vanishing gradient diagnosis
+    Run a focused diagnostic session to check for vanishing gradients.
+    Temporarily disables gradient checkpointing to ensure accurate gradient collection,
+    then restores the original state before returning.
     """
     print("\n" + "=" * 80)
     print("RUNNING GRADIENT DIAGNOSTICS")
     print("=" * 80)
 
     # Create epoch-specific output directory
-    epoch_dir = os.path.join(output_dir, f"epoch_{epoch}")
+    epoch_dir = os.path.join(output_dir, f"epoch_0")
     os.makedirs(epoch_dir, exist_ok=True)
+
+    # Temporarily disable gradient checkpointing for accurate diagnostics
+    # by adding a flag attribute to the model
+    setattr(model, '_disable_gradient_checkpointing', True)
+    print("Gradient checkpointing temporarily disabled for diagnostics")
 
     # Create diagnostics tool
     diagnostics = GradientDiagnostics(model, output_dir=epoch_dir)
 
-    # Register monitoring hooks - do this before the optimizer creation
+    # Register monitoring hooks - do this before optimizer creation
     diagnostics.register_gradient_hooks()
     diagnostics.register_activation_hooks()
 
@@ -1053,14 +1048,7 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         weight_decay=0.05,
         betas=(0.9, 0.95)
     )
-
-    # Define AMP scaler properly for future PyTorch versions
-    try:
-        # Try the new style first (PyTorch 2.0+)
-        scaler = torch.amp.GradScaler('cuda')
-    except TypeError:
-        # Fall back to old style
-        scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler()
 
     # Keep track of batch idx for the diagnostics
     batch_idx = 0
@@ -1085,23 +1073,12 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         optimizer.zero_grad(set_to_none=True)
 
         # Forward pass with AMP
-        try:
-            # Try the new style autocast first (PyTorch 2.0+)
-            with torch.amp.autocast('cuda'):
-                output = model(hsi, aux_data, batch_idx_tensor)
-                loss = output['loss']
-        except TypeError:
-            # Fall back to old style
-            with torch.cuda.amp.autocast():
-                output = model(hsi, aux_data, batch_idx_tensor)
-                loss = output['loss']
+        with torch.cuda.amp.autocast():
+            output = model(hsi, aux_data, batch_idx_tensor)
+            loss = output['loss']
 
         # Backward pass with gradient scaling
         scaler.scale(loss).backward()
-
-        # Check gradients directly from the model before scaler step
-        print(f"Checking gradients for batch {batch_idx}...")
-        grad_count, total_params = diagnostics.check_gradients_directly()
 
         # Log diagnostics for this batch
         diagnostics.analyze_batch(batch_idx, loss=loss.item(), scaler=scaler)
@@ -1113,7 +1090,7 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
         print(f"Processed diagnostic batch {batch_idx + 1}/3, Loss: {loss.item():.6f}")
 
     # Generate diagnostic report
-    results, summary_path = diagnostics.generate_report()
+    results = diagnostics.generate_report()
 
     # Print summary
     if results["has_vanishing_gradients"]:
@@ -1124,7 +1101,13 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     else:
         print("\n✅ No clear signs of vanishing gradients detected.")
 
-    print(f"\nDetailed report available at: {summary_path}")
+    print(f"\nDetailed report available at: {epoch_dir}/summary_report.txt")
+
+    # Re-enable gradient checkpointing by removing the flag
+    if hasattr(model, '_disable_gradient_checkpointing'):
+        delattr(model, '_disable_gradient_checkpointing')
+    print("Gradient checkpointing re-enabled for normal training")
+
     print("=" * 80)
 
-    return results, summary_path
+    return results
