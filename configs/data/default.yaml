@@ -3,7 +3,7 @@
 # Data paths
 #parent_dir: "Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/data_500/Control"  # Used when auto_split is true
 
-parent_dir: "Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/data_500/"  # Used when auto_split is true
+ parent_dir: "Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/data_500/"  # Used when auto_split is true
 #parent_dir: "dummydata"
 train_dir: "dummydata/train"  # Used when auto_split is false
 val_dir: "dummydata/val"  # Used when auto_split is false
@@ -20,6 +20,20 @@ drop_last: false  # Whether to drop the last incomplete batch
 # Augmentation parameters
 use_augmentation: true  # Enable/disable data augmentation
 augmentation:
-  rotation_degrees: 20  # Maximum rotation in degrees
-  scale_range: [0.85, 1.15]  # Range for random scaling
-  prob: 0.5  # Probability of applying each transformation
+    # Basic augmentations (existing)
+    prob: 0.5
+    rotation_degrees: 180
+    scale_range: [0.8, 1.2]
+
+    # New augmentations
+    intensity:
+      enabled: true
+      range: [0.85, 1.15]
+
+    noise:
+      enabled: true
+      level_range: [0.005, 0.02]
+
+    band_mask:
+      enabled: true
+      ratio: 0.1  # Maximum percentage of bands to mask

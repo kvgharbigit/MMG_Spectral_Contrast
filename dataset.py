@@ -279,7 +279,9 @@ class MultiModalTransforms:
     Ensures the same spatial transformations are applied to all modalities.
     """
 
-    def __init__(self, prob=0.5, rotation_degrees=10, scale_range=(0.9, 1.1)):
+    def __init__(self, prob=0.5, rotation_degrees=10, scale_range=(0.9, 1.1),
+                 intensity_range=(0.85, 1.15), noise_level_range=(0.005, 0.02),
+                 band_mask_ratio=0.1, use_intensity=True, use_noise=True, use_band_mask=True):
         """
         Initialize transformation parameters.
 
@@ -287,10 +289,22 @@ class MultiModalTransforms:
             prob (float): Probability of applying each transformation
             rotation_degrees (int): Maximum rotation in degrees
             scale_range (tuple): Range for random scaling (min, max)
+            intensity_range (tuple): Range for intensity scaling (min, max)
+            noise_level_range (tuple): Range for Gaussian noise level (min, max)
+            band_mask_ratio (float): Maximum ratio of spectral bands to mask
+            use_intensity (bool): Whether to apply intensity variations
+            use_noise (bool): Whether to apply Gaussian noise
+            use_band_mask (bool): Whether to apply random band masking
         """
         self.prob = prob
         self.rotation_degrees = rotation_degrees
         self.scale_range = scale_range
+        self.intensity_range = intensity_range
+        self.noise_level_range = noise_level_range
+        self.band_mask_ratio = band_mask_ratio
+        self.use_intensity = use_intensity
+        self.use_noise = use_noise
+        self.use_band_mask = use_band_mask
 
     def __call__(self, hsi_data, aux_data, thickness_mask=None):
         """
@@ -305,6 +319,9 @@ class MultiModalTransforms:
             do_flip = random.random() < self.prob
             do_rotate = random.random() < self.prob
             do_scale = random.random() < self.prob
+            do_intensity = self.use_intensity and random.random() < self.prob
+            do_noise = self.use_noise and random.random() < self.prob
+            do_band_mask = self.use_band_mask and random.random() < self.prob
 
             # Random flip (horizontal)
             if do_flip:
@@ -371,6 +388,44 @@ class MultiModalTransforms:
                     img_tensor = thickness_mask[b, 0]  # Shape: [H, W]
                     scaled = self.custom_scale(img_tensor, new_h, new_w, (H, W), is_mask=True)
                     thickness_mask[b, 0] = scaled
+
+            # NEW: Intensity variations
+            if do_intensity:
+                intensity_scale = random.uniform(self.intensity_range[0], self.intensity_range[1])
+                hsi_data[b, 0] = torch.clamp(hsi_data[b, 0] * intensity_scale, 0, 1)
+
+                # Also apply to auxiliary modalities
+                for modality in aux_data:
+                    if aux_data[modality] is not None:
+                        aux_data[modality][b, 0] = torch.clamp(aux_data[modality][b, 0] * intensity_scale, 0, 1)
+
+            # NEW: Add Gaussian noise
+            if do_noise:
+                noise_level = random.uniform(self.noise_level_range[0], self.noise_level_range[1])
+
+                # Add noise to HSI
+                noise = torch.randn_like(hsi_data[b, 0]) * noise_level
+                hsi_data[b, 0] = torch.clamp(hsi_data[b, 0] + noise, 0, 1)
+
+                # Add noise to auxiliary modalities (with same noise level but different random values)
+                for modality in aux_data:
+                    if aux_data[modality] is not None:
+                        mod_noise = torch.randn_like(aux_data[modality][b, 0]) * noise_level
+                        aux_data[modality][b, 0] = torch.clamp(aux_data[modality][b, 0] + mod_noise, 0, 1)
+
+            # NEW: Random band masking
+            if do_band_mask:
+                # Calculate how many bands to mask
+                max_bands_to_mask = max(1, int(T * self.band_mask_ratio))
+                num_bands_to_mask = random.randint(1, max_bands_to_mask)
+
+                # Randomly select bands to mask
+                bands_to_mask = random.sample(range(T), num_bands_to_mask)
+
+                # Apply masking by attenuating the band (not completely zeroing out)
+                for band_idx in bands_to_mask:
+                    attenuation_factor = random.uniform(0.0, 0.2)  # Attenuate by 80-100%
+                    hsi_data[b, 0, band_idx] = hsi_data[b, 0, band_idx] * attenuation_factor
 
         return hsi_data, aux_data, thickness_mask
 

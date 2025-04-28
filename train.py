@@ -36,6 +36,7 @@ from visualisation import (
     visualize_pixel_reconstruction  # Add this line
 )
 from samplers import ProgressiveSampler
+from gradient_diagnostics import GradientDiagnostics
 
 import matplotlib.cm as cm
 
@@ -691,6 +692,7 @@ def visualize_reconstruction_during_training(model, val_loader, device, epoch, o
         traceback.print_exc()
         return None
 
+
 @hydra.main(config_path="configs", config_name="train", version_base="1.1")
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
@@ -725,26 +727,12 @@ def main(cfg: DictConfig):
     output_dir = os.getcwd()  # Hydra changes working dir to outputs/{date}/...
     print(f"Output directory: {output_dir}")
 
-    # Save hyperparameter and training configuration summary
-    summary_path = save_training_summary(cfg, output_dir)
-    print(f"Training configuration summary saved to: {summary_path}")
+    # Load datasets FIRST (moved up from later in the function)
+    train_dataset = None
+    val_dataset = None
+    train_loader = None
+    val_loader = None
 
-    # Set up MLflow
-    if cfg.logging.use_mlflow:
-        mlflow.set_experiment(cfg.logging.experiment_name)
-        mlflow.start_run(run_name=cfg.logging.run_name)
-
-        # Log Hydra config
-        mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
-
-        # Log configuration summary to MLflow
-        if summary_path and os.path.exists(summary_path):
-            mlflow.log_artifact(summary_path)
-
-    # Set up TensorBoard
-    writer = SummaryWriter(log_dir=os.path.join(output_dir, 'tensorboard'))
-
-    # Load datasets
     if cfg.data.use_auto_split:
         print(f"Loading dataset with auto split: {cfg.data.auto_split_ratio}")
 
@@ -786,7 +774,14 @@ def main(cfg: DictConfig):
             train_dataset.dataset.transform = MultiModalTransforms(
                 prob=cfg.data.augmentation.prob,
                 rotation_degrees=cfg.data.augmentation.rotation_degrees,
-                scale_range=cfg.data.augmentation.scale_range
+                scale_range=cfg.data.augmentation.scale_range,
+                # New augmentation parameters
+                intensity_range=cfg.data.augmentation.intensity.range,
+                noise_level_range=cfg.data.augmentation.noise.level_range,
+                band_mask_ratio=cfg.data.augmentation.band_mask.ratio,
+                use_intensity=cfg.data.augmentation.intensity.enabled,
+                use_noise=cfg.data.augmentation.noise.enabled,
+                use_band_mask=cfg.data.augmentation.band_mask.enabled
             )
 
         val_loader = DataLoader(
@@ -801,89 +796,80 @@ def main(cfg: DictConfig):
         print(f"Dataset split: {train_size} training, {val_size} validation")
         print(f"Using ProgressiveSampler: {2000} samples per epoch")
 
-
     else:
-
         print(f"Using predefined split: {cfg.data.train_dir} and {cfg.data.val_dir}")
 
         # Create the training dataset
-
         train_dataset = PatientDataset(
-
             parent_dir=cfg.data.train_dir,
-
             analysis_dim=cfg.model.analysis_dim,
-
             target_bands=cfg.model.num_frames
-
         )
 
         # Create Progressive Sampler for train dataset
-
         train_sampler = ProgressiveSampler(
-
             train_dataset,
-
             samples_per_epoch=2000,  # Your desired samples per epoch
-
             shuffle=True
-
         )
 
         # Create train loader with the sampler
-
         train_loader = DataLoader(
-
             train_dataset,
-
             batch_size=cfg.training.batch_size,
-
             sampler=train_sampler,  # Use the progressive sampler
-
             num_workers=cfg.data.num_workers,
-
             pin_memory=False,
-
             collate_fn=custom_collate_fn,
-
             drop_last=cfg.data.drop_last,
-
         )
 
         # Add augmentation if needed
-
         if cfg.data.use_augmentation:
             train_dataset.transform = MultiModalTransforms(
-
                 prob=cfg.data.augmentation.prob,
-
                 rotation_degrees=cfg.data.augmentation.rotation_degrees,
-
-                scale_range=cfg.data.augmentation.scale_range
-
+                scale_range=cfg.data.augmentation.scale_range,
+                # New augmentation parameters
+                intensity_range=cfg.data.augmentation.intensity.range,
+                noise_level_range=cfg.data.augmentation.noise.level_range,
+                band_mask_ratio=cfg.data.augmentation.band_mask.ratio,
+                use_intensity=cfg.data.augmentation.intensity.enabled,
+                use_noise=cfg.data.augmentation.noise.enabled,
+                use_band_mask=cfg.data.augmentation.band_mask.enabled
             )
 
         # Create validation loader normally (no progressive sampling needed)
-
         val_loader = create_patient_dataloader(
-
             parent_dir=cfg.data.val_dir,
-
             analysis_dim=cfg.model.analysis_dim,
-
             target_bands=cfg.model.num_frames,
-
             batch_size=cfg.training.batch_size,
-
             num_workers=cfg.data.num_workers,
-
             shuffle=False,
-
             augment=False  # No augmentation for validation
-
         )
 
         print(f"Using ProgressiveSampler: {2000} samples per epoch")
+
+    # NOW save hyperparameter and training configuration summary AFTER datasets are created
+    summary_path = save_training_summary(cfg, output_dir, train_dataset, val_dataset)
+    print(f"Training configuration summary saved to: {summary_path}")
+
+    # Set up MLflow
+    if cfg.logging.use_mlflow:
+        mlflow.set_experiment(cfg.logging.experiment_name)
+        mlflow.start_run(run_name=cfg.logging.run_name)
+
+        # Log Hydra config
+        mlflow.log_params(OmegaConf.to_container(cfg, resolve=True))
+
+        # Log configuration summary to MLflow
+        if summary_path and os.path.exists(summary_path):
+            mlflow.log_artifact(summary_path)
+
+    # Set up TensorBoard
+    writer = SummaryWriter(log_dir=os.path.join(output_dir, 'tensorboard'))
 
     # Create and initialize model
     model = MultiModalSpectralGPT(
@@ -905,7 +891,7 @@ def main(cfg: DictConfig):
         mask_ratio=cfg.model.mask_ratio,
         contrastive_mode=cfg.model.contrastive_mode,
         use_thickness_mask=cfg.model.use_thickness_mask,
-        intra_div_weight= cfg.model.intra_div_weight,
+        intra_div_weight=cfg.model.intra_div_weight,
         inter_div_weight=cfg.model.inter_div_weight,
     )
 
@@ -992,6 +978,10 @@ def main(cfg: DictConfig):
     print(f"==== Scheduler object exists: {scheduler is not None} ====")
     if scheduler is not None:
         print(f"==== Scheduler type: {type(scheduler).__name__} ====")
+
+    # After model initialization but before training loop look at gradient diagnostics
+    diagnostics_dir = os.path.join(output_dir, 'gradient_diagnostics')
+    gradient_results = run_gradient_diagnostics(model, train_loader, device, diagnostics_dir)
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -1147,13 +1137,16 @@ def main(cfg: DictConfig):
     writer.close()
 
 
-def save_training_summary(cfg, output_dir):
+def save_training_summary(cfg, output_dir, train_dataset=None, val_dataset=None):
     """
     Save a comprehensive summary of hyperparameters and training configuration to a text file.
+    Now accepts dataset objects to include accurate dataset information.
 
     Args:
         cfg: The Hydra configuration object containing all parameters
         output_dir: Directory to save the summary file
+        train_dataset: The training dataset object (optional)
+        val_dataset: The validation dataset object (optional)
     """
     import os
     from datetime import datetime
@@ -1223,7 +1216,6 @@ def save_training_summary(cfg, output_dir):
             f.write(f"Beta2: {cfg.optimizer.beta2}\n\n")
 
             # Scheduler Configuration
-
             if cfg.scheduler.use_scheduler:
                 f.write("LEARNING RATE SCHEDULER\n")
                 f.write("-" * 50 + "\n")
@@ -1238,9 +1230,16 @@ def save_training_summary(cfg, output_dir):
                     if use_warmup:
                         warmup_ratio = cfg.scheduler.get('warmup_ratio', 0.0)
                         f.write(f"Warmup Ratio: {warmup_ratio}\n")
-                        if warmup_ratio > 0:
-                            warmup_steps = int(warmup_ratio * cfg.training.epochs * len(train_loader))
-                            f.write(f"Warmup Steps: {warmup_steps}\n")
+                        # We now have access to dataset size for accurate calculation
+                        if train_dataset is not None:
+                            train_size = len(train_dataset.dataset) if hasattr(train_dataset, 'dataset') else len(
+                                train_dataset)
+                            samples_per_epoch = 2000  # Your configured samples per epoch
+                            batches_per_epoch = samples_per_epoch // cfg.training.batch_size
+                            total_batches = batches_per_epoch * cfg.training.epochs
+                            if warmup_ratio > 0:
+                                warmup_steps = int(warmup_ratio * total_batches)
+                                f.write(f"Warmup Steps: {warmup_steps}\n")
                     # Add frequency information
                     step_every_batch = cfg.scheduler.get('step_every_batch', True)
                     f.write(f"Update Every Batch: {step_every_batch}\n")
@@ -1284,9 +1283,22 @@ def save_training_summary(cfg, output_dir):
             f.write(f"Drop Last Batch: {cfg.data.drop_last}\n")
             f.write(f"Using Data Augmentation: {cfg.data.use_augmentation}\n")
             if cfg.data.use_augmentation:
-                f.write(f"Augmentation Probability: {cfg.data.augmentation.prob}\n")
-                f.write(f"Rotation Degrees: {cfg.data.augmentation.rotation_degrees}\n")
-                f.write(f"Scale Range: {cfg.data.augmentation.scale_range}\n")
+                f.write(f"  Augmentation Probability: {cfg.data.augmentation.prob}\n")
+                f.write(f"  Rotation Degrees: {cfg.data.augmentation.rotation_degrees}\n")
+                f.write(f"  Scale Range: {cfg.data.augmentation.scale_range}\n")
+
+                # Add new augmentation details
+                f.write(f"  Intensity Variation: {cfg.data.augmentation.intensity.enabled}\n")
+                if cfg.data.augmentation.intensity.enabled:
+                    f.write(f"    Range: {cfg.data.augmentation.intensity.range}\n")
+
+                f.write(f"  Gaussian Noise: {cfg.data.augmentation.noise.enabled}\n")
+                if cfg.data.augmentation.noise.enabled:
+                    f.write(f"    Level Range: {cfg.data.augmentation.noise.level_range}\n")
+
+                f.write(f"  Random Band Masking: {cfg.data.augmentation.band_mask.enabled}\n")
+                if cfg.data.augmentation.band_mask.enabled:
+                    f.write(f"    Max Ratio: {cfg.data.augmentation.band_mask.ratio}\n")
             f.write("\n")
 
             # Logging Configuration
@@ -1299,14 +1311,28 @@ def save_training_summary(cfg, output_dir):
             f.write(f"Visualization Frequency: {cfg.visualization.viz_frequency}\n")
             f.write("\n")
 
-            # Inside your with open(summary_path, 'w') as f: block, add:
+            # Now add accurate dataset information since we have access to the actual datasets
             f.write("PROGRESSIVE SAMPLING CONFIGURATION\n")
             f.write("-" * 50 + "\n")
             f.write(f"Samples per epoch: 2000\n")
-            f.write(f"Total dataset size: {len(train_dataset)}\n")
-            dataset_cycles = len(train_dataset) / 2000
-            f.write(
-                f"Complete dataset cycles per {cfg.training.epochs} epochs: {cfg.training.epochs / dataset_cycles:.2f}\n")
+
+            # Get actual dataset sizes
+            if train_dataset is not None:
+                # Handle both Dataset and Subset objects
+                train_size = len(train_dataset.dataset) if hasattr(train_dataset, 'dataset') else len(train_dataset)
+                f.write(f"Total training dataset size: {train_size}\n")
+                dataset_cycles = train_size / 2000
+                f.write(
+                    f"Complete dataset cycles per {cfg.training.epochs} epochs: {cfg.training.epochs / dataset_cycles:.2f}\n")
+            else:
+                f.write("Training dataset size: Not available at summary creation time\n")
+
+            if val_dataset is not None:
+                # Handle both Dataset and Subset objects
+                val_size = len(val_dataset.dataset) if hasattr(val_dataset, 'dataset') else len(val_dataset)
+                f.write(f"Validation dataset size: {val_size}\n")
+            else:
+                f.write("Validation dataset size: Not available at summary creation time\n")
             f.write("\n")
 
             # Additional Information
@@ -1427,5 +1453,95 @@ def update_summary_with_results(output_dir, best_val_loss, training_time, epochs
         return False
 
 
+def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_diagnostics"):
+    """
+    Run a focused diagnostic session to check for vanishing gradients.
+    This function runs a single batch through the model with special
+    monitoring hooks to diagnose gradient flow issues.
+
+    Args:
+        model: The model to diagnose
+        train_loader: DataLoader for training data
+        device: The device to run on
+        output_dir: Directory to save diagnostic outputs
+
+    Returns:
+        dict: Analysis results with vanishing gradient diagnosis
+    """
+    print("\n" + "=" * 80)
+    print("RUNNING GRADIENT DIAGNOSTICS")
+    print("=" * 80)
+
+    # Create diagnostics tool
+    diagnostics = GradientDiagnostics(model, output_dir=output_dir)
+
+    # Register monitoring hooks
+    diagnostics.register_gradient_hooks()
+    diagnostics.register_activation_hooks()
+
+    # Create optimizer and scaler (same settings as main training)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=0.0001,
+        weight_decay=0.05,
+        betas=(0.9, 0.95)
+    )
+    scaler = torch.cuda.amp.GradScaler()
+
+    # Keep track of batch idx for the diagnostics
+    batch_idx = 0
+
+    # Set model to train mode
+    model.train()
+
+    # Run a few batches with diagnostics
+    print("Running diagnostic training on 3 batches...")
+    for batch_idx, batch in enumerate(train_loader):
+        # Only process a few batches
+        if batch_idx >= 3:
+            break
+
+        # Move data to device
+        hsi = batch['hsi'].to(device)
+        aux_data = {k: v.to(device) if v is not None else None
+                    for k, v in batch['aux_data'].items()}
+        batch_idx_tensor = batch['batch_idx'].to(device)
+
+        # Clear gradients
+        optimizer.zero_grad(set_to_none=True)
+
+        # Forward pass with AMP
+        with torch.cuda.amp.autocast():
+            output = model(hsi, aux_data, batch_idx_tensor)
+            loss = output['loss']
+
+        # Backward pass with gradient scaling
+        scaler.scale(loss).backward()
+
+        # Log diagnostics for this batch
+        diagnostics.analyze_batch(batch_idx, loss=loss.item(), scaler=scaler)
+
+        # Update weights with scaler
+        scaler.step(optimizer)
+        scaler.update()
+
+        print(f"Processed diagnostic batch {batch_idx + 1}/3, Loss: {loss.item():.6f}")
+
+    # Generate diagnostic report
+    results = diagnostics.generate_report()
+
+    # Print summary
+    if results["has_vanishing_gradients"]:
+        print("\n⚠️ VANISHING GRADIENTS DETECTED!")
+        print("\nWarnings:")
+        for warning in results["warnings"]:
+            print(f"- {warning}")
+    else:
+        print("\n✅ No clear signs of vanishing gradients detected.")
+
+    print(f"\nDetailed report available at: {output_dir}/summary_report.txt")
+    print("=" * 80)
+
+    return results
 if __name__ == "__main__":
     main()
