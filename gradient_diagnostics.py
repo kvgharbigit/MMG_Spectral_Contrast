@@ -1020,6 +1020,7 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     Run a focused diagnostic session to check for vanishing gradients.
     Temporarily disables gradient checkpointing to ensure accurate gradient collection,
     then restores the original state before returning.
+    Uses a smaller batch size to avoid memory errors.
     """
     print("\n" + "=" * 80)
     print("RUNNING GRADIENT DIAGNOSTICS")
@@ -1056,38 +1057,54 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     # Set model to train mode
     model.train()
 
+    # Use a smaller batch size for diagnostics
+    diagnostic_batch_size = 1  # Use smallest possible batch size
+
+    print(f"Running diagnostic training with reduced batch size of {diagnostic_batch_size}...")
+
     # Run a few batches with diagnostics
-    print("Running diagnostic training on 3 batches...")
-    for batch_idx, batch in enumerate(train_loader):
+    for _, batch in enumerate(train_loader):
         # Only process a few batches
         if batch_idx >= 3:
             break
 
-        # Move data to device
-        hsi = batch['hsi'].to(device)
-        aux_data = {k: v.to(device) if v is not None else None
-                    for k, v in batch['aux_data'].items()}
-        batch_idx_tensor = batch['batch_idx'].to(device)
+        # Create sub-batches to reduce memory usage
+        sub_batches = create_sub_batches(batch, diagnostic_batch_size)
 
-        # Clear gradients
-        optimizer.zero_grad(set_to_none=True)
+        for sub_batch in sub_batches:
+            # Move data to device
+            hsi = sub_batch['hsi'].to(device)
+            aux_data = {k: v.to(device) if v is not None else None
+                        for k, v in sub_batch['aux_data'].items()}
+            batch_idx_tensor = sub_batch['batch_idx'].to(device)
 
-        # Forward pass with AMP
-        with torch.cuda.amp.autocast():
-            output = model(hsi, aux_data, batch_idx_tensor)
-            loss = output['loss']
+            # Clear gradients
+            optimizer.zero_grad(set_to_none=True)
 
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
+            # Forward pass with AMP
+            with torch.cuda.amp.autocast():
+                output = model(hsi, aux_data, batch_idx_tensor)
+                loss = output['loss']
 
-        # Log diagnostics for this batch
-        diagnostics.analyze_batch(batch_idx, loss=loss.item(), scaler=scaler)
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
 
-        # Update weights with scaler
-        scaler.step(optimizer)
-        scaler.update()
+            # Log diagnostics for this batch
+            diagnostics.analyze_batch(batch_idx, loss=loss.item(), scaler=scaler)
 
-        print(f"Processed diagnostic batch {batch_idx + 1}/3, Loss: {loss.item():.6f}")
+            # Update weights with scaler
+            scaler.step(optimizer)
+            scaler.update()
+
+            print(f"Processed diagnostic sub-batch {batch_idx + 1}/3, Loss: {loss.item():.6f}")
+
+            # Clear memory
+            del hsi, aux_data, batch_idx_tensor, output, loss
+            torch.cuda.empty_cache()
+
+            batch_idx += 1
+            if batch_idx >= 3:
+                break
 
     # Generate diagnostic report
     results = diagnostics.generate_report()
@@ -1111,3 +1128,37 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
     print("=" * 80)
 
     return results
+
+
+def create_sub_batches(batch, sub_batch_size):
+    """
+    Split a large batch into smaller sub-batches to reduce memory usage.
+
+    Args:
+        batch: Original batch data
+        sub_batch_size: Size of each sub-batch
+
+    Returns:
+        List of sub-batches
+    """
+    original_batch_size = batch['hsi'].shape[0]
+    sub_batches = []
+
+    for i in range(0, original_batch_size, sub_batch_size):
+        end_idx = min(i + sub_batch_size, original_batch_size)
+        sub_batch = {
+            'hsi': batch['hsi'][i:end_idx],
+            'aux_data': {
+                k: (v[i:end_idx] if v is not None else None)
+                for k, v in batch['aux_data'].items()
+            },
+            'batch_idx': batch['batch_idx'][i:end_idx]
+        }
+
+        # Add thickness mask if available
+        if 'thickness_mask' in batch and batch['thickness_mask'] is not None:
+            sub_batch['thickness_mask'] = batch['thickness_mask'][i:end_idx]
+
+        sub_batches.append(sub_batch)
+
+    return sub_batches

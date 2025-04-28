@@ -1507,13 +1507,16 @@ def run_gradient_diagnostics_with_error_handling(model, train_loader, device, ou
         diagnostics_dir = os.path.join(output_dir, 'gradient_diagnostics')
         os.makedirs(diagnostics_dir, exist_ok=True)
 
-        # Epoch-specific directory will be created by the diagnostics tool
+        # Create epoch-specific directory
+        epoch_dir = os.path.join(diagnostics_dir, f"epoch_{epoch}")
+        os.makedirs(epoch_dir, exist_ok=True)
+
+        # Call run_gradient_diagnostics WITHOUT the epoch parameter
         results, summary_path = run_gradient_diagnostics(
             model=model,
             train_loader=train_loader,
             device=device,
-            output_dir=diagnostics_dir,
-            epoch=epoch
+            output_dir=epoch_dir  # Pass the epoch-specific directory
         )
 
         print(f"Gradient diagnostics completed successfully for epoch {epoch}")
