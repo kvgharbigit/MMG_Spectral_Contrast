@@ -698,6 +698,7 @@ def should_run_diagnostics(epoch, frequency=10):
 def run_gradient_diagnostics_with_error_handling(model, train_loader, device, output_dir, epoch):
     """
     Run gradient diagnostics with proper error handling and directory structure.
+    Modified to keep gradient checkpointing enabled to avoid OOM errors.
 
     Args:
         model: The model to diagnose
@@ -743,9 +744,8 @@ def run_gradient_diagnostics_with_error_handling(model, train_loader, device, ou
         max_batches = 3
         successful_batches = 0
 
-        # Set flag to disable gradient checkpointing if it exists
-        if hasattr(model, 'training'):
-            setattr(model, '_disable_gradient_checkpointing', True)
+        # IMPORTANT: Don't disable gradient checkpointing
+        # This was causing the OOM errors
 
         for batch_idx, batch in enumerate(train_loader):
             if batch_idx >= max_batches:
@@ -784,10 +784,7 @@ def run_gradient_diagnostics_with_error_handling(model, train_loader, device, ou
 
             except Exception as batch_err:
                 print(f"Error processing batch {batch_idx} for diagnostics: {batch_err}")
-
-        # Remove the gradient checkpointing flag
-        if hasattr(model, '_disable_gradient_checkpointing'):
-            delattr(model, '_disable_gradient_checkpointing')
+                # Continue to next batch instead of giving up completely
 
         # Restore original training state
         if not was_training:
@@ -830,6 +827,116 @@ def run_gradient_diagnostics_with_error_handling(model, train_loader, device, ou
             f.write(traceback.format_exc())
 
         return False, {"has_vanishing_gradients": False, "errors": [str(e)]}, error_path
+
+
+def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_diagnostics"):
+    """
+    Run a focused diagnostic session to check for vanishing gradients.
+    Modified to keep gradient checkpointing enabled to avoid OOM errors.
+    Uses a smaller batch size to avoid memory errors.
+
+    Key improvement: Collects gradients after backward() but before optimizer step.
+    """
+    print("\n" + "=" * 80)
+    print("RUNNING GRADIENT DIAGNOSTICS")
+    print("=" * 80)
+
+    # Create epoch-specific output directory
+    epoch_dir = os.path.join(output_dir, f"epoch_0")
+    os.makedirs(epoch_dir, exist_ok=True)
+
+    # IMPORTANT: No longer disabling gradient checkpointing
+    # This was causing OOM errors
+    print("Keeping gradient checkpointing enabled during diagnostics")
+
+    # Create diagnostics tool
+    diagnostics = GradientDiagnostics(model, output_dir=epoch_dir)
+
+    # We'll only register activation hooks - we'll collect gradients directly later
+    diagnostics.register_activation_hooks()
+
+    # Create optimizer and scaler (same settings as main training)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=0.0001,
+        weight_decay=0.05,
+        betas=(0.9, 0.95)
+    )
+    scaler = torch.cuda.amp.GradScaler()
+
+    # Keep track of batch idx for the diagnostics
+    batch_idx = 0
+
+    # Set model to train mode
+    model.train()
+
+    # Use a smaller batch size for diagnostics
+    diagnostic_batch_size = 1  # Use smallest possible batch size
+
+    print(f"Running diagnostic training with reduced batch size of {diagnostic_batch_size}...")
+
+    # Run a few batches with diagnostics
+    for _, batch in enumerate(train_loader):
+        # Only process a few batches
+        if batch_idx >= 3:
+            break
+
+        # Create sub-batches to reduce memory usage
+        sub_batches = create_sub_batches(batch, diagnostic_batch_size)
+
+        for sub_batch in sub_batches:
+            # Move data to device
+            hsi = sub_batch['hsi'].to(device)
+            aux_data = {k: v.to(device) if v is not None else None
+                        for k, v in sub_batch['aux_data'].items()}
+            batch_idx_tensor = sub_batch['batch_idx'].to(device)
+
+            # Clear gradients
+            optimizer.zero_grad(set_to_none=True)
+
+            # Forward pass with AMP
+            with torch.cuda.amp.autocast():
+                output = model(hsi, aux_data, batch_idx_tensor)
+                loss = output['loss']
+
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+
+            # IMPORTANT: This is the key change - collect gradients AFTER backward()
+            # but BEFORE optimizer step and scaler update
+            diagnostics.collect_and_analyze_gradients(batch_idx, loss=loss.item(), scaler=scaler)
+
+            # Update weights with scaler
+            scaler.step(optimizer)
+            scaler.update()
+
+            print(f"Processed diagnostic sub-batch {batch_idx + 1}/3, Loss: {loss.item():.6f}")
+
+            # Clear memory
+            del hsi, aux_data, batch_idx_tensor, output, loss
+            torch.cuda.empty_cache()
+
+            batch_idx += 1
+            if batch_idx >= 3:
+                break
+
+    # Generate diagnostic report
+    results = diagnostics.generate_report()
+
+    # Print summary
+    if results[0]["has_vanishing_gradients"]:
+        print("\n⚠️ VANISHING GRADIENTS DETECTED!")
+        print("\nWarnings:")
+        for warning in results[0]["warnings"]:
+            print(f"- {warning}")
+    else:
+        print("\n✅ No clear signs of vanishing gradients detected.")
+
+    print(f"\nDetailed report available at: {epoch_dir}/summary_report.txt")
+
+    print("=" * 80)
+
+    return results
 
 
 def save_training_summary(cfg, output_dir, train_dataset=None, val_dataset=None):
