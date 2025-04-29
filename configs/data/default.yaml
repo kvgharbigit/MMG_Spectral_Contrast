@@ -3,8 +3,8 @@
 # Data paths
 #parent_dir: "Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/data_500/Control"  # Used when auto_split is true
 
-parent_dir: "Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/data_500/SmallerSets"  # Used when auto_split is true
-#parent_dir: "dummydata"
+#parent_dir: "Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/data_500/SmallerSets"  # Used when auto_split is true
+parent_dir: "dummydata_multimodal"
 train_dir: "NA"  # Used when auto_split is false
 val_dir: "NA"  # Used when auto_split is false
 #dummydata

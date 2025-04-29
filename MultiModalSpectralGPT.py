@@ -463,12 +463,151 @@ class MultiModalSpectralGPT(nn.Module):
             self.pos_embed = self.pos_embed.to(device)
 
     def initialize_weights(self):
-        """Initialize model weights."""
-        # Initialize position embeddings
-        torch.nn.init.normal_(self.pos_embed, std=0.02)
+        """Initialize model weights properly to prevent gradient issues."""
+        print("Initializing model with robust weight initialization...")
 
-        # Initialize mask token
-        torch.nn.init.normal_(self.mask_token, std=0.02)
+        # Initialize embedding projections with normal distribution
+        nn.init.normal_(self.pos_embed, std=0.02)
+        nn.init.normal_(self.mask_token, std=0.02)
+
+        # Initialize decoder position embeddings
+        nn.init.normal_(self.decoder_pos_embed, std=0.02)
+
+        # Initialize main transformer blocks
+        for block in self.blocks:
+            if hasattr(block.attn, 'qkv'):
+                # For fused QKV attention
+                nn.init.xavier_uniform_(block.attn.qkv.weight)
+                if block.attn.qkv.bias is not None:
+                    nn.init.zeros_(block.attn.qkv.bias)
+            else:
+                # For separate Q, K, V
+                for name, param in block.attn.named_parameters():
+                    if 'weight' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+
+            # Output projection
+            if hasattr(block.attn, 'proj'):
+                nn.init.xavier_uniform_(block.attn.proj.weight)
+                if block.attn.proj.bias is not None:
+                    nn.init.zeros_(block.attn.proj.bias)
+
+            # MLP layers
+            if hasattr(block, 'mlp'):
+                for name, param in block.mlp.named_parameters():
+                    if 'weight' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+
+        # Initialize cross-attention blocks similarly
+        for block in self.cross_attn:
+            if hasattr(block.attn, 'qkv'):
+                nn.init.xavier_uniform_(block.attn.qkv.weight)
+                if block.attn.qkv.bias is not None:
+                    nn.init.zeros_(block.attn.qkv.bias)
+            else:
+                for name, param in block.attn.named_parameters():
+                    if 'weight' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+
+            if hasattr(block.attn, 'proj'):
+                nn.init.xavier_uniform_(block.attn.proj.weight)
+                if block.attn.proj.bias is not None:
+                    nn.init.zeros_(block.attn.proj.bias)
+
+            if hasattr(block, 'mlp'):
+                for name, param in block.mlp.named_parameters():
+                    if 'weight' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+
+        # Initialize decoder blocks
+        for block in self.decoder_blocks:
+            if hasattr(block.attn, 'qkv'):
+                nn.init.xavier_uniform_(block.attn.qkv.weight)
+                if block.attn.qkv.bias is not None:
+                    nn.init.zeros_(block.attn.qkv.bias)
+            else:
+                for name, param in block.attn.named_parameters():
+                    if 'weight' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+
+            if hasattr(block.attn, 'proj'):
+                nn.init.xavier_uniform_(block.attn.proj.weight)
+                if block.attn.proj.bias is not None:
+                    nn.init.zeros_(block.attn.proj.bias)
+
+            if hasattr(block, 'mlp'):
+                for name, param in block.mlp.named_parameters():
+                    if 'weight' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param)
+
+        # Initialize projection heads for contrastive learning
+        for module in self.proj_head_global.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        for module in self.proj_head_spatial.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        # Initialize auxiliary encoder components with special care
+        for modality, encoder in self.aux_encoder.items():
+            for name, module in encoder.named_modules():
+                if isinstance(module, nn.Conv2d):
+                    nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                elif isinstance(module, nn.LayerNorm):
+                    nn.init.constant_(module.weight, 1.0)
+                    nn.init.constant_(module.bias, 0.0)
+                elif isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+        # Initialize modality projection
+        nn.init.xavier_uniform_(self.modality_proj.weight)
+        if self.modality_proj.bias is not None:
+            nn.init.zeros_(self.modality_proj.bias)
+
+        # Initialize final decoder prediction layer with smaller weights
+        if isinstance(self.decoder_pred, nn.Sequential):
+            for module in self.decoder_pred.modules():
+                if isinstance(module, nn.Linear):
+                    # Use smaller initialization for the final layer
+                    nn.init.xavier_uniform_(module.weight, gain=0.5)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+        # Initialize normalization layers
+        if hasattr(self, 'norm'):
+            nn.init.constant_(self.norm.weight, 1.0)
+            nn.init.constant_(self.norm.bias, 0.0)
+
+        if hasattr(self, 'decoder_norm'):
+            nn.init.constant_(self.decoder_norm.weight, 1.0)
+            nn.init.constant_(self.decoder_norm.bias, 0.0)
+
+        # Initialize auxiliary norm
+        nn.init.constant_(self.aux_norm.weight, 1.0)
+        nn.init.constant_(self.aux_norm.bias, 0.0)
+
+        print("Robust initialization complete")
 
     def random_masking(self, x, mask_ratio):
         """Perform per-sample random masking by per-sample shuffling."""

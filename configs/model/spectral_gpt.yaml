@@ -15,7 +15,7 @@ t_patch_size: 5
 in_chans: 1
 aux_chans: 1
 aux_embed_dim: 256
-temperature: 0.07
+temperature: 0.2
 mask_ratio: 0.5
 
 # Contrastive learning mode: 'global' or 'spatial'
