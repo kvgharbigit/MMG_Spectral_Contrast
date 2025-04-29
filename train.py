@@ -769,7 +769,14 @@ def run_gradient_diagnostics_with_error_handling(model, train_loader, device, ou
                 # Backward pass with gradient scaling
                 scaler.scale(loss).backward()
 
-                # KEY IMPROVEMENT: Collect gradients now - AFTER backward() but BEFORE optimizer step
+                # Unscale gradients before clipping
+                scaler.unscale_(optimizer)
+
+                # Apply gradient clipping with debug print
+                original_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                print(f"[diagnostics] Gradient norm before clipping: {original_norm:.4f}, clipped to max: 1.0")
+
+                # KEY IMPROVEMENT: Collect gradients now - AFTER backward() AND AFTER clipping
                 diagnostics.collect_and_analyze_gradients(batch_idx, loss=loss.item(), scaler=scaler)
 
                 # Update weights and scaler
@@ -901,6 +908,14 @@ def run_gradient_diagnostics(model, train_loader, device, output_dir="gradient_d
 
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
+
+            # IMPORTANT: Unscale gradients before clipping
+            scaler.unscale_(optimizer)
+
+            # Apply gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if batch_idx == 0:  # Print only for first batch
+                print(f"Gradient norm before clipping: {grad_norm:.4f}, clipped to max: 1.0")
 
             # IMPORTANT: This is the key change - collect gradients AFTER backward()
             # but BEFORE optimizer step and scaler update
@@ -1455,7 +1470,10 @@ def main(cfg: DictConfig):
         use_thickness_mask=cfg.model.use_thickness_mask,
         intra_div_weight=cfg.model.intra_div_weight,
         inter_div_weight=cfg.model.inter_div_weight,
+        use_multimodal=cfg.model.use_multimodal,  # Pass the toggle from config
     )
+    # Log multimodal status
+    print(f"Training with multimodal support: {'ENABLED' if cfg.model.use_multimodal else 'DISABLED'}")
 
     # Move model to device
     model = model.to(device)

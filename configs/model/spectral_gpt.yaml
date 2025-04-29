@@ -31,4 +31,6 @@ inter_div_weight: 0.1  # Weight for inter-patch diversity loss
 # Loss weights
 loss_weights:
   recon: 1.0
-  contrastive: 0.0
+  contrastive: 0.3
+
+use_multimodal: false
