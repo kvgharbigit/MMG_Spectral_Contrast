@@ -2195,10 +2195,26 @@ class MultiModalSpectralGPT(nn.Module):
         reconstructed_variance = losses.get('reconstructed_variance', torch.tensor(0.0, device=device))
         reconstructed_similarity = losses.get('reconstructed_similarity', torch.tensor(0.0, device=device))
 
-        # Return all outputs (unchanged)
-        return {
+        # Return all outputs with modified dictionary
+        results = {
             'loss': loss,
             'loss_recon': loss_recon,
             'loss_contrast': loss_contrast,
-            # ... rest of outputs unchanged
+            'mse_loss': mse_loss,
+            'intra_patch_div_loss': intra_patch_div_loss,
+            'inter_patch_div_loss': inter_patch_div_loss,
+            'reference_variance': reference_variance,
+            'variance_threshold': variance_threshold,
+            'diversity_threshold': diversity_threshold,
+            'reconstructed_variance': reconstructed_variance,
+            'reconstructed_similarity': reconstructed_similarity,
+            'reconstructed_pixels': reconstructed_pixels,
+            'mask': mask,
+            'pred': pred_tokens
         }
+
+        # Only include num_modalities if multimodal is enabled
+        if self.use_multimodal:
+            results['num_modalities'] = torch.tensor(num_available, device=device)
+
+        return results

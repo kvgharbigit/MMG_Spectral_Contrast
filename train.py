@@ -449,8 +449,14 @@ def train_epoch(model, dataloader, optimizer, device, contrastive_mode=None, sch
             'loss': output['loss'].detach().item(),
             'loss_recon': output['loss_recon'].detach().item(),
             'loss_contrast': output['loss_contrast'].detach().item(),
-            'num_modalities': output['num_modalities'].detach().item()
         }
+
+        # Add num_modalities if it exists (for multimodal mode)
+        if 'num_modalities' in output:
+            batch_output['num_modalities'] = output['num_modalities'].detach().item()
+        else:
+            # Default to 0 when multimodal mode is disabled
+            batch_output['num_modalities'] = 0
 
         # Add the loss components if available
         if 'mse_loss' in output:
@@ -531,8 +537,14 @@ def validate_epoch(model, dataloader, device, contrastive_mode=None):
                 'loss': output['loss'].detach().item(),
                 'loss_recon': output['loss_recon'].detach().item(),
                 'loss_contrast': output['loss_contrast'].detach().item(),
-                'num_modalities': output['num_modalities'].detach().item()
             }
+
+            # Add num_modalities if it exists (for multimodal mode)
+            if 'num_modalities' in output:
+                batch_output['num_modalities'] = output['num_modalities'].detach().item()
+            else:
+                # Default to 0 when multimodal mode is disabled
+                batch_output['num_modalities'] = 0
 
             # Add the loss components if available
             if 'mse_loss' in output:
