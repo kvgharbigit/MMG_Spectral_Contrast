@@ -7,7 +7,311 @@ import pandas as pd
 from collections import defaultdict
 import json
 from torch.cuda.amp import GradScaler
+import networkx as nx
+from matplotlib.colors import LinearSegmentedColormap
+import math
 
+
+def visualize_model_structure(model, output_dir):
+    """
+    Create a comprehensive visualization of the model structure including:
+    1. A hierarchical graph of module relationships
+    2. Parameter distribution across different layer categories
+    3. Module dependency flow
+
+    Args:
+        model: The model to visualize
+        output_dir: Directory to save visualizations
+
+    Returns:
+        str: Path to the saved visualization
+    """
+    # Create output directory for structure visualizations
+    structure_dir = os.path.join(output_dir, "model_structure")
+    os.makedirs(structure_dir, exist_ok=True)
+
+    # 1. Create a hierarchical graph of the model structure
+    G = nx.DiGraph()
+
+    # Track parameter counts
+    param_counts = {}
+    param_dimensions = {}
+    trainable_counts = {}
+
+    # Track module types
+    module_types = {}
+
+    # Function to recursively add modules to the graph
+    def add_modules_to_graph(module, parent_name="model"):
+        for name, child in module.named_children():
+            # Create full module name
+            full_name = f"{parent_name}.{name}" if parent_name else name
+
+            # Add node to graph
+            G.add_node(full_name)
+            G.add_edge(parent_name, full_name)
+
+            # Get module type
+            module_type = child.__class__.__name__
+            module_types[full_name] = module_type
+
+            # Count parameters
+            param_count = sum(p.numel() for p in child.parameters())
+            trainable_count = sum(p.numel() for p in child.parameters() if p.requires_grad)
+
+            param_counts[full_name] = param_count
+            trainable_counts[full_name] = trainable_count
+
+            # Store sample parameter dimensions for visualization
+            dims = []
+            for name, param in child.named_parameters():
+                if param.requires_grad:
+                    dims.append(f"{name}: {tuple(param.shape)}")
+            param_dimensions[full_name] = dims
+
+            # Recurse for children
+            add_modules_to_graph(child, full_name)
+
+    # Start with the model itself
+    G.add_node("model")
+    add_modules_to_graph(model)
+
+    # 2. Draw hierarchical graph
+    plt.figure(figsize=(20, 15))
+    pos = nx.nx_agraph.graphviz_layout(G, prog="dot")
+
+    # Color nodes by parameter count using a colormap
+    if param_counts:
+        max_count = max(param_counts.values())
+        min_count = min([count for count in param_counts.values() if count > 0]) if any(
+            count > 0 for count in param_counts.values()) else 0
+
+        # Create custom colormap from blue to red
+        cmap = LinearSegmentedColormap.from_list("param_count", ["#E0F7FF", "#FF5733"])
+
+        # Calculate colors based on log scale for better visualization
+        node_colors = []
+        for node in G.nodes():
+            if node in param_counts and param_counts[node] > 0:
+                # Use log scale to better visualize parameter counts
+                log_count = math.log(param_counts[node]) if param_counts[node] > 0 else 0
+                log_min = math.log(min_count) if min_count > 0 else 0
+                log_max = math.log(max_count) if max_count > 0 else 1
+
+                if log_max > log_min:
+                    color_val = (log_count - log_min) / (log_max - log_min)
+                else:
+                    color_val = 0.5
+
+                color = cmap(color_val)
+            else:
+                color = "#EEEEEE"  # Light gray for nodes without parameters
+
+            node_colors.append(color)
+
+        # Node size based on parameter count (log scale for better visualization)
+        node_sizes = []
+        for node in G.nodes():
+            if node in param_counts and param_counts[node] > 0:
+                size = 300 * (math.log(param_counts[node] + 1) / math.log(max_count + 1))
+                node_sizes.append(max(50, size))
+            else:
+                node_sizes.append(50)  # Default size for nodes without parameters
+    else:
+        node_colors = ["#EEEEEE"] * len(G.nodes())
+        node_sizes = [50] * len(G.nodes())
+
+    # Draw the network
+    nx.draw(G, pos,
+            with_labels=True,
+            node_color=node_colors,
+            node_size=node_sizes,
+            font_size=8,
+            font_weight="bold",
+            edge_color="#CCCCCC",
+            width=1.0,
+            arrows=True)
+
+    plt.title("Model Structure Hierarchy", fontsize=16)
+    plt.tight_layout()
+    model_structure_path = os.path.join(structure_dir, "model_hierarchy.png")
+    plt.savefig(model_structure_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # 3. Create parameter distribution pie chart
+    category_params = {}
+    layer_categories = {
+        "encoder": ["patch_embed", "pos_embed", "blocks", "cross_attn", "norm"],
+        "decoder": ["decoder_embed", "decoder_blocks", "decoder_norm", "decoder_pred", "decoder_pos_embed"],
+        "projections": ["proj_head_global", "proj_head_spatial", "modality_proj"],
+        "aux_encoders": ["aux_encoder"],
+        "contrastive": ["temperature", "mask_token"]
+    }
+
+    # Categorize parameters
+    for param_name, param in model.named_parameters():
+        if param.requires_grad:
+            category = "other"
+            for cat_name, keywords in layer_categories.items():
+                if any(keyword in param_name for keyword in keywords):
+                    category = cat_name
+                    break
+
+            if category not in category_params:
+                category_params[category] = 0
+
+            category_params[category] += param.numel()
+
+    # Create pie chart
+    plt.figure(figsize=(12, 8))
+
+    labels = []
+    sizes = []
+    explode = []
+    colors = plt.cm.tab10(np.linspace(0, 1, len(category_params)))
+
+    for i, (category, count) in enumerate(sorted(category_params.items(), key=lambda x: x[1], reverse=True)):
+        percentage = count / sum(category_params.values()) * 100
+        labels.append(f"{category}: {percentage:.1f}%\n({count:,} params)")
+        sizes.append(count)
+        explode.append(0.1 if i == 0 else 0)
+
+    plt.pie(sizes, explode=explode, labels=labels, colors=colors, autopct='%1.1f%%',
+            shadow=True, startangle=140, textprops={'fontsize': 9})
+    plt.axis('equal')
+    plt.title("Parameter Distribution by Category", fontsize=16)
+    plt.tight_layout()
+
+    pie_chart_path = os.path.join(structure_dir, "parameter_distribution.png")
+    plt.savefig(pie_chart_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    # 4. Create detailed structure report with layer information
+    report_path = os.path.join(structure_dir, "model_structure_report.txt")
+    with open(report_path, "w") as f:
+        f.write("=" * 80 + "\n")
+        f.write("MODEL STRUCTURE REPORT\n")
+        f.write("=" * 80 + "\n\n")
+
+        # Overall statistics
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        f.write(f"Total Parameters: {total_params:,}\n")
+        f.write(f"Trainable Parameters: {trainable_params:,} ({trainable_params / total_params * 100:.1f}%)\n\n")
+
+        # Write parameter distribution by category
+        f.write("Parameter Distribution by Category:\n")
+        f.write("-" * 50 + "\n")
+
+        for category, count in sorted(category_params.items(), key=lambda x: x[1], reverse=True):
+            percentage = count / trainable_params * 100
+            f.write(f"{category.ljust(15)}: {count:,} ({percentage:.2f}%)\n")
+
+        f.write("\n")
+
+        # Write detailed layer information
+        f.write("Detailed Layer Structure:\n")
+        f.write("-" * 50 + "\n")
+
+        def write_module_info(module, prefix="", depth=0):
+            for name, child in module.named_children():
+                full_name = f"{prefix}.{name}" if prefix else name
+                module_type = child.__class__.__name__
+
+                param_count = sum(p.numel() for p in child.parameters())
+                trainable_count = sum(p.numel() for p in child.parameters() if p.requires_grad)
+
+                indent = "  " * depth
+                f.write(f"{indent}● {name} ({module_type}): {trainable_count:,}/{param_count:,} params\n")
+
+                # Print parameter shapes for leaf modules
+                if not list(child.named_children()) and list(child.named_parameters()):
+                    for param_name, param in child.named_parameters():
+                        if param.requires_grad:
+                            indent_params = "  " * (depth + 1)
+                            f.write(f"{indent_params}- {param_name}: {tuple(param.shape)}\n")
+
+                write_module_info(child, full_name, depth + 1)
+
+        write_module_info(model)
+
+    # 5. Create a flow diagram of main components
+    # This is a simplified directed graph showing main model components
+    H = nx.DiGraph()
+
+    # Define main functional components
+    main_components = [
+        "Encoder", "Decoder", "Aux Encoders", "Cross-Attention",
+        "Contrastive Learning", "MAE Reconstruction"
+    ]
+
+    # Define relationships
+    edges = [
+        ("Input", "Encoder"),
+        ("Input", "Aux Encoders"),
+        ("Encoder", "Cross-Attention"),
+        ("Aux Encoders", "Cross-Attention"),
+        ("Cross-Attention", "Decoder"),
+        ("Encoder", "Contrastive Learning"),
+        ("Aux Encoders", "Contrastive Learning"),
+        ("Decoder", "MAE Reconstruction"),
+        ("MAE Reconstruction", "Output Loss"),
+        ("Contrastive Learning", "Output Loss")
+    ]
+
+    # Add nodes and edges
+    H.add_nodes_from(["Input", "Output Loss"] + main_components)
+    H.add_edges_from(edges)
+
+    # Create component flow diagram
+    plt.figure(figsize=(14, 10))
+
+    # Position nodes in a more logical flow
+    pos = {
+        "Input": (0, 0),
+        "Encoder": (1, 1),
+        "Aux Encoders": (1, -1),
+        "Cross-Attention": (2, 0),
+        "Decoder": (3, 0),
+        "MAE Reconstruction": (4, 0.5),
+        "Contrastive Learning": (4, -0.5),
+        "Output Loss": (5, 0)
+    }
+
+    # Custom node colors
+    node_colors = {
+        "Input": "#E0F7FF",
+        "Encoder": "#FFD966",
+        "Aux Encoders": "#A9D18E",
+        "Cross-Attention": "#C5A5CF",
+        "Decoder": "#FF9966",
+        "MAE Reconstruction": "#9FC5F8",
+        "Contrastive Learning": "#F8C4B4",
+        "Output Loss": "#EA9999"
+    }
+
+    # Draw the network
+    node_color_list = [node_colors.get(node, "#EEEEEE") for node in H.nodes()]
+
+    nx.draw(H, pos,
+            with_labels=True,
+            node_color=node_color_list,
+            node_size=2500,
+            font_size=10,
+            font_weight="bold",
+            edge_color="#666666",
+            width=2.0,
+            arrowsize=20,
+            arrows=True)
+
+    plt.title("Model Functional Flow", fontsize=16)
+    plt.tight_layout()
+    flow_diagram_path = os.path.join(structure_dir, "model_flow_diagram.png")
+    plt.savefig(flow_diagram_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return structure_dir
 
 class GradientDiagnostics:
     """
@@ -64,6 +368,17 @@ class GradientDiagnostics:
 
         # Counters for hooks
         self.hook_handles = []
+
+    def visualize_model_structure(self):
+        """
+        Visualize the model's structure and parameter distribution.
+
+        Returns:
+            str: Path to the saved visualizations
+        """
+        structure_dir = visualize_model_structure(self.model, self.output_dir)
+        self.log(f"Model structure visualizations saved to: {structure_dir}")
+        return structure_dir
 
     def count_parameters_by_category(self):
         """Count parameters by category and log the results"""
@@ -400,21 +715,26 @@ class GradientDiagnostics:
             scaler_df.to_csv(os.path.join(self.output_dir, "gradscaler_stats.csv"), index=False)
 
     def generate_report(self):
-        """Generate a comprehensive diagnostic report"""
+        """Generate a comprehensive diagnostic report with added model structure visualization"""
         self.log("\n" + "=" * 50)
         self.log("Generating Gradient Diagnostics Report")
         self.log("=" * 50)
 
-        # 1. Save all collected statistics to CSV
+        # 1. Visualize model structure before other diagnostics
+        self.log("\nVisualizing model structure...")
+        structure_dir = self.visualize_model_structure()
+        self.log(f"Model structure visualizations saved to: {structure_dir}")
+
+        # 2. Save all collected statistics to CSV
         self._save_stats_to_csv()
 
-        # 2. Generate plots
+        # 3. Generate plots
         self._generate_plots()
 
-        # 3. Check for gradient vanishing signs
+        # 4. Check for gradient vanishing signs
         vanishing_status = self._check_for_vanishing_gradients()
 
-        # 4. Summarize findings in the report
+        # 5. Summarize findings in the report
         summary_path = self._write_summary_report(vanishing_status)
 
         self.log(f"Report generation complete. Files saved to {self.output_dir}")
@@ -909,7 +1229,7 @@ class GradientDiagnostics:
         return results
 
     def _write_summary_report(self, vanishing_status):
-        """Write a summary report based on the analysis"""
+        """Write a summary report based on the analysis with added model structure reference"""
         summary_file = os.path.join(self.output_dir, "summary_report.txt")
 
         with open(summary_file, "w") as f:
@@ -917,10 +1237,21 @@ class GradientDiagnostics:
             f.write("GRADIENT DIAGNOSTICS SUMMARY REPORT\n")
             f.write("=" * 80 + "\n\n")
 
+            # Reference to model structure visualization
+            f.write("MODEL STRUCTURE ANALYSIS:\n")
+            f.write("-" * 50 + "\n")
+            structure_dir = os.path.join(self.output_dir, "model_structure")
+            f.write(f"Detailed model structure visualizations available at: {structure_dir}\n")
+            f.write("Key visualizations include:\n")
+            f.write("  - model_hierarchy.png: Hierarchical graph of model components\n")
+            f.write("  - parameter_distribution.png: Parameter distribution by category\n")
+            f.write("  - model_flow_diagram.png: Functional flow of model components\n")
+            f.write("  - model_structure_report.txt: Detailed text report of model structure\n\n")
+
+            # Write main vanishing gradients verdict
             f.write("VANISHING GRADIENTS ANALYSIS:\n")
             f.write("-" * 50 + "\n")
 
-            # Write main verdict
             if vanishing_status["has_vanishing_gradients"]:
                 f.write("VERDICT: VANISHING GRADIENTS DETECTED\n\n")
             else:
@@ -1034,6 +1365,7 @@ class GradientDiagnostics:
             if self.scaler_stats:
                 f.write(f"GradScaler statistics: {os.path.join(self.output_dir, 'gradscaler_stats.csv')}\n")
             f.write(f"Diagnostic plots: {os.path.join(self.output_dir, 'plots')}\n")
+            f.write(f"Model structure analysis: {os.path.join(self.output_dir, 'model_structure')}\n")
 
         # Also save a JSON version of the analysis
         with open(os.path.join(self.output_dir, "vanishing_gradient_analysis.json"), "w") as f:
