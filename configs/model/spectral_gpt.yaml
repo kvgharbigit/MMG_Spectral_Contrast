@@ -25,12 +25,12 @@ contrastive_mode: global
 use_thickness_mask: true
 
 # Diversity loss weights
-intra_div_weight: 0.1  # Weight for intra-patch diversity loss
-inter_div_weight: 0.1  # Weight for inter-patch diversity loss
+intra_div_weight: 0.2  # Weight for intra-patch diversity loss
+inter_div_weight: 0.2  # Weight for inter-patch diversity loss
 
 # Loss weights
 loss_weights:
   recon: 1.0
-  contrastive: 0.3
+  contrastive: 0
 
 use_multimodal: false

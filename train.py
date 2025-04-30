@@ -1034,6 +1034,7 @@ def save_training_summary(cfg, output_dir, train_dataset=None, val_dataset=None)
             # Add the diversity loss weights to the summary
             f.write(f"Intra-patch Diversity Loss Weight: {cfg.model.intra_div_weight}\n")
             f.write(f"Inter-patch Diversity Loss Weight: {cfg.model.inter_div_weight}\n\n")
+            f.write(f"Multimodal Support: {'ENABLED' if cfg.model.use_multimodal else 'DISABLED'}\n")
 
             # Optimizer Configuration
             f.write("OPTIMIZER CONFIGURATION\n")
