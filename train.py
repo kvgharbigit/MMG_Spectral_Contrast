@@ -1010,7 +1010,6 @@ def save_training_summary(cfg, output_dir, train_dataset=None, val_dataset=None)
             f.write(f"CUDA Version: {cuda_version}\n")
             f.write(f"Random Seed: {cfg.seed}\n\n")
 
-            # Model Configuration
             f.write("MODEL CONFIGURATION\n")
             f.write("-" * 50 + "\n")
             f.write(f"Analysis Dimension: {cfg.model.analysis_dim}\n")
@@ -1033,17 +1032,13 @@ def save_training_summary(cfg, output_dir, train_dataset=None, val_dataset=None)
             f.write(f"Using Thickness Mask: {cfg.model.use_thickness_mask}\n")
             # Add the diversity loss weights to the summary
             f.write(f"Intra-patch Diversity Loss Weight: {cfg.model.intra_div_weight}\n")
-            f.write(f"Inter-patch Diversity Loss Weight: {cfg.model.inter_div_weight}\n\n")
+            f.write(f"Inter-patch Diversity Loss Weight: {cfg.model.inter_div_weight}\n")
+            # Add cross-attention depth information
+            cross_attention_depth = cfg.model.get('cross_attention_depth', cfg.model.depth)
+            f.write(f"Cross-Attention Depth: {cross_attention_depth}\n\n")
+            # Add multimodal and cross-attention toggles
             f.write(f"Multimodal Support: {'ENABLED' if cfg.model.use_multimodal else 'DISABLED'}\n")
-
-            # Optimizer Configuration
-            f.write("OPTIMIZER CONFIGURATION\n")
-            f.write("-" * 50 + "\n")
-            f.write(f"Optimizer: AdamW\n")  # Hardcoded as your code uses AdamW
-            f.write(f"Learning Rate: {cfg.optimizer.lr}\n")
-            f.write(f"Weight Decay: {cfg.optimizer.weight_decay}\n")
-            f.write(f"Beta1: {cfg.optimizer.beta1}\n")
-            f.write(f"Beta2: {cfg.optimizer.beta2}\n\n")
+            f.write(f"Cross-Attention: {'ENABLED' if cfg.model.use_cross_attention else 'DISABLED'}\n")
 
             # Scheduler Configuration
             if cfg.scheduler.use_scheduler:
@@ -1484,7 +1479,8 @@ def main(cfg: DictConfig):
         intra_div_weight=cfg.model.intra_div_weight,
         inter_div_weight=cfg.model.inter_div_weight,
         cross_attention_depth=cfg.model.cross_attention_depth,  # Add this line
-        use_multimodal=cfg.model.use_multimodal,
+        use_multimodal=cfg.model.use_multimodal,  # Pass the multimodal toggle
+        use_cross_attention=cfg.model.use_cross_attention,  # Pass the cross-attention toggle
     )
     # Log multimodal status
     print(f"Training with multimodal support: {'ENABLED' if cfg.model.use_multimodal else 'DISABLED'}")
