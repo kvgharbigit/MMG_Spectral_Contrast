@@ -1483,7 +1483,8 @@ def main(cfg: DictConfig):
         use_thickness_mask=cfg.model.use_thickness_mask,
         intra_div_weight=cfg.model.intra_div_weight,
         inter_div_weight=cfg.model.inter_div_weight,
-        use_multimodal=cfg.model.use_multimodal,  # Pass the toggle from config
+        cross_attention_depth=cfg.model.cross_attention_depth,  # Add this line
+        use_multimodal=cfg.model.use_multimodal,
     )
     # Log multimodal status
     print(f"Training with multimodal support: {'ENABLED' if cfg.model.use_multimodal else 'DISABLED'}")

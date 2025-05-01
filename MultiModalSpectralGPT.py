@@ -219,6 +219,7 @@ class MultiModalSpectralGPT(nn.Module):
             # Add these new parameters with defaults
             intra_div_weight=0.1,
             inter_div_weight=0.1,
+            cross_attention_depth=3,  # Default to 3 blocks instead of using encoder depth
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
             use_multimodal=True,
             **kwargs
@@ -286,7 +287,7 @@ class MultiModalSpectralGPT(nn.Module):
         # Cross-attention blocks for conditioning on auxiliary features
         self.cross_attn = nn.ModuleList([
             Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
-            for _ in range(depth)
+            for _ in range(cross_attention_depth)
         ])
 
         # Main transformer blocks
@@ -369,6 +370,7 @@ class MultiModalSpectralGPT(nn.Module):
         print(f"  Spatial Patch Size: {patch_size}")
         print(f"  Temporal Patch Size: {t_patch_size}")
         print(f"  Pixel Output Dimension: {pixel_output_dim}")
+        print(f"  Cross-Attention Depth: {cross_attention_depth}")  # Add this line
 
         # Calculate and print derived parameters
         spatial_patches_h = self.analysis_dim // self.patch_size[0]
@@ -655,7 +657,6 @@ class MultiModalSpectralGPT(nn.Module):
         return x_masked, mask, ids_restore
 
     def forward_encoder(self, hsi_img, aux_data=None):
-
         """Forward pass through encoder with conditional auxiliary conditioning."""
         with torch.amp.autocast('cuda', enabled=True):
             # Convert input to sequence of embedded patches
@@ -679,24 +680,44 @@ class MultiModalSpectralGPT(nn.Module):
                 for modality, embedding in aux_embeddings.items():
                     if embedding is not None:
                         cond_tokens = self.modality_proj(embedding).unsqueeze(1)
+
+                        # Apply cross-attention blocks with proper residual connections
                         for block in self.cross_attn:
-                            # Use checkpointing during training
                             if self.training and not hasattr(self, '_disable_gradient_checkpointing'):
-                                # Existing code for checkpoint use
+                                # Fix residual connection for checkpointing case
                                 def create_custom_forward(mod):
                                     def custom_forward(*inputs):
-                                        return mod(torch.cat(inputs, dim=1))[:, :-1, :]
+                                        # Concatenate inputs and apply block
+                                        combined = torch.cat(inputs, dim=1)
+                                        # Get attention output from combined sequence
+                                        attn_output = mod(combined)
+                                        # Only use the part corresponding to the original sequence
+                                        relevant_output = attn_output[:, :inputs[0].size(1), :]
+                                        return relevant_output
 
                                     return custom_forward
 
-                                x = x + checkpoint(
+                                # Apply with fixed residual connection
+                                x_combined = checkpoint(
                                     create_custom_forward(block),
                                     x, cond_tokens
                                 )
+                                # Add residual connection properly
+                                x = x + x_combined
                             else:
-                                # Regular forward pass
-                                print("Skipping auxiliary data processing (multimodal disabled or no available modalities)")
-                                x = x + block(torch.cat([x, cond_tokens], dim=1))[:, :-1, :]
+                                # Regular forward pass with fixed residual connection
+                                # Concatenate x and conditioning tokens
+                                combined = torch.cat([x, cond_tokens], dim=1)
+                                # Apply attention block
+                                attn_output = block(combined)
+                                # Extract only the portion related to original tokens
+                                x_updated = attn_output[:, :x.size(1), :]
+                                # Apply residual connection properly
+                                x = x + x_updated
+                    else:
+                        print(f"Skipping modality {modality} - no data available")
+            else:
+                print("Skipping auxiliary data processing (multimodal disabled or no available modalities)")
 
             # Process through transformer blocks
             for block in self.blocks:
