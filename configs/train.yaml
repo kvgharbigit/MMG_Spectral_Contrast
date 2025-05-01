@@ -28,8 +28,8 @@ experiment_name: spectralgpt_mae_contrastive
 training:
   epochs: 100
   batch_size: 4
-  resume_from_checkpoint: false
-  checkpoint_path: "Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/MMG_Spectral_Output/2025-04-14/spectralgpt_mae_contrastive/20-48-15/checkpoints/best_model.pth"
+  resume_from_checkpoint: true
+  checkpoint_path: "Z:/Projects/Ophthalmic neuroscience/Projects/Kayvan/MMG_Spectral_Output/2025-04-30/spectralgpt_mae_contrastive/21-49-11/checkpoints/best_model.pth"
   early_stopping:
     enabled: false
     patience: 50

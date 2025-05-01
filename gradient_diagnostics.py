@@ -15,7 +15,7 @@ import math
 def visualize_model_structure(model, output_dir):
     """
     Create a comprehensive visualization of the model structure including:
-    1. A hierarchical graph of module relationships
+    1. A hierarchical graph of module relationships using NetworkX without graphviz
     2. Parameter distribution across different layer categories
     3. Module dependency flow
 
@@ -26,6 +26,17 @@ def visualize_model_structure(model, output_dir):
     Returns:
         str: Path to the saved visualization
     """
+    import os
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    from collections import defaultdict
+    import json
+    import networkx as nx
+    from matplotlib.colors import LinearSegmentedColormap
+    import math
+
     # Create output directory for structure visualizations
     structure_dir = os.path.join(output_dir, "model_structure")
     os.makedirs(structure_dir, exist_ok=True)
@@ -76,9 +87,43 @@ def visualize_model_structure(model, output_dir):
     G.add_node("model")
     add_modules_to_graph(model)
 
-    # 2. Draw hierarchical graph
+    # 2. Draw hierarchical graph using NetworkX's built-in layout options
     plt.figure(figsize=(20, 15))
-    pos = nx.nx_agraph.graphviz_layout(G, prog="dot")
+
+    # Replace graphviz with networkx's hierarchical layout
+    # First try to use a hierarchical layout if available
+    try:
+        # For newer NetworkX versions (2.6+)
+        pos = nx.nx_pydot.pydot_layout(G, prog="dot")
+    except:
+        try:
+            # If pydot fails, try pygraphviz variant (should never happen if graphviz is issue)
+            pos = nx.nx_agraph.graphviz_layout(G, prog="dot")
+        except:
+            # Fall back to a pure networkx implementation that doesn't require external deps
+            # Use a combination of spring_layout with iterations and fixed y-positions based on depth
+
+            # Calculate node depths
+            def get_node_depth(node):
+                if node == "model":
+                    return 0
+                parent_depths = [get_node_depth(parent) for parent in G.predecessors(node)]
+                return 1 + max(parent_depths) if parent_depths else 0
+
+            node_depths = {node: get_node_depth(node) for node in G.nodes()}
+            max_depth = max(node_depths.values())
+
+            # Create initial layout with spring model
+            pos = nx.spring_layout(G, k=1.5 / math.sqrt(len(G.nodes())), iterations=50, seed=42)
+
+            # Adjust y-positions based on depth and apply some horizontal spreading
+            for node, (x, y) in pos.items():
+                depth = node_depths[node]
+                # Normalize depth for y-position (top to bottom)
+                y_pos = 1.0 - (depth / max(max_depth, 1))
+                # Keep original x but normalize it a bit
+                x_pos = x * 0.8
+                pos[node] = (x_pos, y_pos)
 
     # Color nodes by parameter count using a colormap
     if param_counts:
@@ -121,7 +166,7 @@ def visualize_model_structure(model, output_dir):
         node_colors = ["#EEEEEE"] * len(G.nodes())
         node_sizes = [50] * len(G.nodes())
 
-    # Draw the network
+    # Draw the network with improved labels
     nx.draw(G, pos,
             with_labels=True,
             node_color=node_colors,
@@ -131,6 +176,19 @@ def visualize_model_structure(model, output_dir):
             edge_color="#CCCCCC",
             width=1.0,
             arrows=True)
+
+    # Improve readability by adding node labels with more details
+    labels = {}
+    for node in G.nodes():
+        if node in param_counts:
+            labels[node] = f"{node.split('.')[-1]}\n{param_counts[node]:,}"
+        else:
+            labels[node] = node.split('.')[-1]
+
+    # Add a legend for node sizes/colors
+    if param_counts:
+        plt.figtext(0.01, 0.01, "Node size and color represent parameter count",
+                    fontsize=10, ha='left')
 
     plt.title("Model Structure Hierarchy", fontsize=16)
     plt.tight_layout()
@@ -188,7 +246,7 @@ def visualize_model_structure(model, output_dir):
 
     # 4. Create detailed structure report with layer information
     report_path = os.path.join(structure_dir, "model_structure_report.txt")
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:  # Added explicit encoding to handle Unicode
         f.write("=" * 80 + "\n")
         f.write("MODEL STRUCTURE REPORT\n")
         f.write("=" * 80 + "\n\n")
@@ -223,7 +281,8 @@ def visualize_model_structure(model, output_dir):
                 trainable_count = sum(p.numel() for p in child.parameters() if p.requires_grad)
 
                 indent = "  " * depth
-                f.write(f"{indent}● {name} ({module_type}): {trainable_count:,}/{param_count:,} params\n")
+                # Changed bullet character from Unicode (●) to ASCII (*)
+                f.write(f"{indent}* {name} ({module_type}): {trainable_count:,}/{param_count:,} params\n")
 
                 # Print parameter shapes for leaf modules
                 if not list(child.named_children()) and list(child.named_parameters()):
@@ -267,7 +326,8 @@ def visualize_model_structure(model, output_dir):
     # Create component flow diagram
     plt.figure(figsize=(14, 10))
 
-    # Position nodes in a more logical flow
+    # Position nodes in a more logical flow - without graphviz
+    # Define fixed positions manually for a clear flow layout
     pos = {
         "Input": (0, 0),
         "Encoder": (1, 1),
