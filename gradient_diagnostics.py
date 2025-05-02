@@ -414,10 +414,10 @@ class GradientDiagnostics:
         self.log(f"Gradient Diagnostics initialized at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.log(f"Model has {len(self.named_parameters)} named parameters")
 
-        # Layer categories for analysis
+        # Layer categories for analysis - UPDATED with more specific keywords
         self.layer_categories = {
-            "encoder": ["patch_embed", "pos_embed", "blocks", "cross_attn", "norm"],
             "decoder": ["decoder_embed", "decoder_blocks", "decoder_norm", "decoder_pred", "decoder_pos_embed"],
+            "encoder": ["patch_embed", "pos_embed", "^blocks", "cross_attn", "^norm"],  # ^ means match at start
             "projections": ["proj_head_global", "proj_head_spatial", "modality_proj"],
             "aux_encoders": ["aux_encoder"],
             "contrastive": ["temperature", "mask_token"]
@@ -441,21 +441,37 @@ class GradientDiagnostics:
         return structure_dir
 
     def count_parameters_by_category(self):
-        """Count parameters by category and log the results"""
+        """Count parameters by category and log the results with improved matching"""
         category_counts = defaultdict(int)
+        category_param_counts = defaultdict(int)
 
         for name, param in self.named_parameters:
             if param.requires_grad:
-                category = "other"
-                for cat_name, keywords in self.layer_categories.items():
-                    if any(keyword in name for keyword in keywords):
-                        category = cat_name
-                        break
-                category_counts[category] += 1
+                # First, handle the most specific patterns that should take precedence
+                if name.startswith("decoder_") or "decoder" in name:
+                    category = "decoder"
+                elif name.startswith("blocks.") or name == "norm.weight" or name == "norm.bias":
+                    category = "encoder"
+                elif name.startswith("patch_embed") or name.startswith("pos_embed"):
+                    category = "encoder"
+                elif "proj_head" in name:
+                    category = "projections"
+                elif "aux_encoder" in name:
+                    category = "aux_encoders"
+                elif "mask_token" in name or "temperature" in name:
+                    category = "contrastive"
+                else:
+                    category = "other"
 
+                category_counts[category] += 1
+                category_param_counts[category] += param.numel()
+
+        # Log both parameter counts and total parameters
         self.log("Parameter counts by category:")
-        for category, count in category_counts.items():
-            self.log(f"  - {category}: {count} parameters")
+        for category, count in sorted(category_counts.items(), key=lambda x: x[1], reverse=True):
+            param_count = category_param_counts[category]
+            percentage = 100 * param_count / sum(category_param_counts.values())
+            self.log(f"  - {category}: {count} parameters ({param_count:,} elements, {percentage:.2f}%)")
 
         return category_counts
 

@@ -6,8 +6,8 @@ patch_size: [7, 7]
 embed_dim: 1024
 depth: 10
 num_heads: 16
-decoder_embed_dim: 512
-decoder_depth: 4
+decoder_embed_dim: 768
+decoder_depth: 8
 decoder_num_heads: 8
 mlp_ratio: 4.0
 num_frames: 30
@@ -28,9 +28,14 @@ use_thickness_mask: true
 intra_div_weight: 0.2  # Weight for intra-patch diversity loss
 inter_div_weight: 0.2  # Weight for inter-patch diversity loss
 
+# New parameter for cross-attention depth
+cross_attention_depth: 3  # Default depth of cross-attention blocks
+
 # Loss weights
 loss_weights:
   recon: 1.0
   contrastive: 0
 
-use_multimodal: false
+# Model component toggles
+use_multimodal: false      # Whether to use auxiliary modalities for conditioning
+use_cross_attention: false # Whether to include cross-attention blocks in the model architecture

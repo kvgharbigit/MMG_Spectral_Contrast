@@ -221,13 +221,23 @@ class MultiModalSpectralGPT(nn.Module):
             inter_div_weight=0.1,
             norm_layer=partial(nn.LayerNorm, eps=1e-6),
             use_multimodal=True,
+            use_cross_attention=True,  # New parameter for toggling cross-attention
+            cross_attention_depth=None,  # Add this parameter with None as default
             **kwargs
     ):
         super().__init__()
 
-        # Store the flag as instance variable
+        # Store the flag for multi-modal support as instance variable
         self.use_multimodal = use_multimodal
         print(f"Initializing model with multimodal support: {'ENABLED' if use_multimodal else 'DISABLED'}")
+
+        # Store the flag for cross-attention as instance variable
+        self.use_cross_attention = use_cross_attention
+        print(f"Initializing model with cross-attention: {'ENABLED' if use_cross_attention else 'DISABLED'}")
+
+        # Store cross-attention depth if provided, otherwise use main depth
+        self.cross_attention_depth = cross_attention_depth if cross_attention_depth is not None else depth
+        print(f"Cross-Attention Depth: {self.cross_attention_depth}")
 
         # Store the new diversity loss weights as class attributes
         self.intra_div_weight = intra_div_weight
@@ -267,27 +277,30 @@ class MultiModalSpectralGPT(nn.Module):
         # Add spatial registration module for consistent dimensions
         self.spatial_registration = SpatialRegistration(analysis_dim, num_frames)
 
-        # Create ViT encoders for each auxiliary modality
-        self.aux_encoder = nn.ModuleDict({
-            'ir': self._make_aux_encoder(aux_chans, aux_embed_dim),
-            'af': self._make_aux_encoder(aux_chans, aux_embed_dim),
-            'thickness': self._make_aux_encoder(aux_chans, aux_embed_dim)
-        })
+        # Create ViT encoders for each auxiliary modality - only if multimodal is enabled
+        if self.use_multimodal:
+            self.aux_encoder = nn.ModuleDict({
+                'ir': self._make_aux_encoder(aux_chans, aux_embed_dim),
+                'af': self._make_aux_encoder(aux_chans, aux_embed_dim),
+                'thickness': self._make_aux_encoder(aux_chans, aux_embed_dim)
+            })
 
-        # Add normalization layers for auxiliary encoders
-        self.aux_norm = nn.LayerNorm(aux_embed_dim)
+            # Add normalization layers for auxiliary encoders
+            self.aux_norm = nn.LayerNorm(aux_embed_dim)
 
-        # Normalization layer for auxiliary features
-        self.modality_proj = nn.Linear(aux_embed_dim, embed_dim)
+            # Normalization layer for auxiliary features
+            self.modality_proj = nn.Linear(aux_embed_dim, embed_dim)
 
         # Learnable mask token for MAE decoder
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_embed_dim))
 
-        # Cross-attention blocks for conditioning on auxiliary features
-        self.cross_attn = nn.ModuleList([
-            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
-            for _ in range(depth)
-        ])
+        # Cross-attention blocks for conditioning on auxiliary features - only if both multimodal and cross-attention are enabled
+        if self.use_multimodal and self.use_cross_attention:
+            # Use cross_attention_depth instead of depth for the number of cross-attention blocks
+            self.cross_attn = nn.ModuleList([
+                Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+                for _ in range(self.cross_attention_depth)
+            ])
 
         # Main transformer blocks
         self.blocks = nn.ModuleList([
@@ -322,28 +335,29 @@ class MultiModalSpectralGPT(nn.Module):
         self.norm = norm_layer(embed_dim)
         self.decoder_norm = norm_layer(decoder_embed_dim)
 
-        # Contrastive learning components
-        self.temperature = temperature
+        # Contrastive learning components - only if multimodal is enabled
+        if self.use_multimodal:
+            self.temperature = temperature
 
-        # Calculate spectral dim for spatial contrastive learning
-        spectral_dim = self.spectral_patches * embed_dim
+            # Calculate spectral dim for spatial contrastive learning
+            spectral_dim = self.spectral_patches * embed_dim
 
-        # For global contrastive learning mode
-        self.proj_head_global = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim)
-        )
+            # For global contrastive learning mode
+            self.proj_head_global = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim)
+            )
 
-        # For spatial contrastive learning mode
-        self.proj_head_spatial = nn.Sequential(
-            nn.Linear(spectral_dim, embed_dim),
-            nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim)
-        )
+            # For spatial contrastive learning mode
+            self.proj_head_spatial = nn.Sequential(
+                nn.Linear(spectral_dim, embed_dim),
+                nn.ReLU(),
+                nn.Linear(embed_dim, embed_dim)
+            )
 
-        # Project auxiliary patch embeddings to fixed embedding dim
-        self.aux_spatial_proj = nn.Linear(aux_embed_dim, embed_dim)
+            # Project auxiliary patch embeddings to fixed embedding dim
+            self.aux_spatial_proj = nn.Linear(aux_embed_dim, embed_dim)
 
         # Create patch embedding during initialization
         self.patch_embed = PatchEmbed(
@@ -507,30 +521,31 @@ class MultiModalSpectralGPT(nn.Module):
                     elif 'bias' in name:
                         nn.init.zeros_(param)
 
-        # Initialize cross-attention blocks similarly
-        for block in self.cross_attn:
-            if hasattr(block.attn, 'qkv'):
-                nn.init.xavier_uniform_(block.attn.qkv.weight)
-                if block.attn.qkv.bias is not None:
-                    nn.init.zeros_(block.attn.qkv.bias)
-            else:
-                for name, param in block.attn.named_parameters():
-                    if 'weight' in name:
-                        nn.init.xavier_uniform_(param)
-                    elif 'bias' in name:
-                        nn.init.zeros_(param)
+        # Initialize cross-attention blocks similarly - only if enabled
+        if self.use_multimodal and self.use_cross_attention and hasattr(self, 'cross_attn'):
+            for block in self.cross_attn:
+                if hasattr(block.attn, 'qkv'):
+                    nn.init.xavier_uniform_(block.attn.qkv.weight)
+                    if block.attn.qkv.bias is not None:
+                        nn.init.zeros_(block.attn.qkv.bias)
+                else:
+                    for name, param in block.attn.named_parameters():
+                        if 'weight' in name:
+                            nn.init.xavier_uniform_(param)
+                        elif 'bias' in name:
+                            nn.init.zeros_(param)
 
-            if hasattr(block.attn, 'proj'):
-                nn.init.xavier_uniform_(block.attn.proj.weight)
-                if block.attn.proj.bias is not None:
-                    nn.init.zeros_(block.attn.proj.bias)
+                if hasattr(block.attn, 'proj'):
+                    nn.init.xavier_uniform_(block.attn.proj.weight)
+                    if block.attn.proj.bias is not None:
+                        nn.init.zeros_(block.attn.proj.bias)
 
-            if hasattr(block, 'mlp'):
-                for name, param in block.mlp.named_parameters():
-                    if 'weight' in name:
-                        nn.init.xavier_uniform_(param)
-                    elif 'bias' in name:
-                        nn.init.zeros_(param)
+                if hasattr(block, 'mlp'):
+                    for name, param in block.mlp.named_parameters():
+                        if 'weight' in name:
+                            nn.init.xavier_uniform_(param)
+                        elif 'bias' in name:
+                            nn.init.zeros_(param)
 
         # Initialize decoder blocks
         for block in self.decoder_blocks:
@@ -557,38 +572,42 @@ class MultiModalSpectralGPT(nn.Module):
                     elif 'bias' in name:
                         nn.init.zeros_(param)
 
-        # Initialize projection heads for contrastive learning
-        for module in self.proj_head_global.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-        for module in self.proj_head_spatial.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-        # Initialize auxiliary encoder components with special care
-        for modality, encoder in self.aux_encoder.items():
-            for name, module in encoder.named_modules():
-                if isinstance(module, nn.Conv2d):
-                    nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-                    if module.bias is not None:
-                        nn.init.zeros_(module.bias)
-                elif isinstance(module, nn.LayerNorm):
-                    nn.init.constant_(module.weight, 1.0)
-                    nn.init.constant_(module.bias, 0.0)
-                elif isinstance(module, nn.Linear):
+        # Initialize projection heads for contrastive learning - only if multimodal is enabled
+        if self.use_multimodal and hasattr(self, 'proj_head_global'):
+            for module in self.proj_head_global.modules():
+                if isinstance(module, nn.Linear):
                     nn.init.xavier_uniform_(module.weight)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
 
-        # Initialize modality projection
-        nn.init.xavier_uniform_(self.modality_proj.weight)
-        if self.modality_proj.bias is not None:
-            nn.init.zeros_(self.modality_proj.bias)
+        if self.use_multimodal and hasattr(self, 'proj_head_spatial'):
+            for module in self.proj_head_spatial.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+        # Initialize auxiliary encoder components with special care - only if multimodal is enabled
+        if self.use_multimodal and hasattr(self, 'aux_encoder'):
+            for modality, encoder in self.aux_encoder.items():
+                for name, module in encoder.named_modules():
+                    if isinstance(module, nn.Conv2d):
+                        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                        if module.bias is not None:
+                            nn.init.zeros_(module.bias)
+                    elif isinstance(module, nn.LayerNorm):
+                        nn.init.constant_(module.weight, 1.0)
+                        nn.init.constant_(module.bias, 0.0)
+                    elif isinstance(module, nn.Linear):
+                        nn.init.xavier_uniform_(module.weight)
+                        if module.bias is not None:
+                            nn.init.zeros_(module.bias)
+
+            # Initialize modality projection - only if it exists
+            if hasattr(self, 'modality_proj'):
+                nn.init.xavier_uniform_(self.modality_proj.weight)
+                if self.modality_proj.bias is not None:
+                    nn.init.zeros_(self.modality_proj.bias)
 
         # Initialize final decoder prediction layer with smaller weights
         if isinstance(self.decoder_pred, nn.Sequential):
@@ -608,9 +627,10 @@ class MultiModalSpectralGPT(nn.Module):
             nn.init.constant_(self.decoder_norm.weight, 1.0)
             nn.init.constant_(self.decoder_norm.bias, 0.0)
 
-        # Initialize auxiliary norm
-        nn.init.constant_(self.aux_norm.weight, 1.0)
-        nn.init.constant_(self.aux_norm.bias, 0.0)
+        # Initialize auxiliary norm - only if multimodal is enabled
+        if self.use_multimodal and hasattr(self, 'aux_norm'):
+            nn.init.constant_(self.aux_norm.weight, 1.0)
+            nn.init.constant_(self.aux_norm.bias, 0.0)
 
         print("Robust initialization complete")
 
@@ -655,7 +675,6 @@ class MultiModalSpectralGPT(nn.Module):
         return x_masked, mask, ids_restore
 
     def forward_encoder(self, hsi_img, aux_data=None):
-
         """Forward pass through encoder with conditional auxiliary conditioning."""
         with torch.amp.autocast('cuda', enabled=True):
             # Convert input to sequence of embedded patches
@@ -671,9 +690,9 @@ class MultiModalSpectralGPT(nn.Module):
             # Apply random masking
             x, mask, ids_restore = self.random_masking(x, self.mask_ratio)
 
-            # Process auxiliary modalities ONLY if use_multimodal is True
-            if self.use_multimodal and aux_data is not None:
-                print(f"Processing auxiliary data from {len(aux_data)} modalities")
+            # Process auxiliary modalities ONLY if both use_multimodal and use_cross_attention are True
+            if self.use_multimodal and self.use_cross_attention and aux_data is not None:
+                print(f"Processing auxiliary data from {len(aux_data)} modalities with cross-attention")
                 aux_embeddings = self.encode_auxiliary(aux_data)
                 # Apply cross-attention for each modality
                 for modality, embedding in aux_embeddings.items():
@@ -695,8 +714,11 @@ class MultiModalSpectralGPT(nn.Module):
                                 )
                             else:
                                 # Regular forward pass
-                                print("Skipping auxiliary data processing (multimodal disabled or no available modalities)")
                                 x = x + block(torch.cat([x, cond_tokens], dim=1))[:, :-1, :]
+            elif self.use_multimodal and not self.use_cross_attention and aux_data is not None:
+                print("Multimodal enabled but cross-attention disabled - skipping cross-attention conditioning")
+            elif not self.use_multimodal and aux_data is not None:
+                print("Multimodal support disabled - ignoring auxiliary data")
 
             # Process through transformer blocks
             for block in self.blocks:
