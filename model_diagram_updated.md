@@ -1,5 +1,5 @@
 # MultiModalSpectralGPT Architecture Diagrams
-
+#
 ## 1. Current Configuration (use_multimodal=False, use_cross_attention=False)
 
 ```
