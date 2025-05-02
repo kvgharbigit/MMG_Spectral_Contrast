@@ -431,12 +431,12 @@ class GradientDiagnostics:
 
     def visualize_model_structure(self):
         """
-        Visualize the model's structure and parameter distribution.
+        Visualize the model's structure and parameter distribution with accurate categorization.
 
         Returns:
             str: Path to the saved visualizations
         """
-        structure_dir = visualize_model_structure(self.model, self.output_dir)
+        structure_dir = visualize_model_structure(self.model, self.output_dir, layer_categories=self.layer_categories)
         self.log(f"Model structure visualizations saved to: {structure_dir}")
         return structure_dir
 
@@ -596,12 +596,21 @@ class GradientDiagnostics:
                             "batch": self.batch_counter
                         }
 
-                        # Categorize the parameter
+                        # Categorize the parameter with improved logic
                         category = "other"
-                        for cat_name, keywords in self.layer_categories.items():
-                            if any(keyword in name for keyword in keywords):
-                                category = cat_name
-                                break
+
+                        # Match parameters to categories with improved logic
+                        if any(keyword in name for keyword in self.layer_categories["decoder"]):
+                            category = "decoder"
+                        elif name.startswith(
+                                "blocks.") or name == "norm.weight" or name == "norm.bias" or "patch_embed" in name or "pos_embed" in name:
+                            category = "encoder"
+                        elif any(keyword in name for keyword in self.layer_categories["projections"]):
+                            category = "projections"
+                        elif any(keyword in name for keyword in self.layer_categories["aux_encoders"]):
+                            category = "aux_encoders"
+                        elif any(keyword in name for keyword in self.layer_categories["contrastive"]):
+                            category = "contrastive"
 
                         stats["category"] = category
                         grad_by_category[category] += 1
